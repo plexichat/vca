@@ -1,0 +1,31 @@
+# Build artifacts
+*.o
+*.obj
+*.exe
+*.a
+*.lib
+*.pdb
+*.ilk
+
+# Generated data / caches (large)
+data/
+*.db
+*.db-wal
+*.db-shm
+*.vgraph
+*.pbf
+*.osm
+*.osm.bz2
+*.geojson
+*.mapcache
+*.ways.tmp
+*.log
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# OS
+Thumbs.db
+.DS_Store
