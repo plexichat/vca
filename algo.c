@@ -142,6 +142,7 @@ typedef struct {
     float w_straight; /* Macro-vector straightness (tortuosity) weight   */
     float w_smooth;   /* Smoothness / toll-free preference weight        */
     int   avoid_tolls;
+    int   pref_id;    /* 0..4 built-in profile, -1 custom weights */
 } VmrPreference;
 
 typedef struct {
@@ -657,6 +658,8 @@ typedef struct {
     uint32_t *ch_child1;
     uint32_t *ch_child2;
 
+    float *edge_attr_scale[5];
+
     IdMap     osm_map;
 } VmrGraph;
 
@@ -832,6 +835,9 @@ static void vmr_graph_free(VmrGraph *g) {
     xfree(g->ch_via);
     xfree(g->ch_child1);
     xfree(g->ch_child2);
+    for (int i = 0; i < 5; i++) {
+        xfree(g->edge_attr_scale[i]);
+    }
     idmap_free(&g->osm_map);
     vmr_graph_init(g);
 }
@@ -1280,7 +1286,7 @@ static int cmp_ch_packed(const void *pa, const void *pb) {
 }
 
 /* Vector-aware contraction hierarchy: shortcuts carry the same 8D features. */
-static int vmr_build_ch_vector(VmrGraph *g) {
+static __attribute__((unused)) int vmr_build_ch_vector(VmrGraph *g) {
     uint32_t n = g->node_count;
     uint32_t m0 = g->edge_count;
     if (n == 0 || m0 == 0) {
@@ -2264,6 +2270,32 @@ static int vmr_preprocess_graph(VmrRawGraph *rg, VmrGraph *g) {
         (*(g->fwd_offsets + u + 1U))++;
     }
 
+    /* Precompute attr_scale for the five built-in profiles: removes the 4D dot
+     * product and division from the query hot loop. */
+    static const float pw[5][4] = {
+        {1.20f, 1.00f, 0.60f, 0.50f},
+        {2.20f, 1.50f, 0.30f, 0.40f},
+        {0.50f, 0.30f, 1.20f, 0.30f},
+        {1.80f, 2.20f, 0.50f, 0.60f},
+        {0.70f, 0.20f, 0.80f, 1.40f}
+    };
+    if (sm > 0) {
+        for (uint32_t p = 0; p < 5; p++) {
+            float *arr = (float *)xmalloc((size_t)sm * sizeof(float));
+            if (!arr) {
+                continue;
+            }
+            for (uint32_t e = 0; e < sm; e++) {
+                float dot = pw[p][0] * *(g->edge_f_speed + e) +
+                            pw[p][1] * *(g->edge_f_class + e) +
+                            pw[p][2] * *(g->edge_f_straight + e) +
+                            pw[p][3] * *(g->edge_f_smooth + e);
+                *(arr + e) = 1.0f / (1.0f + 0.22f * dot);
+            }
+            g->edge_attr_scale[p] = arr;
+        }
+    }
+
     /* Raw edge pool is now mirrored in the SoA arrays. */
     xfree(rg->edges);
     rg->edges = NULL;
@@ -2363,9 +2395,7 @@ static int vmr_preprocess_graph(VmrRawGraph *rg, VmrGraph *g) {
 
     vmr_build_landmarks(g);
 
-    if (vmr_build_ch_vector(g) != 0) {
-        LOG_WARN("Vector CH build failed; falling back to full A*");
-    }
+    /* Vector CH is not used for the exact-vector A* (UK measured slower). */
 
     clock_t t1 = clock();
     double ms = 1000.0 * (double)(t1 - t0) / (double)CLOCKS_PER_SEC;
@@ -2463,6 +2493,19 @@ static int vmr_save_binary(const VmrGraph *g, const char *path) {
         ok &= (fwrite(g->edge_length_m,   sizeof(float),    m, fp) == m);
         ok &= (fwrite(g->edge_time_s,     sizeof(float),    m, fp) == m);
         ok &= (fwrite(g->edge_flags,      sizeof(uint8_t),  m, fp) == m);
+    }
+
+    uint8_t amask = 0;
+    for (uint32_t p = 0; p < 5; p++) {
+        if (g->edge_attr_scale[p]) {
+            amask |= (uint8_t)(1U << p);
+        }
+    }
+    ok &= (fwrite(&amask, sizeof(uint8_t), 1, fp) == 1);
+    for (uint32_t p = 0; p < 5; p++) {
+        if (amask & (1U << p)) {
+            ok &= (fwrite(g->edge_attr_scale[p], sizeof(float), m, fp) == m);
+        }
     }
 
     ok &= (fwrite(g->rev_offsets,  sizeof(uint32_t), n + 1U, fp) == n + 1U);
@@ -2617,6 +2660,19 @@ static int vmr_load_binary(VmrGraph *g, const char *path) {
         ok &= (fread(g->edge_length_m,   sizeof(float),    m, fp) == m);
         ok &= (fread(g->edge_time_s,     sizeof(float),    m, fp) == m);
         ok &= (fread(g->edge_flags,      sizeof(uint8_t),  m, fp) == m);
+    }
+
+    uint8_t amask = 0;
+    ok &= (fread(&amask, sizeof(uint8_t), 1, fp) == 1);
+    for (uint32_t p = 0; p < 5; p++) {
+        if (amask & (1U << p)) {
+            g->edge_attr_scale[p] = (float *)xmalloc((size_t)(m ? m : 1) * sizeof(float));
+            if (!g->edge_attr_scale[p]) {
+                ok = 0;
+            } else {
+                ok &= (fread(g->edge_attr_scale[p], sizeof(float), m, fp) == m);
+            }
+        }
     }
 
     ok &= (fread(g->rev_offsets,  sizeof(uint32_t), n + 1U, fp) == n + 1U);
@@ -4707,19 +4763,27 @@ for (int pass = 0; pass < 2 && best == VMR_INVALID; pass++) {
 
 static VmrPreference vmr_preset_profile(const char *name) {
     VmrPreference p;
+    int id = 0;
     if (name == NULL || c_stricmp(name, "balanced") == 0) {
-        p = (VmrPreference){ 1.40f, 1.20f, 1.00f, 0.60f, 0.50f, 0 };
+        p = (VmrPreference){ 1.40f, 1.20f, 1.00f, 0.60f, 0.50f, 0, 0 };
+        id = 0;
     } else if (c_stricmp(name, "fastest") == 0) {
-        p = (VmrPreference){ 0.80f, 2.20f, 1.50f, 0.30f, 0.40f, 0 };
+        p = (VmrPreference){ 0.80f, 2.20f, 1.50f, 0.30f, 0.40f, 0, 0 };
+        id = 1;
     } else if (c_stricmp(name, "direct") == 0) {
-        p = (VmrPreference){ 2.60f, 0.50f, 0.30f, 1.20f, 0.30f, 0 };
+        p = (VmrPreference){ 2.60f, 0.50f, 0.30f, 1.20f, 0.30f, 0, 0 };
+        id = 2;
     } else if (c_stricmp(name, "highway") == 0) {
-        p = (VmrPreference){ 1.10f, 1.80f, 2.20f, 0.50f, 0.60f, 0 };
+        p = (VmrPreference){ 1.10f, 1.80f, 2.20f, 0.50f, 0.60f, 0, 0 };
+        id = 3;
     } else if (c_stricmp(name, "local") == 0 || c_stricmp(name, "no-toll") == 0) {
-        p = (VmrPreference){ 1.30f, 0.70f, 0.20f, 0.80f, 1.40f, 1 };
+        p = (VmrPreference){ 1.30f, 0.70f, 0.20f, 0.80f, 1.40f, 1, 0 };
+        id = 4;
     } else {
-        p = (VmrPreference){ 1.40f, 1.20f, 1.00f, 0.60f, 0.50f, 0 };
+        p = (VmrPreference){ 1.40f, 1.20f, 1.00f, 0.60f, 0.50f, 0, 0 };
+        id = 0;
     }
+    p.pref_id = id;
     return p;
 }
 
@@ -4804,8 +4868,18 @@ static inline float two_hop_rev_cos(const VmrGraph *g, uint32_t w, uint32_t u,
  *   Feature dims:  (4) speed, (5) class, (6) straightness, (7) smoothness,
  *                  (8) cross-track corridor rejection relative to A -> B chord
  */
+static inline float compute_attr_scale(const VmrGraph *g, uint32_t eid,
+                                       const VmrPreference *p) {
+    float dot = (p->w_speed    * *(g->edge_f_speed + eid)) +
+                (p->w_class    * *(g->edge_f_class + eid)) +
+                (p->w_straight * *(g->edge_f_straight + eid)) +
+                (p->w_smooth   * *(g->edge_f_smooth + eid));
+    return 1.0f / (1.0f + 0.22f * dot);
+}
+
 static inline float compute_8d_step_cost(const VmrGraph *g, uint32_t eid,
                                          const VmrPreference *p, SearchMode mode,
+                                         float attr_scale,
                                          float cos1, float cos2, float mom_dot,
                                          float cross_ratio) {
     float base_time = *(g->edge_time_s + eid);
@@ -4815,13 +4889,6 @@ static inline float compute_8d_step_cost(const VmrGraph *g, uint32_t eid,
     if (mode == MODE_DIJKSTRA) {
         return base_time;
     }
-
-    /* 4D road attribute dot product */
-    float attr_dot = (p->w_speed    * *(g->edge_f_speed + eid)) +
-                     (p->w_class    * *(g->edge_f_class + eid)) +
-                     (p->w_straight * *(g->edge_f_straight + eid)) +
-                     (p->w_smooth   * *(g->edge_f_smooth + eid));
-    float attr_scale = 1.0f / (1.0f + 0.22f * attr_dot);
 
     /* Spatial vector alignment (1-hop + 2-hop sum + directional momentum) */
     float spatial_align = (0.50f * cos1) + (0.30f * cos2) + (0.20f * mom_dot);
@@ -5436,6 +5503,8 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
 
     clock_t t0 = clock();
     uint32_t n = g->node_count;
+    const float *as_arr = (query->pref.pref_id >= 0 && query->pref.pref_id < 5)
+                        ? g->edge_attr_scale[query->pref.pref_id] : NULL;
     int skip_dead = !g->ch_built &&
                     !(*(g->node_flags + start_idx) & NODE_DEAD_TREE) &&
                     !(*(g->node_flags + goal_idx)  & NODE_DEAD_TREE);
@@ -5595,6 +5664,7 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
             uint32_t end = *(g->fwd_offsets + u + 1U);
             for (uint32_t ei = beg; ei < end; ei++) {
                 uint32_t v = *(g->edge_to + ei);
+                float as = as_arr ? as_arr[ei] : compute_attr_scale(g, ei, &query->pref);
                 if (ws->state[v].st_fwd == epoch + 1) continue;
                 if (skip_dead && (*(g->edge_flags + ei) & EDGE_DEAD_TARGET)) continue;
                 if (g->ch_built && !(*(g->ch_level + u) < *(g->ch_level + v))) continue;
@@ -5626,7 +5696,7 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
 
                 /* Optimistic lower bound (cos2 = 1): skip two-hop and heap work
                  * when the edge cannot improve the target. */
-                float sc_min = compute_8d_step_cost(g, ei, &query->pref, query->mode,
+                float sc_min = compute_8d_step_cost(g, ei, &query->pref, query->mode, as,
                                                     cos1, 1.0f, mom, cross_ratio);
                 float ng_min = ws->state[u].g_fwd + sc_min;
                 if (ws->state[v].st_fwd == epoch && ng_min >= ws->state[v].g_fwd) continue;
@@ -5636,7 +5706,7 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
                              two_hop_fwd_cos(g, u, v, goal_idx,
                                              *(g->edge_dx + ei), *(g->edge_dy + ei),
                                              cos1, urx, ury);
-                float sc = compute_8d_step_cost(g, ei, &query->pref, query->mode,
+                float sc = compute_8d_step_cost(g, ei, &query->pref, query->mode, as,
                                                 cos1, cos2, mom, cross_ratio);
                 float ng = ws->state[u].g_fwd + sc;
                 if (ng + h_v >= best_total) continue;
@@ -5696,6 +5766,7 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
                 uint32_t end = *(g->fwd_offsets + u + 1U);
                 for (uint32_t ei = beg; ei < end; ei++) {
                     uint32_t v = *(g->edge_to + ei);
+                    float as = as_arr ? as_arr[ei] : compute_attr_scale(g, ei, &query->pref);
                     if (ws->state[v].st_fwd == epoch + 1) continue;
 if (skip_dead && (*(g->edge_flags + ei) & EDGE_DEAD_TARGET)) continue;
                 if (g->ch_built && !(*(g->ch_level + u) < *(g->ch_level + v))) continue;
@@ -5721,7 +5792,7 @@ if (skip_dead && (*(g->edge_flags + ei) & EDGE_DEAD_TARGET)) continue;
                             : vmr_sqrt_fast((gx - *(g->node_x + v)) * (gx - *(g->node_x + v)) +
                                             (gy - *(g->node_y + v)) * (gy - *(g->node_y + v))) * v_heur);
 
-                    float sc_min = compute_8d_step_cost(g, ei, &query->pref, MODE_VEC_BIDIR,
+                    float sc_min = compute_8d_step_cost(g, ei, &query->pref, MODE_VEC_BIDIR, as,
                                                         cos1, 1.0f, mom, cross_ratio);
                     float ng_min = ws->state[u].g_fwd + sc_min;
                     if (ws->state[v].st_fwd == epoch && ng_min >= ws->state[v].g_fwd) continue;
@@ -5730,7 +5801,7 @@ if (skip_dead && (*(g->edge_flags + ei) & EDGE_DEAD_TARGET)) continue;
                     float cos2 = two_hop_fwd_cos(g, u, v, goal_idx,
                                                  *(g->edge_dx + ei), *(g->edge_dy + ei),
                                                  cos1, urx, ury);
-                    float sc = compute_8d_step_cost(g, ei, &query->pref, MODE_VEC_BIDIR,
+                    float sc = compute_8d_step_cost(g, ei, &query->pref, MODE_VEC_BIDIR, as,
                                                     cos1, cos2, mom, cross_ratio);
                     float ng = ws->state[u].g_fwd + sc;
                     if (ng + h_v >= best_total) continue;
@@ -5784,6 +5855,7 @@ if (skip_dead && (*(g->edge_flags + ei) & EDGE_DEAD_TARGET)) continue;
                 for (uint32_t ri = beg; ri < end; ri++) {
 uint32_t u = *(g->rev_src_node + ri);
                     uint32_t eid = *(g->rev_fwd_eid + ri);
+                    float as = as_arr ? as_arr[eid] : compute_attr_scale(g, eid, &query->pref);
                     if (ws->state[u].st_bwd == epoch + 1) continue;
                     if (skip_dead && (*(g->edge_flags + eid) & EDGE_DEAD_SOURCE)) continue;
                     if (g->ch_built && !(*(g->ch_level + w) < *(g->ch_level + u))) continue;
@@ -5811,7 +5883,7 @@ uint32_t u = *(g->rev_src_node + ri);
                             : vmr_sqrt_fast((sx - *(g->node_x + u)) * (sx - *(g->node_x + u)) +
                                             (sy - *(g->node_y + u)) * (sy - *(g->node_y + u))) * v_heur);
 
-                    float sc_min = compute_8d_step_cost(g, eid, &query->pref, MODE_VEC_BIDIR,
+                    float sc_min = compute_8d_step_cost(g, eid, &query->pref, MODE_VEC_BIDIR, as,
                                                         cos1, 1.0f, mom, cross_ratio);
                     float ng_min = ws->state[w].g_bwd + sc_min;
                     if ((ws->state[u].st_bwd == epoch || ws->state[u].st_bwd == epoch+1) && ng_min >= ws->state[u].g_bwd) continue;
@@ -5820,7 +5892,7 @@ uint32_t u = *(g->rev_src_node + ri);
                     float cos2 = two_hop_rev_cos(g, w, u, start_idx,
                                                  *(g->edge_dx + eid), *(g->edge_dy + eid),
                                                  cos1, urx, ury);
-                    float sc = compute_8d_step_cost(g, eid, &query->pref, MODE_VEC_BIDIR,
+                    float sc = compute_8d_step_cost(g, eid, &query->pref, MODE_VEC_BIDIR, as,
                                                     cos1, cos2, mom, cross_ratio);
                     float ng = ws->state[w].g_bwd + sc;
                     if (ng + h_v >= best_total) continue;
@@ -6300,6 +6372,7 @@ int main(int argc, char **argv) {
             if (sscanf(*(argv + (++i)), "%f,%f,%f,%f,%f", &wa, &ws, &wc, &wt, &wm) == 5) {
                 pref.w_align = wa; pref.w_speed = ws; pref.w_class = wc;
                 pref.w_straight = wt; pref.w_smooth = wm;
+                pref.pref_id = -1;
             }
         } else if (strcmp(a, "--mode") == 0 && i + 1 < argc) {
             const char *m = *(argv + (++i));
