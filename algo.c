@@ -5564,6 +5564,13 @@ static int db_load_raw_graph(sqlite3 *db, VmrRawGraph *rg) {
     raw_graph_free(rg);
     raw_graph_init(rg);
 
+    /* Read-path pragmas: large page cache + mmap the file + in-memory temp.
+     * These cut the row-by-row load time substantially on multi-GB DBs. */
+    sqlite3_exec(db, "PRAGMA cache_size = -262144;", NULL, NULL, NULL);   /* 256 MB */
+    sqlite3_exec(db, "PRAGMA mmap_size = 1073741824;", NULL, NULL, NULL);  /* 1 GB */
+    sqlite3_exec(db, "PRAGMA temp_store = MEMORY;", NULL, NULL, NULL);
+    sqlite3_exec(db, "PRAGMA query_only = ON;", NULL, NULL, NULL);
+
     sqlite3_stmt *nstmt = NULL;
     if (sqlite3_prepare_v2(db, "SELECT id, lat, lon FROM osm_nodes;", -1, &nstmt, NULL) != SQLITE_OK) {
         LOG_ERR("Failed to query osm_nodes: %s", sqlite3_errmsg(db));
