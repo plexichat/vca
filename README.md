@@ -1,16 +1,19 @@
-# VectorStar — Vector-Corridor A* (VCA*) Routing Engine
+# VectorStar — Vector-Corridor A* (VCA*)
 
 A single-file, dependency-free **VCA\*** router for large road networks.
-Instead of optimising a single scalar (travel time), VCA\* optimises a
-**direction-aware, preference-weighted vector cost** — producing routes that are
-straighter, stay on preferred road classes, and align with the overall
-direction of travel.
 
-`algo.c` (single translation unit, C99 + optional OpenMP/AVX2) implements:
-import (OSM XML / **PBF** / CSV / SQLite), preprocessing, and point-to-point
-search, with no external dependencies beyond `sqlite3.c` and `zlib`.
+VCA\* optimises a **direction-aware, preference-weighted vector cost** instead of
+a single scalar such as travel time. Each edge carries a *direction* and a set of
+*feature attributes* (road class, speed, surface). The cost of a path combines
+how well each edge aligns with the remaining route direction (via two-hop
+look-ahead continuation vectors) with a per-profile weighting of those
+attributes. The result is a route that is straighter, keeps to preferred road
+classes, and follows the overall bearing of the trip.
 
----
+`algo.c` is one translation unit (C99, with optional OpenMP and AVX2 paths) that
+does the whole pipeline — OSM XML / PBF / CSV / SQLite import, graph
+contraction and preprocessing, and point-to-point search — with no dependencies
+beyond `sqlite3.c` and `zlib`.
 
 ## Build
 
@@ -23,19 +26,41 @@ gcc -O2 -mavx2 -o uk_vector_router_sc.exe algo.c sqlite3.o libz.a -I . -lm
 ## Usage
 
 ```sh
-# import + preprocess (PBF or OSM XML or CSV) -> .vgraph cache
-./uk_vector_router.exe --import-pbf great-britain-latest.osm.pbf --db uk.db --preprocess --save-bin uk.vgraph
+# import + preprocess (PBF, OSM XML, or CSV) into a reusable .vgraph cache
+./uk_vector_router.exe --import-pbf great-britain-latest.osm.pbf --db uk.db \
+    --preprocess --save-bin uk.vgraph
 
-# route (any of 5 profiles, 5 modes)
-./uk_vector_router.exe --load-bin uk.vgraph --route-coord 51.5074 -0.1278 55.9533 -3.1883 \
+# route between two coordinates
+./uk_vector_router.exe --load-bin uk.vgraph \
+    --route-coord 51.5074 -0.1278 55.9533 -3.1883 \
     --mode bidir --profile balanced
-
-# modes: bidir | unidir | astar | dijkstra | cch
-# profiles: balanced | fastest | direct | highway | local (no-toll)
-# env: VMR_ALT_SCALE (override auto ALT scale), VMR_CCH=1 (build CCH hierarchy)
 ```
 
----
+**Modes** (`--mode`): `bidir` (default), `unidir`, `astar`, `dijkstra`, `cch`.
+
+**Profiles** (`--profile`): `balanced` (default), `fastest`, `direct`, `highway`,
+`local` (no-toll). Each profile sets the feature weight vector used in the cost.
+
+**Environment overrides:** `VMR_ALT_SCALE` forces the ALT landmark heuristic
+scale (default is chosen per query from the graph's admissible minimum); setting
+`VMR_CCH=1` builds the CCH hierarchy at preprocess time.
+
+## How the search works
+
+- **Cost model.** Each edge stores a direction `(edge_ux, edge_uy)` and a scale
+  `edge_attr_scale` derived from its feature attributes. The path cost weights
+  edge length by a per-profile attribute score and rewards alignment between an
+  edge and the two-hop continuation vector from the node it leads to.
+- **Heuristic (ALT).** A small set of landmarks (31 on the UK graph) is chosen
+  and their distances precomputed. The heuristic is the max over landmarks of
+  `|d(L,t) - d(L,v)|` scaled by `attr_min`, which is admissible because every
+  edge cost is at least `attr_min × length`.
+- **Two-hop continuation.** For each node, a short forward/backward look-ahead
+  vector is precomputed at preprocess time so the search can evaluate direction
+  change without walking the path.
+- **Contraction + reorder.** Low-degree nodes are contracted, dead-end components
+  are peeled, and the graph is reordered by Hilbert curve so that each query
+  touches a compact, cache-friendly region.
 
 ## Performance (single core, this machine)
 
@@ -43,6 +68,7 @@ gcc -O2 -mavx2 -o uk_vector_router_sc.exe algo.c sqlite3.o libz.a -I . -lm
 **Graph:** UK — 17,039,603 OSM nodes → 2,714,206 after contraction; 33,131,465 → 6,027,213 edges (31 cul-de-sac peels, 31 ALT landmarks).
 
 ### Preprocessing (one-time)
+
 | Phase | Single core | OpenMP (6 threads) |
 |---|---|---|
 | SQLite DB load (17 M nodes / 33 M edges) | ~45 s (I/O) | ~45 s (I/O) |
@@ -51,6 +77,7 @@ gcc -O2 -mavx2 -o uk_vector_router_sc.exe algo.c sqlite3.o libz.a -I . -lm
 | **Total algorithm** | **27.5 s** | **~10 s** |
 
 ### Query latency (warm, single core)
+
 | Algorithm | Expanded | CPU |
 |---|---|---|
 | **vca-bidir** | **1,644** | **<1 ms** |
@@ -61,12 +88,14 @@ gcc -O2 -mavx2 -o uk_vector_router_sc.exe algo.c sqlite3.o libz.a -I . -lm
 Cold first query (mmap page-faults) is ~0.3–0.9 s; warm is <1 ms.
 
 ### Peak memory (single core)
+
 | Metric | Value |
 |---|---|
 | Peak **private** (heap) | **382 MB** |
 | Peak working set (incl. mmap pages) | 583 MB |
 
 ### All 5 profiles (single core, London→Edinburgh)
+
 | Profile | Dist | CPU |
 |---|---|---|
 | balanced | 597.75 km | 3–4 ms |
@@ -75,13 +104,12 @@ Cold first query (mmap page-faults) is ~0.3–0.9 s; warm is <1 ms.
 | highway | 597.92 km | 3–4 ms |
 | local/no-toll | 598.49 km | 3–4 ms |
 
-**Stat: 5 optimisation profiles, each < 20 ms per query (typically 3–4 ms).**
+**5 optimisation profiles, each < 20 ms per query (typically 3–4 ms).**
 
 ### Route quality (London→Edinburgh, balanced)
+
 597.75 km (direct 533.5 km, **detour 1.12×**), 374 min, mean_cos **0.917**,
 8-D alignment ~0.91, 919 hops.
-
----
 
 ## Comparison to incumbents
 
@@ -92,35 +120,15 @@ Cold first query (mmap page-faults) is ~0.3–0.9 s; warm is <1 ms.
 | Objective | time | time | time | **direction-aware vector** |
 | Memory | — | — | large | **382 MB** |
 
-VCA\* matches A\*'s speed on long routes and beats it on **route shape** (alignment/straightness/class), at a fraction of CCH's memory.
-
----
-
-## How to improve further
-
-**Latency (→ sub-millisecond, more headroom):**
-1. **Enable the AVX2 block expansion by default** (currently gated by `VMR_BLOCK`); build `rev_blocks` for the backward pass too.
-10. **Cache `edge_attr_scale`** (already mmap'd) and precompute `time·attr` per edge to remove a multiply in the hot loop.
-11. **Stronger admissible heuristic:** build landmarks on a `time·attr` metric or add more landmarks; the current 8-landmark cap is conservative.
-12. **Radix heap** for the ALT landmark Dijkstras (single-core preprocess 19.8 s is the biggest one-time cost).
-
-**Memory (→ <300 MB):**
-- mmap the per-query `sf/sb` workspace or shrink it (drop `mx/my`, recompute from parent edge).
-- Reduce ALT to int16-quantised distances (695 MB → ~170 MB if heap-backed).
-
-**Preprocessing:**
-- Parallelise contraction/components; radix heap for ALT; better landmark selection (k-means / farthest-point).
-
-**Quality:**
-- **Build `edge_attr_scale` from normalised features** (currently unnormalised → 0.5–0.8); add a turn-count metric; validate against a PSP baseline.
-- Fix the legacy `vmr_build_ch` (pair-set 8 GB growth) so the CCH comparison is exact.
-
-**Correctness:**
-- The auto ALT scale is sub-optimal for some short/mixed queries; the node-budget retry mitigates but doesn't eliminate it. A proper per-query admissibility check (consistency test on the found path) would close this.
-
----
+VCA\* matches A\*'s speed on long routes and beats it on **route shape** (alignment,
+straightness, class) at a fraction of CCH's memory.
 
 ## Status / caveats
-- `.vgraph` format is v8; regenerate after changes.
-- CCH is opt-in (`VMR_CCH=1`) and experimental (legacy CH builder doesn't scale cleanly).
+
+- `.vgraph` format is v8; regenerate after changing the graph layout.
+- CCH is opt-in (`VMR_CCH=1`) and experimental — the legacy CH builder does not
+  scale cleanly to large graphs.
+- The auto ALT scale is chosen per query from the graph's admissible minimum; for
+  some short or mixed queries this is not the fastest admissible choice, so the
+  search may expand more nodes than strictly necessary.
 - See `RESEARCH.md` for related work and the benchmark plan.

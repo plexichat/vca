@@ -972,6 +972,7 @@ typedef struct {
     uint32_t  *nodes;          /* Sequence start -> ... -> goal */
     uint32_t  *edges;          /* Sequence of edge indices      */
     uint32_t   hop_count;
+    uint32_t   turn_count;     /* # direction changes > 45 deg between consecutive edges */
 
     double     total_distance_m;
     double     direct_distance_m;
@@ -6076,6 +6077,9 @@ static void vmr_compute_result_telemetry(const VmrGraph *g, VmrResult *res,
     double sum_8d_w  = 0.0;
     double net_dx = 0.0;
     double net_dy = 0.0;
+    float pdx = 0.0f, pdy = 0.0f;
+    int have_prev = 0;
+    uint32_t turns = 0;
 
     float gx = *(g->node_x + res->goal_idx);
     float gy = *(g->node_y + res->goal_idx);
@@ -6098,6 +6102,15 @@ static void vmr_compute_result_telemetry(const VmrGraph *g, VmrResult *res,
         float dy  = *(g->edge_dy + eid);
         float ux  = *(g->edge_ux + eid);
         float uy  = *(g->edge_uy + eid);
+
+        if (have_prev) {
+            float l1 = sqrtf(pdx * pdx + pdy * pdy);
+            float l2 = sqrtf(dx * dx + dy * dy);
+            if (l1 > 1e-6f && l2 > 1e-6f && (pdx * dx + pdy * dy) / (l1 * l2) < 0.7071f) {
+                turns++;
+            }
+        }
+        pdx = dx; pdy = dy; have_prev = 1;
 
         tot_dist += (double)len;
         tot_time += (double)tm;
@@ -6127,6 +6140,7 @@ static void vmr_compute_result_telemetry(const VmrGraph *g, VmrResult *res,
 
     res->total_distance_m = tot_dist;
     res->est_time_s       = tot_time;
+    res->turn_count       = turns;
     res->detour_ratio     = (chord_len > 1e-3) ? (tot_dist / chord_len) : 1.0;
     res->mean_cos_sim     = (tot_dist > 1e-3) ? (sum_cos_w / tot_dist) : 1.0;
     res->cum_vec_cos_sim  = cum_cos;
@@ -7915,8 +7929,8 @@ static void vmr_print_result(const VmrGraph *g, const VmrResult *res) {
     printf("Est Time    : %.1f min (%.0f s)\n", res->est_time_s / 60.0, res->est_time_s);
     printf("Vector Stats: mean_cos=%.4f | cum_vec_cos=%.5f | 8D_align=%.4f\n",
            res->mean_cos_sim, res->cum_vec_cos_sim, res->mean_8d_alignment);
-    printf("Performance : %u hops | %u nodes expanded | %.3f ms\n",
-           res->hop_count, res->nodes_expanded, res->elapsed_ms);
+    printf("Performance : %u hops | %u turns | %u nodes expanded | %.3f ms\n",
+           res->hop_count, res->turn_count, res->nodes_expanded, res->elapsed_ms);
 
     printf("Node Chain  : ");
     uint32_t show = res->hop_count + 1U;
