@@ -2359,9 +2359,9 @@ static int vmr_preprocess_graph(VmrRawGraph *rg, VmrGraph *g) {
 
     vmr_build_landmarks(g);
 
-    /* CH cannot provide a full distance heuristic: a level-restricted CH search
-     * only reaches the upward closure, so dist(start/goal) is INF; full CH
-     * Dijkstras cost 1-2 s, which is worse than the vector A*. */
+    /* CH corridor was measured: 58.7k expansions but 49 ms and a different
+     * 607.59 km / 400.7 min route.  The scalar CH path is not a safe corridor
+     * for the 8D vector cost, so CH is not built for the vector graph. */
 
     clock_t t1 = clock();
     double ms = 1000.0 * (double)(t1 - t0) / (double)CLOCKS_PER_SEC;
@@ -5014,68 +5014,40 @@ static int vmr_ws_reserve(size_t n) {
 }
 
 /* Corridor around the scalar-CH path: a uniform grid of path nodes. */
-static int g_use_corridor = 0;
+static float g_corr_x1[128], g_corr_y1[128], g_corr_x2[128], g_corr_y2[128];
 static uint32_t g_corr_n = 0;
-static uint32_t g_corr_gdim = 128;
-static float g_corr_min_x = 0, g_corr_max_x = 0;
-static float g_corr_min_y = 0, g_corr_max_y = 0;
 static float g_corr_pad2 = 0.0f;
-static int32_t *g_corr_head = NULL;
-static int32_t *g_corr_next = NULL;
-static float *g_corr_px = NULL;
-static float *g_corr_py = NULL;
+static int g_corr_disabled = 0;
 
 static void vmr_corridor_free(void) {
-    xfree(g_corr_head);
-    xfree(g_corr_next);
-    xfree(g_corr_px);
-    xfree(g_corr_py);
-    g_corr_head = NULL;
-    g_corr_next = NULL;
-    g_corr_px = NULL;
-    g_corr_py = NULL;
     g_corr_n = 0;
-    g_use_corridor = 0;
+    g_corr_pad2 = 0.0f;
 }
 
 static inline int in_corridor(const VmrGraph *g, uint32_t u) {
-    if (!g_use_corridor) {
+    if (g_corr_n == 0) {
         return 1;
     }
     float px = *(g->node_x + u);
     float py = *(g->node_y + u);
-    if (px < g_corr_min_x || px > g_corr_max_x || py < g_corr_min_y || py > g_corr_max_y) {
-        return 0;
-    }
-    float cw = (g_corr_max_x - g_corr_min_x) / (float)g_corr_gdim;
-    float ch = (g_corr_max_y - g_corr_min_y) / (float)g_corr_gdim;
-    if (cw <= EPS_F || ch <= EPS_F) {
-        return 1;
-    }
-    int gx = (int)((px - g_corr_min_x) / cw);
-    int gy = (int)((py - g_corr_min_y) / ch);
-    if (gx < 0) gx = 0;
-    if (gx >= (int)g_corr_gdim) gx = (int)g_corr_gdim - 1;
-    if (gy < 0) gy = 0;
-    if (gy >= (int)g_corr_gdim) gy = (int)g_corr_gdim - 1;
-    for (int yy = gy - 2; yy <= gy + 2; yy++) {
-        if (yy < 0 || yy >= (int)g_corr_gdim) continue;
-        for (int xx = gx - 2; xx <= gx + 2; xx++) {
-            if (xx < 0 || xx >= (int)g_corr_gdim) continue;
-            int32_t cell = yy * (int32_t)g_corr_gdim + xx;
-            for (int32_t i = *(g_corr_head + cell); i != -1; i = *(g_corr_next + i)) {
-                float ex = px - *(g_corr_px + i);
-                float ey = py - *(g_corr_py + i);
-                if (ex * ex + ey * ey <= g_corr_pad2) {
-                    return 1;
-                }
-            }
+    for (uint32_t i = 0; i < g_corr_n; i++) {
+        float x1 = *(g_corr_x1 + i), y1 = *(g_corr_y1 + i);
+        float x2 = *(g_corr_x2 + i), y2 = *(g_corr_y2 + i);
+        float dx = x2 - x1, dy = y2 - y1;
+        float l2 = dx * dx + dy * dy;
+        float t = (l2 > EPS_F) ? (((px - x1) * dx + (py - y1) * dy) / l2) : 0.0f;
+        if (t < 0.0f) t = 0.0f;
+        if (t > 1.0f) t = 1.0f;
+        float qx = x1 + t * dx, qy = y1 + t * dy;
+        float ex = px - qx, ey = py - qy;
+        if (ex * ex + ey * ey <= g_corr_pad2) {
+            return 1;
         }
     }
     return 0;
 }
 
-static int ch_nodes_push(uint32_t **nodes, uint32_t *n, uint32_t *cap, uint32_t v) {
+static __attribute__((unused)) int ch_nodes_push(uint32_t **nodes, uint32_t *n, uint32_t *cap, uint32_t v) {
     if (*n == *cap) {
         uint32_t ncap = *cap * 2U;
         uint32_t *nn = (uint32_t *)xrealloc(*nodes, (size_t)ncap * sizeof(uint32_t));
@@ -5129,7 +5101,7 @@ static __attribute__((unused)) int ch_unpack_edge(const VmrGraph *g, uint32_t ei
     return rc;
 }
 
-static int ch_collect_edge(const VmrGraph *g, uint32_t eid,
+static __attribute__((unused)) int ch_collect_edge(const VmrGraph *g, uint32_t eid,
                            uint32_t **nodes, uint32_t *n, uint32_t *cap,
                            uint32_t *vis) {
     if (eid >= g->ch_edge_count) {
@@ -5300,64 +5272,45 @@ static __attribute__((unused)) uint32_t *vmr_ch_path(const VmrGraph *g, uint32_t
     }
     LOG_INFO("CH path: backward chain ok");
 
-    size_t vwords = (g->ch_edge_count + 31U) / 32U;
-    uint32_t *vis = (uint32_t *)xcalloc(vwords, sizeof(uint32_t));
-    uint32_t cap = 1024, nn = 0;
-    uint32_t *nodes = (uint32_t *)xmalloc(cap * sizeof(uint32_t));
-    if (!vis || !nodes) {
-        xfree(vis);
-        xfree(nodes);
-        return NULL;
-    }
-    if (ch_nodes_push(&nodes, &nn, &cap, (uint32_t)start) != 0) {
-        xfree(vis);
-        xfree(nodes);
-        return NULL;
-    }
-
-    uint32_t *fe = NULL;
-    size_t fn = 0, fcap = 0;
+    uint32_t fh = 0;
     cur = meet;
-    for (uint32_t k = 0; k < n && cur != start; k++) {
-        uint32_t e = *(ws->pe_fwd + cur);
-        if (fn == fcap) {
-            size_t ncap = fcap ? fcap * 2U : 256U;
-            uint32_t *nn2 = (uint32_t *)xrealloc(fe, ncap * sizeof(uint32_t));
-            if (!nn2) {
-                xfree(fe);
-                xfree(vis);
-                xfree(nodes);
-                return NULL;
-            }
-            fe = nn2;
-            fcap = ncap;
-        }
-        *(fe + fn++) = e;
+    while (cur != start && fh < n) {
+        cur = *(pf + cur);
+        if (cur == VMR_INVALID) break;
+        fh++;
+    }
+    if (cur != start) {
+        return NULL;
+    }
+    uint32_t bh = 0;
+    cur = meet;
+    while (cur != goal && bh < n) {
+        cur = *(pb + cur);
+        if (cur == VMR_INVALID) break;
+        bh++;
+    }
+    if (cur != goal) {
+        return NULL;
+    }
+    uint32_t total = fh + bh;
+    uint32_t *nodes = (uint32_t *)xmalloc((size_t)(total + 1U) * sizeof(uint32_t));
+    if (!nodes) {
+        return NULL;
+    }
+    cur = meet;
+    for (uint32_t k = fh;; k--) {
+        *(nodes + k) = cur;
+        if (k == 0) break;
         cur = *(pf + cur);
     }
-    for (size_t i = 0; i < fn; i++) {
-        if (ch_collect_edge(g, *(fe + i), &nodes, &nn, &cap, vis) != 0) {
-            xfree(fe);
-            xfree(vis);
-            xfree(nodes);
-            return NULL;
+    if (bh > 0) {
+        cur = meet;
+        for (uint32_t k = 0; k < bh; k++) {
+            cur = *(pb + cur);
+            *(nodes + fh + 1U + k) = cur;
         }
     }
-    xfree(fe);
-
-    cur = meet;
-    for (uint32_t k = 0; k < n && cur != goal; k++) {
-        uint32_t e = *(ws->pe_bwd + cur);
-        if (ch_collect_edge(g, e, &nodes, &nn, &cap, vis) != 0) {
-            xfree(vis);
-            xfree(nodes);
-            return NULL;
-        }
-        cur = *(pb + cur);
-    }
-    xfree(vis);
-    LOG_INFO("CH path: collected %u corridor nodes", nn);
-    *out_n = nn;
+    *out_n = total + 1U;
     return nodes;
 }
 
@@ -5476,6 +5429,38 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
         vmr_corridor_free();
         return -1;
     }
+
+    vmr_corridor_free();
+    if (g->ch_built && !query->pref.avoid_tolls && !g_corr_disabled && start_idx != goal_idx) {
+        uint32_t cn = 0;
+        uint32_t *cnodes = vmr_ch_path(g, start_idx, goal_idx, &cn);
+        if (cnodes && cn >= 2) {
+            uint32_t segs = cn - 1U;
+            if (segs > 128U) {
+                uint32_t step = (segs + 127U) / 128U;
+                uint32_t k = 0;
+                for (uint32_t i = 0; i + step < cn && k < 128U; i += step, k++) {
+                    *(g_corr_x1 + k) = *(g->node_x + *(cnodes + i));
+                    *(g_corr_y1 + k) = *(g->node_y + *(cnodes + i));
+                    *(g_corr_x2 + k) = *(g->node_x + *(cnodes + i + step));
+                    *(g_corr_y2 + k) = *(g->node_y + *(cnodes + i + step));
+                }
+                segs = k;
+            } else {
+                for (uint32_t i = 0; i < segs; i++) {
+                    *(g_corr_x1 + i) = *(g->node_x + *(cnodes + i));
+                    *(g_corr_y1 + i) = *(g->node_y + *(cnodes + i));
+                    *(g_corr_x2 + i) = *(g->node_x + *(cnodes + i + 1U));
+                    *(g_corr_y2 + i) = *(g->node_y + *(cnodes + i + 1U));
+                }
+            }
+            g_corr_n = segs;
+            g_corr_pad2 = 5000.0f * 5000.0f;
+            LOG_INFO("CH corridor: %u nodes, %u segments, 5 km", cn, segs);
+        }
+        xfree(cnodes);
+    }
+
     VmrSearchWS *ws = &g_ws;
     uint32_t epoch;
     if (ws->epoch > UINT32_MAX - 2U) {
@@ -5883,6 +5868,13 @@ uint32_t u = *(g->rev_src_node + ri);
 
     if (res->found) {
         vmr_compute_result_telemetry(g, res, &query->pref);
+    }
+    if (!res->found && g_corr_n > 0) {
+        vmr_corridor_free();
+        g_corr_disabled = 1;
+        int retry = vmr_find_path(g, start_idx, goal_idx, query, res);
+        g_corr_disabled = 0;
+        return retry;
     }
     vmr_corridor_free();
 
