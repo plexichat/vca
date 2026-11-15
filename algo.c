@@ -7358,13 +7358,15 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
         int pid = query->pref.pref_id;
         float amin = (pid >= 0 && pid < 5) ? g->attr_min[pid] : attr_scale_min;
         if (amin <= 0.0f) amin = attr_scale_min;
-        alt_scale = cch_weak ? amin : ((chord_len > 240000.0f) ? 0.88f : amin);
-        cch_strong = (!cch_weak && alt_scale > amin + 1e-4f) ? 1 : 0;
-        const char *s = getenv("UVR_ALT_SCALE");
-        if (s && *s) {
-            float v = (float)atof(s);
-            if (v > 0.0f && v <= 1.5f) alt_scale = v;
+        alt_scale = amin; /* admissible default (correct) */
+        if (!cch_weak) {
+            const char *s = getenv("UVR_ALT_SCALE");
+            if (s && *s) {
+                float v = (float)atof(s);
+                if (v > 0.0f && v <= 1.5f) alt_scale = v; /* opt-in strong (may be inadmissible) */
+            }
         }
+        cch_strong = (!cch_weak && alt_scale > amin + 1e-4f) ? 1 : 0;
     }
     (void)0;
 #if defined(__AVX2__)
@@ -7782,6 +7784,33 @@ uint32_t u = *(g->rev_src_node + ri);
 
     clock_t t1 = clock();
     res->elapsed_ms = 1000.0 * (double)(t1 - t0) / (double)CLOCKS_PER_SEC;
+
+    /* Per-query admissibility check: if the strong scale over-estimated on an edge
+     * of the found path (its attr < scale), the result may be sub-optimal -> retry
+     * once with the admissible min(attr). */
+    if (res->found && cch_strong && !cch_weak && query->pref.pref_id >= 0 && query->pref.pref_id < 5) {
+        const float *as2 = g->edge_attr_scale[query->pref.pref_id];
+        if (as2 != NULL && alt_scale > 0.0f && res->hop_count > 0) {
+            float mn = FLT_MAX;
+            for (uint32_t i = 0; i < res->hop_count; i++) {
+                uint32_t e = *(res->edges + i);
+                if (e < g->edge_count) {
+                    float a = *(as2 + e);
+                    if (a < mn) mn = a;
+                }
+            }
+            if (mn < alt_scale - 1e-3f) {
+                LOG_INFO("ALT admissibility: path min attr %.3f < scale %.3f; retrying admissible", mn, alt_scale);
+                vmr_result_free(res);
+                vmr_result_init(res);
+                res->mode_used = query->mode;
+                res->start_idx = start_idx;
+                res->goal_idx = goal_idx;
+                cch_weak = 1;
+                goto vmr_retry;
+            }
+        }
+    }
 
     if (res->found) {
         vmr_compute_result_telemetry(g, res, &query->pref);
