@@ -7207,6 +7207,9 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
         xfree(cnodes);
     }
 
+    int cch_weak = 0;
+    int cch_strong = 0;
+    vmr_retry:;
     VmrSearchWS *ws = &g_ws;
     uint32_t epoch;
     if (ws->epoch > UINT32_MAX - 2U) {
@@ -7279,7 +7282,8 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
         int pid = query->pref.pref_id;
         float amin = (pid >= 0 && pid < 5) ? g->attr_min[pid] : attr_scale_min;
         if (amin <= 0.0f) amin = attr_scale_min;
-        alt_scale = (chord_len > 300000.0f) ? 0.88f : amin; /* chord_len is metres */
+        alt_scale = cch_weak ? amin : ((chord_len > 240000.0f) ? 0.88f : amin);
+        cch_strong = (!cch_weak && alt_scale > amin + 1e-4f) ? 1 : 0;
         const char *s = getenv("UVR_ALT_SCALE");
         if (s && *s) {
             float v = (float)atof(s);
@@ -7637,6 +7641,19 @@ uint32_t u = *(g->rev_src_node + ri);
                 }
             }
         }
+    }
+
+    /* Node-budget auto-select: if the strong scale blew up (many expansions) on
+     * this route, retry once with the admissible min(attr) scale. */
+    if (cch_strong && expanded > 40000U) {
+        LOG_INFO("ALT strong scale blew up (%u expansions); retrying with admissible min", expanded);
+        vmr_result_free(res);
+        vmr_result_init(res);
+        res->mode_used = query->mode;
+        res->start_idx = start_idx;
+        res->goal_idx = goal_idx;
+        cch_weak = 1;
+        goto vmr_retry;
     }
 
     res->nodes_expanded = expanded;
