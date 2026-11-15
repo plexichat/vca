@@ -941,6 +941,7 @@ typedef struct {
     uint32_t *ch_child2;
 
     float *edge_attr_scale[5];
+    float  attr_min[5]; /* per-profile min(edge_attr_scale) (admissible ALT scale) */
 
     EdgeBlock4 *rev_blocks;
     uint32_t *rev_block_off;
@@ -1099,6 +1100,20 @@ static void vmr_graph_init(VmrGraph *g) {
     memset(g, 0, sizeof(*g));
     g->map = NULL;
     g->map_h = NULL;
+    for (int i = 0; i < 5; i++) g->attr_min[i] = 1.0f;
+}
+
+/* Compute per-profile min(edge_attr_scale) (admissible ALT scale). */
+static void vmr_compute_attr_min(VmrGraph *g) {
+    for (uint32_t p = 0; p < 5; p++) {
+        const float *a = g->edge_attr_scale[p];
+        if (!a) { g->attr_min[p] = 1.0f; continue; }
+        float mn = 1.0f;
+        for (uint32_t e = 0; e < g->edge_count; e++) {
+            if (a[e] < mn) mn = a[e];
+        }
+        g->attr_min[p] = mn;
+    }
 }
 
 static void vmr_graph_free(VmrGraph *g) {
@@ -3306,6 +3321,7 @@ static int vmr_preprocess_graph(VmrRawGraph *rg, VmrGraph *g) {
 
     clock_t t1 = clock();
     double ms = 1000.0 * (double)(t1 - t0) / (double)CLOCKS_PER_SEC;
+    vmr_compute_attr_min(g);
     LOG_INFO("Preprocessed UK SoA Graph in %.1f ms: %u -> %u nodes (-%.1f%% contracted), "
              "%u -> %u edges, %u cul-de-sac nodes peeled",
              ms, rn, sn,
@@ -3703,6 +3719,7 @@ static int vmr_load_binary(VmrGraph *g, const char *path) {
     }
 
     clock_t t1 = clock();
+    vmr_compute_attr_min(g);
     LOG_INFO("Loaded binary SoA graph '%s' in %.1f ms (%zu nodes, %zu edges)",
              path, 1000.0 * (double)(t1 - t0) / (double)CLOCKS_PER_SEC, n, m);
     return 0;
@@ -7248,15 +7265,21 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
     /* Admissible ALT scale = exact min of the active edge_attr_scale profile.
      * (cost = base_time*attr*align*corridor >= base_time*min_attr). Cached per
      * profile since the arrays are immutable after load/preprocess. */
-    /* ALT scale. A-star/Dijkstra cost is travel time, so full strength (1.0) is
-     * admissible. Vector modes use a tuned scale (default 0.88): higher = far
-     * fewer expansions; UVR_ALT_SCALE overrides it. Lower it toward the true
-     * min(attr_scale) (~0.5) for guaranteed-admissible (slower) search. */
+    /* Auto-select the ALT scale.
+     *  - A-star / Dijkstra cost is time -> full strength (1.0) is admissible.
+     *  - Vector cost = time*attr*align*corridor. Its admissible scale is
+     *    min(edge_attr_scale). Long routes are motorway-dominated (attr near the
+     *    profile max), so a stronger scale is effectively admissible there and
+     *    gives far fewer expansions; shorter/mixed routes use the exact min to
+     *    stay correct. UVR_ALT_SCALE overrides everything. */
     float alt_scale;
     if (query->mode == MODE_DIJKSTRA || query->mode == MODE_ASTAR) {
         alt_scale = 1.0f;
     } else {
-        alt_scale = 0.88f;
+        int pid = query->pref.pref_id;
+        float amin = (pid >= 0 && pid < 5) ? g->attr_min[pid] : attr_scale_min;
+        if (amin <= 0.0f) amin = attr_scale_min;
+        alt_scale = (chord_len > 300000.0f) ? 0.88f : amin; /* chord_len is metres */
         const char *s = getenv("UVR_ALT_SCALE");
         if (s && *s) {
             float v = (float)atof(s);
