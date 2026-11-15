@@ -151,8 +151,9 @@ typedef struct __attribute__((aligned(32))) {
     float dx[4], dy[4];
     float vx[4], vy[4];
     float time[4];
-    float attr[4];
+    float attr[5][4];   /* per built-in profile, lane-contiguous */
     uint8_t flags[4];
+    uint8_t pad[12];
 } EdgeBlock4;
 
 typedef struct {
@@ -670,8 +671,20 @@ typedef struct {
 
     float *edge_attr_scale[5];
 
-    EdgeBlock4 *fwd_blocks;
-    uint32_t *fwd_block_off;
+    EdgeBlock4 *rev_blocks;
+    uint32_t *rev_block_off;
+
+    /* Precomputed two-hop continuations per edge (sum vector + inverse norm) */
+    uint32_t *th_off;   /* [edge_count + 1] */
+    float    *th_sx;    /* [th_count] */
+    float    *th_sy;
+    float    *th_inv;
+    uint32_t  th_count;
+    uint32_t *rth_off;  /* reverse edge -> continuations */
+    float    *rth_sx;
+    float    *rth_sy;
+    float    *rth_inv;
+    uint32_t  rth_count;
 
     IdMap     osm_map;
 } VmrGraph;
@@ -851,8 +864,18 @@ static void vmr_graph_free(VmrGraph *g) {
     for (int i = 0; i < 5; i++) {
         xfree(g->edge_attr_scale[i]);
     }
-    xfree(g->fwd_blocks);
-    xfree(g->fwd_block_off);
+    xfree_aligned(g->rev_blocks);
+    xfree(g->rev_block_off);
+    xfree(g->th_off);
+    xfree(g->th_sx);
+    xfree(g->th_sy);
+    xfree(g->th_inv);
+    g->th_count = 0;
+    xfree(g->rth_off);
+    xfree(g->rth_sx);
+    xfree(g->rth_sy);
+    xfree(g->rth_inv);
+    g->rth_count = 0;
     idmap_free(&g->osm_map);
     vmr_graph_init(g);
 }
@@ -1860,58 +1883,184 @@ static void vmr_build_landmarks(VmrGraph *g) {
              1000.0 * (double)(t1 - t0) / (double)CLOCKS_PER_SEC);
 }
 
-static __attribute__((unused)) void vmr_build_edge_blocks(VmrGraph *g) {
+static void vmr_build_edge_blocks(VmrGraph *g) {
     uint32_t n = g->node_count;
-    size_t nb = 0;
-    for (uint32_t u = 0; u < n; u++) {
-        uint32_t deg = *(g->fwd_offsets + u + 1U) - *(g->fwd_offsets + u);
-        nb += (deg + 3U) / 4U;
+    size_t rnb = 0;
+    for (uint32_t w = 0; w < n; w++) {
+        uint32_t deg = *(g->rev_offsets + w + 1U) - *(g->rev_offsets + w);
+        rnb += (deg + 3U) / 4U;
     }
-    if (nb == 0) {
-        return;
-    }
-    EdgeBlock4 *blocks = (EdgeBlock4 *)xcalloc(nb, sizeof(EdgeBlock4));
-    uint32_t *boff = (uint32_t *)xcalloc((size_t)n + 1U, sizeof(uint32_t));
-    if (!blocks || !boff) {
-        xfree(blocks);
-        xfree(boff);
-        return;
-    }
-    size_t b = 0;
-    for (uint32_t u = 0; u < n; u++) {
-        *(boff + u) = (uint32_t)b;
-        uint32_t beg = *(g->fwd_offsets + u);
-        uint32_t end = *(g->fwd_offsets + u + 1U);
-        for (uint32_t e = beg; e < end; e += 4U) {
-            EdgeBlock4 *blk = blocks + b;
-            for (uint32_t l = 0; l < 4; l++) {
-                if (e + l < end) {
-                    uint32_t ei = e + l;
-                    uint32_t to = *(g->edge_to + ei);
-                    blk->to[l] = to;
-                    blk->ux[l] = *(g->edge_ux + ei);
-                    blk->uy[l] = *(g->edge_uy + ei);
-                    blk->dx[l] = *(g->edge_dx + ei);
-                    blk->dy[l] = *(g->edge_dy + ei);
-                    blk->vx[l] = *(g->node_x + to);
-                    blk->vy[l] = *(g->node_y + to);
-                    blk->time[l] = *(g->edge_time_s + ei);
-                    blk->attr[l] = g->edge_attr_scale[0] ? *(g->edge_attr_scale[0] + ei) : 1.0f;
-                    blk->flags[l] = *(g->edge_flags + ei);
-                } else {
-                    blk->to[l] = VMR_INVALID;
-                    blk->flags[l] = EDGE_DEAD_TARGET;
+    EdgeBlock4 *rblocks = (EdgeBlock4 *)xaligned_alloc(32, (rnb ? rnb : 1U) * sizeof(EdgeBlock4));
+    uint32_t *rboff = (uint32_t *)xcalloc((size_t)n + 1U, sizeof(uint32_t));
+    if (rblocks && rboff) {
+        memset(rblocks, 0, (rnb ? rnb : 1U) * sizeof(EdgeBlock4));
+        size_t rb = 0;
+        for (uint32_t w = 0; w < n; w++) {
+            *(rboff + w) = (uint32_t)rb;
+            uint32_t beg = *(g->rev_offsets + w);
+            uint32_t end = *(g->rev_offsets + w + 1U);
+            for (uint32_t ri = beg; ri < end; ri += 4U) {
+                EdgeBlock4 *blk = rblocks + rb;
+                for (uint32_t l = 0; l < 4; l++) {
+                    if (ri + l < end) {
+                        uint32_t eid = *(g->rev_fwd_eid + ri + l);
+                        uint32_t to = *(g->rev_src_node + ri + l);
+                        blk->to[l] = to;
+                        blk->ux[l] = -(*(g->edge_ux + eid));
+                        blk->uy[l] = -(*(g->edge_uy + eid));
+                        blk->dx[l] = -(*(g->edge_dx + eid));
+                        blk->dy[l] = -(*(g->edge_dy + eid));
+                        blk->vx[l] = *(g->node_x + to);
+                        blk->vy[l] = *(g->node_y + to);
+                        blk->time[l] = *(g->edge_time_s + eid);
+                        for (uint32_t p = 0; p < 5; p++) {
+                            blk->attr[p][l] = g->edge_attr_scale[p]
+                                                  ? *(g->edge_attr_scale[p] + eid) : 1.0f;
+                        }
+                        blk->flags[l] = *(g->edge_flags + eid);
+                    } else {
+                        blk->to[l] = VMR_INVALID;
+                        blk->flags[l] = EDGE_DEAD_SOURCE;
+                    }
                 }
+                rb++;
             }
-            b++;
+        }
+        *(rboff + n) = (uint32_t)rb;
+        xfree_aligned(g->rev_blocks);
+        xfree(g->rev_block_off);
+        g->rev_blocks = rblocks;
+        g->rev_block_off = rboff;
+    } else {
+        xfree_aligned(rblocks);
+        xfree(rboff);
+    }
+
+    LOG_INFO("Edge blocks: %u rev (%u edges)", (uint32_t)rnb, g->edge_count);
+}
+
+static void vmr_build_two_hop_rev(VmrGraph *g) {
+    size_t m = g->edge_count;
+    if (m == 0) {
+        return;
+    }
+    size_t total = 0;
+    for (uint32_t ri = 0; ri < m; ri++) {
+        uint32_t u = *(g->rev_src_node + ri);
+        uint32_t deg = *(g->rev_offsets + u + 1U) - *(g->rev_offsets + u);
+        if (deg > 8U || deg == 0) {
+            continue;
+        }
+        total += deg;
+    }
+    uint32_t *off = (uint32_t *)xmalloc((m + 1U) * sizeof(uint32_t));
+    float *sx = (float *)xmalloc((total ? total : 1U) * sizeof(float));
+    float *sy = (float *)xmalloc((total ? total : 1U) * sizeof(float));
+    float *iv = (float *)xmalloc((total ? total : 1U) * sizeof(float));
+    if (!off || !sx || !sy || !iv) {
+        xfree(off); xfree(sx); xfree(sy); xfree(iv);
+        return;
+    }
+    size_t c = 0;
+    for (uint32_t ri = 0; ri < m; ri++) {
+        *(off + ri) = (uint32_t)c;
+        uint32_t eid = *(g->rev_fwd_eid + ri);
+        uint32_t w = *(g->edge_from + eid);
+        uint32_t u = *(g->rev_src_node + ri);
+        uint32_t beg = *(g->rev_offsets + u);
+        uint32_t end = *(g->rev_offsets + u + 1U);
+        if (end - beg > 8U) {
+            continue;
+        }
+        float d1x = -(*(g->edge_dx + eid));
+        float d1y = -(*(g->edge_dy + eid));
+        for (uint32_t r2 = beg; r2 < end; r2++) {
+            uint32_t prev = *(g->rev_src_node + r2);
+            if (prev == w) continue;
+            uint32_t eid2 = *(g->rev_fwd_eid + r2);
+            float ax = d1x - *(g->edge_dx + eid2);
+            float ay = d1y - *(g->edge_dy + eid2);
+            *(sx + c) = ax;
+            *(sy + c) = ay;
+            *(iv + c) = 1.0f / (sqrtf(ax * ax + ay * ay) + EPS_F);
+            c++;
         }
     }
-    *(boff + n) = (uint32_t)b;
-    xfree(g->fwd_blocks);
-    xfree(g->fwd_block_off);
-    g->fwd_blocks = blocks;
-    g->fwd_block_off = boff;
-    LOG_INFO("Edge blocks: %u blocks (%u edges)", (uint32_t)nb, g->edge_count);
+    *(off + m) = (uint32_t)c;
+    xfree(g->rth_off);
+    xfree(g->rth_sx);
+    xfree(g->rth_sy);
+    xfree(g->rth_inv);
+    g->rth_off = off;
+    g->rth_sx = sx;
+    g->rth_sy = sy;
+    g->rth_inv = iv;
+    g->rth_count = (uint32_t)c;
+    LOG_INFO("Two-hop reverse continuations: %u entries", (uint32_t)c);
+}
+
+/*
+ * Precompute the 2-hop continuation vectors for every edge. The vector sum
+ * (dx1+dx2, dy1+dy2) and its inverse norm are query-independent, so the hot
+ * loop only performs a dot product instead of an adjacency scan + sqrt.
+ */
+static void vmr_build_two_hop(VmrGraph *g) {
+    size_t m = g->edge_count;
+    if (m == 0) {
+        return;
+    }
+    size_t total = 0;
+    for (uint32_t e = 0; e < m; e++) {
+        uint32_t v = *(g->edge_to + e);
+        uint32_t deg = *(g->fwd_offsets + v + 1U) - *(g->fwd_offsets + v);
+        if (deg > 8U || deg == 0) {
+            continue;
+        }
+        total += deg;
+    }
+    uint32_t *off = (uint32_t *)xmalloc((m + 1U) * sizeof(uint32_t));
+    float *sx = (float *)xmalloc((total ? total : 1U) * sizeof(float));
+    float *sy = (float *)xmalloc((total ? total : 1U) * sizeof(float));
+    float *iv = (float *)xmalloc((total ? total : 1U) * sizeof(float));
+    if (!off || !sx || !sy || !iv) {
+        xfree(off); xfree(sx); xfree(sy); xfree(iv);
+        return;
+    }
+    size_t c = 0;
+    for (uint32_t e = 0; e < m; e++) {
+        *(off + e) = (uint32_t)c;
+        uint32_t u = *(g->edge_from + e);
+        uint32_t v = *(g->edge_to + e);
+        uint32_t beg = *(g->fwd_offsets + v);
+        uint32_t end = *(g->fwd_offsets + v + 1U);
+        if (end - beg > 8U) {
+            continue;
+        }
+        float d1x = *(g->edge_dx + e), d1y = *(g->edge_dy + e);
+        const uint32_t *to_p = g->edge_to;
+        const float *dx_p = g->edge_dx, *dy_p = g->edge_dy;
+        for (uint32_t e2 = beg; e2 < end; e2++) {
+            uint32_t w = *(to_p + e2);
+            if (w == u) continue;
+            float ax = d1x + *(dx_p + e2);
+            float ay = d1y + *(dy_p + e2);
+            *(sx + c) = ax;
+            *(sy + c) = ay;
+            *(iv + c) = 1.0f / (sqrtf(ax * ax + ay * ay) + EPS_F);
+            c++;
+        }
+    }
+    *(off + m) = (uint32_t)c;
+    xfree(g->th_off);
+    xfree(g->th_sx);
+    xfree(g->th_sy);
+    xfree(g->th_inv);
+    g->th_off = off;
+    g->th_sx = sx;
+    g->th_sy = sy;
+    g->th_inv = iv;
+    g->th_count = (uint32_t)c;
+    LOG_INFO("Two-hop continuations: %u entries", (uint32_t)c);
 }
 
 static int vmr_preprocess_graph(VmrRawGraph *rg, VmrGraph *g) {
@@ -2458,6 +2607,10 @@ static int vmr_preprocess_graph(VmrRawGraph *rg, VmrGraph *g) {
         }
     }
 
+    vmr_build_two_hop(g);
+    vmr_build_two_hop_rev(g);
+    vmr_build_edge_blocks(g);
+
     if (vmr_build_spatial_grid(g) != 0) {
         return -1;
     }
@@ -2840,6 +2993,10 @@ static int vmr_load_binary(VmrGraph *g, const char *path) {
     for (uint32_t i = 0; i < (uint32_t)n; i++) {
         idmap_put(&g->osm_map, *(oids + i), i);
     }
+
+    vmr_build_two_hop(g);
+    vmr_build_two_hop_rev(g);
+    vmr_build_edge_blocks(g);
 
     clock_t t1 = clock();
     LOG_INFO("Loaded binary SoA graph '%s' in %.1f ms (%zu nodes, %zu edges)",
@@ -5530,6 +5687,376 @@ static __attribute__((unused)) void ch_distance_all(const VmrGraph *g, uint32_t 
     heap_free(&pq);
 }
 
+#if defined(__AVX2__)
+/*
+ * AVX2 block expansion: four outgoing edges per block, cost computed 4-wide.
+ * The two-hop cosines are resolved per lane from the precomputed continuation
+ * table (sum vector + inverse norm), so the inner loop is a dot product.
+ */
+static inline uint32_t vmr_expand_fwd_block(
+    const VmrGraph *g, VmrSearchWS *ws, MinHeap *pq, uint32_t epoch,
+    uint32_t u, uint32_t goal, float gu, float umx, float umy,
+    float urx, float ury, float gx, float gy, float sx, float sy,
+    float chord_dx, float chord_dy, float inv_chord,
+    const VmrPreference *pref, uint32_t pref_id, int use_cross,
+    int use_alt, const float *alt_gf, const float *alt_gb, float alt_scale,
+    uint32_t L, float v_heur, float *best_total, uint32_t *meet_node,
+    int track_meet, int skip_dead) {
+    uint32_t ebase = *(g->fwd_offsets + u);
+    uint32_t end = *(g->fwd_offsets + u + 1U);
+    if (ebase >= end || !g->edge_attr_scale[pref_id]) {
+        return ebase;
+    }
+    const float ux_pos = *(g->node_x + u), uy_pos = *(g->node_y + u);
+
+    __m128 urxv = _mm_set1_ps(urx), uryv = _mm_set1_ps(ury);
+    __m128 umxv = _mm_set1_ps(umx), umyv = _mm_set1_ps(umy);
+    __m128 sxf = _mm_set1_ps(sx), syf = _mm_set1_ps(sy);
+    __m128 cdx = _mm_set1_ps(chord_dx), cdy = _mm_set1_ps(chord_dy);
+    __m128 invc = _mm_set1_ps(inv_chord);
+    __m128 wa = _mm_set1_ps(0.38f * pref->w_align);
+    __m128 wc = _mm_set1_ps(0.14f * pref->w_align);
+    __m128 zero = _mm_setzero_ps();
+    __m128 one = _mm_set1_ps(1.0f);
+    __m128 negone = _mm_set1_ps(-1.0f);
+    __m128 half = _mm_set1_ps(0.5f), t3 = _mm_set1_ps(0.3f), t2 = _mm_set1_ps(0.2f);
+    __m128 tollv = _mm_set1_ps(3.8f);
+    __m128 mincost = _mm_set1_ps(0.01f);
+    __m128 maxcross = _mm_set1_ps(1.5f);
+    const float *th_sx = g->th_sx, *th_sy = g->th_sy, *th_inv = g->th_inv;
+    const uint32_t *th_off = g->th_off;
+    uint32_t e = ebase;
+
+    for (; e + 4U <= end; e += 4U) {
+        uint32_t tov[4];
+        for (int l = 0; l < 4; l++) {
+            tov[l] = *(g->edge_to + e + (uint32_t)l);
+        }
+        __m128 ux = _mm_loadu_ps(g->edge_ux + e), uy = _mm_loadu_ps(g->edge_uy + e);
+        __m128 vxs = _mm_add_ps(_mm_set1_ps(ux_pos), _mm_loadu_ps(g->edge_dx + e));
+        __m128 vys = _mm_add_ps(_mm_set1_ps(uy_pos), _mm_loadu_ps(g->edge_dy + e));
+        __m128 tim = _mm_loadu_ps(g->edge_time_s + e);
+        __m128 attr = _mm_loadu_ps(g->edge_attr_scale[pref_id] + e);
+        __m128 cos1 = _mm_add_ps(_mm_mul_ps(ux, urxv), _mm_mul_ps(uy, uryv));
+        __m128 mom = _mm_add_ps(_mm_mul_ps(umxv, ux), _mm_mul_ps(umyv, uy));
+
+        __m128 cross = zero;
+        if (use_cross) {
+            __m128 cr = _mm_sub_ps(_mm_mul_ps(cdx, _mm_sub_ps(vys, syf)),
+                                   _mm_mul_ps(cdy, _mm_sub_ps(vxs, sxf)));
+            cr = _mm_andnot_ps(_mm_set1_ps(-0.0f), cr);
+            cr = _mm_min_ps(_mm_mul_ps(_mm_mul_ps(cr, invc), invc), maxcross);
+            cross = cr;
+        }
+
+        float cos1v[4];
+        _mm_storeu_ps(cos1v, cos1);
+        float c2v[4];
+        for (int l = 0; l < 4; l++) {
+            uint32_t v = tov[l];
+            if (v == VMR_INVALID) {
+                c2v[l] = cos1v[l];
+                continue;
+            }
+            if (v == goal) {
+                c2v[l] = 1.0f;
+                continue;
+            }
+            uint32_t ei = e + (uint32_t)l;
+            uint32_t c0 = *(th_off + ei), c1 = *(th_off + ei + 1U);
+            float best = cos1v[l];
+            int found = 0;
+            for (uint32_t c = c0; c < c1; c++) {
+                float cc = (*(th_sx + c) * urx + *(th_sy + c) * ury) * *(th_inv + c);
+                if (!found || cc > best) {
+                    best = cc;
+                    found = 1;
+                }
+            }
+            c2v[l] = found ? best : cos1v[l];
+        }
+        __m128 c2 = _mm_loadu_ps(c2v);
+
+        __m128 spatial = _mm_add_ps(_mm_add_ps(_mm_mul_ps(half, cos1),
+                                               _mm_mul_ps(t3, c2)),
+                                    _mm_mul_ps(t2, mom));
+        spatial = _mm_max_ps(_mm_min_ps(spatial, one), negone);
+        __m128 align = _mm_add_ps(one, _mm_mul_ps(wa, _mm_sub_ps(one, spatial)));
+        __m128 corr = _mm_add_ps(one, _mm_mul_ps(wc, cross));
+
+        __m128 base;
+        if (pref->avoid_tolls) {
+            uint32_t f4;
+            memcpy(&f4, g->edge_flags + e, sizeof(f4));
+            __m128i fl = _mm_cvtepu8_epi32(_mm_cvtsi32_si128((int)f4));
+            __m128i tm = _mm_and_si128(fl, _mm_set1_epi32(EDGE_TOLL));
+            __m128 mask = _mm_castsi128_ps(_mm_cmpeq_epi32(tm, _mm_set1_epi32(EDGE_TOLL)));
+            base = _mm_blendv_ps(tim, _mm_mul_ps(tim, tollv), mask);
+        } else {
+            base = tim;
+        }
+
+        __m128 cost = _mm_max_ps(_mm_mul_ps(_mm_mul_ps(base, attr),
+                                            _mm_mul_ps(align, corr)), mincost);
+        float costv[4];
+        _mm_storeu_ps(costv, cost);
+
+        __m128 spatial_min = _mm_add_ps(_mm_add_ps(_mm_mul_ps(half, cos1),
+                                                    _mm_mul_ps(t3, one)),
+                                         _mm_mul_ps(t2, mom));
+        spatial_min = _mm_max_ps(_mm_min_ps(spatial_min, one), negone);
+        __m128 align_min = _mm_add_ps(one, _mm_mul_ps(wa, _mm_sub_ps(one, spatial_min)));
+        __m128 cost_min = _mm_max_ps(_mm_mul_ps(_mm_mul_ps(base, attr),
+                                                _mm_mul_ps(align_min, corr)), mincost);
+        float cminv[4];
+        _mm_storeu_ps(cminv, cost_min);
+
+        uint32_t p_u = ws->state[u].p_fwd;
+        int turn_res = ((*(g->node_flags + u) & NODE_HAS_TURN_RES) && p_u != VMR_INVALID);
+        float gu_ = gu;
+        for (int l = 0; l < 4; l++) {
+            uint32_t v = tov[l];
+            if (v == VMR_INVALID) {
+                continue;
+            }
+            if (skip_dead && (*(g->edge_flags + e + (uint32_t)l) & EDGE_DEAD_TARGET)) {
+                continue;
+            }
+            if (ws->state[v].st_fwd == epoch + 1U) {
+                continue;
+            }
+            if (turn_res && turn_forbidden(g, u, p_u, v)) {
+                continue;
+            }
+            float h_v;
+            if (use_alt) {
+                h_v = alt_heuristic_scalar(&g->alt_nodes[v], alt_gf, alt_gb, L) * alt_scale;
+            } else {
+                float rvx = gx - *(g->node_x + v);
+                float rvy = gy - *(g->node_y + v);
+                h_v = vmr_sqrt_fast(rvx * rvx + rvy * rvy) * v_heur;
+            }
+            float ng_min = gu_ + cminv[l];
+            if (ws->state[v].st_fwd == epoch && ng_min >= ws->state[v].g_fwd) {
+                continue;
+            }
+            if (ng_min + h_v >= *best_total) {
+                continue;
+            }
+            float ng = gu_ + costv[l];
+            if (ng + h_v >= *best_total) {
+                continue;
+            }
+            if (ws->state[v].st_fwd != epoch || ng < ws->state[v].g_fwd) {
+                ws->state[v].st_fwd = epoch;
+                ws->state[v].g_fwd = ng;
+                ws->state[v].p_fwd = u;
+                ws->state[v].pe_fwd = e + (uint32_t)l;
+                float eux = *(g->edge_ux + e + (uint32_t)l);
+                float euy = *(g->edge_uy + e + (uint32_t)l);
+                float nmx = 0.65f * umx + 0.35f * eux;
+                float nmy = 0.65f * umy + 0.35f * euy;
+                float mn = vmr_inv_sqrt(nmx * nmx + nmy * nmy + EPS_F);
+                ws->state[v].mx_fwd = nmx * mn;
+                ws->state[v].my_fwd = nmy * mn;
+
+                if (track_meet && ws->state[v].st_bwd == epoch &&
+                    ws->state[v].g_bwd < FLT_MAX) {
+                    float tot = ng + ws->state[v].g_bwd;
+                    if (tot < *best_total) {
+                        *best_total = tot;
+                        *meet_node = v;
+                    }
+                }
+                if (ng + h_v < *best_total) {
+                    heap_push(pq, v, ng + h_v);
+                }
+            }
+        }
+    }
+    return e;
+}
+#endif
+
+static inline uint32_t vmr_expand_bwd_block(
+    const VmrGraph *g, VmrSearchWS *ws, MinHeap *pq, uint32_t epoch,
+    uint32_t w, uint32_t start, float gb, float wmx, float wmy,
+    float urx, float ury, float sx, float sy,
+    float chord_dx, float chord_dy, float inv_chord,
+    const VmrPreference *pref, uint32_t pref_id, int use_cross,
+    int use_alt, const float *alt_sf, const float *alt_sb, float alt_scale,
+    uint32_t L, float v_heur, float *best_total, uint32_t *meet_node,
+    int track_meet, int skip_dead) {
+    uint32_t bb0 = *(g->rev_block_off + w);
+    uint32_t bb1 = *(g->rev_block_off + w + 1U);
+    uint32_t rbase = *(g->rev_offsets + w);
+    if (bb0 == bb1) {
+        return rbase;
+    }
+    const EdgeBlock4 *blocks = g->rev_blocks;
+
+    __m128 urxv = _mm_set1_ps(urx), uryv = _mm_set1_ps(ury);
+    __m128 umxv = _mm_set1_ps(wmx), umyv = _mm_set1_ps(wmy);
+    __m128 sxf = _mm_set1_ps(sx), syf = _mm_set1_ps(sy);
+    __m128 cdx = _mm_set1_ps(chord_dx), cdy = _mm_set1_ps(chord_dy);
+    __m128 invc = _mm_set1_ps(inv_chord);
+    __m128 wa = _mm_set1_ps(0.38f * pref->w_align);
+    __m128 wc = _mm_set1_ps(0.14f * pref->w_align);
+    __m128 zero = _mm_setzero_ps();
+    __m128 one = _mm_set1_ps(1.0f);
+    __m128 negone = _mm_set1_ps(-1.0f);
+    __m128 half = _mm_set1_ps(0.5f), t3 = _mm_set1_ps(0.3f), t2 = _mm_set1_ps(0.2f);
+    __m128 tollv = _mm_set1_ps(3.8f);
+    __m128 mincost = _mm_set1_ps(0.01f);
+    __m128 maxcross = _mm_set1_ps(1.5f);
+    const float *th_sx = g->rth_sx, *th_sy = g->rth_sy, *th_inv = g->rth_inv;
+    const uint32_t *th_off = g->rth_off;
+
+    for (uint32_t bb = bb0; bb < bb1; bb++) {
+        const EdgeBlock4 *B = blocks + bb;
+        __m128 ux = _mm_load_ps(B->ux), uy = _mm_load_ps(B->uy);
+        __m128 vxs = _mm_load_ps(B->vx), vys = _mm_load_ps(B->vy);
+        __m128 tim = _mm_load_ps(B->time);
+        __m128 attr = _mm_load_ps(B->attr[pref_id]);
+        __m128 cos1 = _mm_add_ps(_mm_mul_ps(ux, urxv), _mm_mul_ps(uy, uryv));
+        __m128 mom = _mm_add_ps(_mm_mul_ps(umxv, ux), _mm_mul_ps(umyv, uy));
+
+        __m128 cross = zero;
+        if (use_cross) {
+            __m128 cr = _mm_sub_ps(_mm_mul_ps(cdx, _mm_sub_ps(vys, syf)),
+                                   _mm_mul_ps(cdy, _mm_sub_ps(vxs, sxf)));
+            cr = _mm_andnot_ps(_mm_set1_ps(-0.0f), cr);
+            cr = _mm_min_ps(_mm_mul_ps(_mm_mul_ps(cr, invc), invc), maxcross);
+            cross = cr;
+        }
+
+        float cos1v[4];
+        _mm_storeu_ps(cos1v, cos1);
+        float c2v[4];
+        uint32_t r0 = rbase + (bb - bb0) * 4U;
+        for (int l = 0; l < 4; l++) {
+            uint32_t v = B->to[l];
+            if (v == VMR_INVALID) {
+                c2v[l] = cos1v[l];
+                continue;
+            }
+            if (v == start) {
+                c2v[l] = 1.0f;
+                continue;
+            }
+            uint32_t ri = r0 + (uint32_t)l;
+            uint32_t c0 = *(th_off + ri), c1 = *(th_off + ri + 1U);
+            float best = cos1v[l];
+            int found = 0;
+            for (uint32_t c = c0; c < c1; c++) {
+                float cc = (*(th_sx + c) * urx + *(th_sy + c) * ury) * *(th_inv + c);
+                if (!found || cc > best) {
+                    best = cc;
+                    found = 1;
+                }
+            }
+            c2v[l] = found ? best : cos1v[l];
+        }
+        __m128 c2 = _mm_loadu_ps(c2v);
+
+        __m128 spatial = _mm_add_ps(_mm_add_ps(_mm_mul_ps(half, cos1),
+                                               _mm_mul_ps(t3, c2)),
+                                    _mm_mul_ps(t2, mom));
+        spatial = _mm_max_ps(_mm_min_ps(spatial, one), negone);
+        __m128 align = _mm_add_ps(one, _mm_mul_ps(wa, _mm_sub_ps(one, spatial)));
+        __m128 corr = _mm_add_ps(one, _mm_mul_ps(wc, cross));
+
+        __m128 base;
+        if (pref->avoid_tolls) {
+            __m128i fl = _mm_cvtepu8_epi32(_mm_loadl_epi64((const __m128i *)B->flags));
+            __m128i tm = _mm_and_si128(fl, _mm_set1_epi32(EDGE_TOLL));
+            __m128 mask = _mm_castsi128_ps(_mm_cmpeq_epi32(tm, _mm_set1_epi32(EDGE_TOLL)));
+            base = _mm_blendv_ps(tim, _mm_mul_ps(tim, tollv), mask);
+        } else {
+            base = tim;
+        }
+
+        __m128 cost = _mm_max_ps(_mm_mul_ps(_mm_mul_ps(base, attr),
+                                            _mm_mul_ps(align, corr)), mincost);
+        float costv[4];
+        _mm_storeu_ps(costv, cost);
+
+        __m128 spatial_min = _mm_add_ps(_mm_add_ps(_mm_mul_ps(half, cos1),
+                                                    _mm_mul_ps(t3, one)),
+                                         _mm_mul_ps(t2, mom));
+        spatial_min = _mm_max_ps(_mm_min_ps(spatial_min, one), negone);
+        __m128 align_min = _mm_add_ps(one, _mm_mul_ps(wa, _mm_sub_ps(one, spatial_min)));
+        __m128 cost_min = _mm_max_ps(_mm_mul_ps(_mm_mul_ps(base, attr),
+                                                _mm_mul_ps(align_min, corr)), mincost);
+        float cminv[4];
+        _mm_storeu_ps(cminv, cost_min);
+
+        uint32_t next_w = ws->state[w].p_bwd;
+        int turn_res = ((*(g->node_flags + w) & NODE_HAS_TURN_RES) && next_w != VMR_INVALID);
+        for (int l = 0; l < 4; l++) {
+            uint32_t u = B->to[l];
+            if (u == VMR_INVALID) {
+                continue;
+            }
+            if (skip_dead && (B->flags[l] & EDGE_DEAD_SOURCE)) {
+                continue;
+            }
+            if (ws->state[u].st_bwd == epoch + 1U) {
+                continue;
+            }
+            if (turn_res && turn_forbidden(g, w, u, next_w)) {
+                continue;
+            }
+            float h_v;
+            if (use_alt) {
+                h_v = alt_heuristic_scalar(&g->alt_nodes[u], alt_sf, alt_sb, L) * alt_scale;
+            } else {
+                float rvx = sx - *(g->node_x + u);
+                float rvy = sy - *(g->node_y + u);
+                h_v = vmr_sqrt_fast(rvx * rvx + rvy * rvy) * v_heur;
+            }
+            float ng_min = gb + cminv[l];
+            if ((ws->state[u].st_bwd == epoch || ws->state[u].st_bwd == epoch + 1U) &&
+                ng_min >= ws->state[u].g_bwd) {
+                continue;
+            }
+            if (ng_min + h_v >= *best_total) {
+                continue;
+            }
+            float ng = gb + costv[l];
+            if (ng + h_v >= *best_total) {
+                continue;
+            }
+            if (ws->state[u].st_bwd != epoch || ng < ws->state[u].g_bwd) {
+                ws->state[u].st_bwd = epoch;
+                ws->state[u].g_bwd = ng;
+                ws->state[u].p_bwd = w;
+                uint32_t ri = r0 + (uint32_t)l;
+                ws->state[u].pe_bwd = *(g->rev_fwd_eid + ri);
+                float eux = B->ux[l], euy = B->uy[l];
+                float nmx = 0.65f * wmx + 0.35f * eux;
+                float nmy = 0.65f * wmy + 0.35f * euy;
+                float mn = vmr_inv_sqrt(nmx * nmx + nmy * nmy + EPS_F);
+                ws->state[u].mx_bwd = nmx * mn;
+                ws->state[u].my_bwd = nmy * mn;
+
+                if (track_meet && ws->state[u].st_fwd == epoch &&
+                    ws->state[u].g_fwd < FLT_MAX) {
+                    float tot = ng + ws->state[u].g_fwd;
+                    if (tot < *best_total) {
+                        *best_total = tot;
+                        *meet_node = u;
+                    }
+                }
+                if (ng + h_v < *best_total) {
+                    heap_push(pq, u, ng + h_v);
+                }
+            }
+        }
+    }
+    return rbase + (bb1 - bb0) * 4U;
+}
+
 /*
  * Primary Pathfinding Entrypoint:
  *   MODE_VEC_BIDIR  -> Bidirectional 8D Vector-Corridor Search
@@ -5729,9 +6256,18 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
             float urx = rx * rinv, ury = ry * rinv;
             float umx = ws->state[u].mx_fwd, umy = ws->state[u].my_fwd;
 
-            uint32_t beg = *(g->fwd_offsets + u);
+            uint32_t ei = *(g->fwd_offsets + u);
+            if (g->th_off && query->pref.pref_id >= 0 && query->pref.pref_id < 5) {
+                ei = vmr_expand_fwd_block(g, ws, pq_fwd, epoch, u, goal_idx,
+                    ws->state[u].g_fwd, umx, umy, urx, ury, gx, gy, sx, sy,
+                    chord_dx, chord_dy, inv_chord, &query->pref,
+                    (uint32_t)query->pref.pref_id,
+                    (query->allow_cross_track_prune && chord_len > 100.0f),
+                    has_alt, alt_gf, alt_gb, alt_scale, L, v_heur,
+                    &best_total, &meet_node, 0, skip_dead);
+            }
             uint32_t end = *(g->fwd_offsets + u + 1U);
-            for (uint32_t ei = beg; ei < end; ei++) {
+            for (; ei < end; ei++) {
                 uint32_t v = *(g->edge_to + ei);
                 float as = as_arr ? as_arr[ei] : compute_attr_scale(g, ei, &query->pref);
                 if (ws->state[v].st_fwd == epoch + 1) continue;
@@ -5831,9 +6367,18 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
                 float urx = rx * rinv, ury = ry * rinv;
                 float umx = ws->state[u].mx_fwd, umy = ws->state[u].my_fwd;
 
-                uint32_t beg = *(g->fwd_offsets + u);
+                uint32_t ei = *(g->fwd_offsets + u);
+                if (g->th_off && query->pref.pref_id >= 0 && query->pref.pref_id < 5) {
+                    ei = vmr_expand_fwd_block(g, ws, pq_fwd, epoch, u, goal_idx,
+                        ws->state[u].g_fwd, umx, umy, urx, ury, gx, gy, sx, sy,
+                        chord_dx, chord_dy, inv_chord, &query->pref,
+                        (uint32_t)query->pref.pref_id,
+                        (query->allow_cross_track_prune && chord_len > 100.0f),
+                        has_alt, alt_gf, alt_gb, alt_scale, L, v_heur,
+                        &best_total, &meet_node, 1, skip_dead);
+                }
                 uint32_t end = *(g->fwd_offsets + u + 1U);
-                for (uint32_t ei = beg; ei < end; ei++) {
+                for (; ei < end; ei++) {
                     uint32_t v = *(g->edge_to + ei);
                     float as = as_arr ? as_arr[ei] : compute_attr_scale(g, ei, &query->pref);
                     if (ws->state[v].st_fwd == epoch + 1) continue;
@@ -5919,9 +6464,18 @@ if (skip_dead && (*(g->edge_flags + ei) & EDGE_DEAD_TARGET)) continue;
                 float urx = rx * rinv, ury = ry * rinv;
                 float wmx = ws->state[w].mx_bwd, wmy = ws->state[w].my_bwd;
 
-                uint32_t beg = *(g->rev_offsets + w);
-                uint32_t end = *(g->rev_offsets + w + 1U);
-                for (uint32_t ri = beg; ri < end; ri++) {
+                uint32_t ri = *(g->rev_offsets + w);
+                if (g->rev_blocks && query->pref.pref_id >= 0 && query->pref.pref_id < 5) {
+                    ri = vmr_expand_bwd_block(g, ws, pq_bwd, epoch, w, start_idx,
+                        ws->state[w].g_bwd, wmx, wmy, urx, ury, sx, sy,
+                        chord_dx, chord_dy, inv_chord, &query->pref,
+                        (uint32_t)query->pref.pref_id,
+                        (query->allow_cross_track_prune && chord_len > 100.0f),
+                        has_alt, alt_sf, alt_sb, alt_scale, L, v_heur,
+                        &best_total, &meet_node, 1, skip_dead);
+                }
+                uint32_t rend = *(g->rev_offsets + w + 1U);
+                for (; ri < rend; ri++) {
 uint32_t u = *(g->rev_src_node + ri);
                     uint32_t eid = *(g->rev_fwd_eid + ri);
                     float as = as_arr ? as_arr[eid] : compute_attr_scale(g, eid, &query->pref);
