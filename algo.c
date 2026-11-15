@@ -26,6 +26,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <windows.h>
 #if defined(__SSE__)
 #include <xmmintrin.h>
 #endif
@@ -61,7 +62,7 @@ static inline float vmr_sqrt_fast(float x) {
 
 #define UVR_VERSION      "2.0.0"
 #define VGRAPH_MAGIC     0x564D5235U /* "VMR5" */
-#define VGRAPH_FORMAT_V  6U
+#define VGRAPH_FORMAT_V  8U
 
 #define VMR_INVALID      UINT32_MAX
 #define EARTH_RADIUS_M   6371008.8
@@ -544,6 +545,215 @@ static int heap_pop(MinHeap *h, HeapEntry *out) {
     return 1;
 }
 
+/* Monotone bucket queue (Dial): A* keys are non-decreasing with the consistent
+ * ALT heuristic, so integer buckets (1 s) replace the 4-ary heap. */
+#define BUCKET_NB (1u << 20)
+typedef struct {
+    uint32_t *head;   /* [BUCKET_NB] node or VMR_INVALID */
+    uint32_t *next;   /* [n] next node in the same bucket */
+    uint32_t *prev;   /* [n] prev node in the same bucket */
+    uint32_t *bucket; /* [n] current bucket or VMR_INVALID */
+    uint32_t cur;
+    uint32_t maxb;
+    uint32_t nb;
+    uint32_t size;
+    size_t cap;
+} BucketQueue;
+
+static inline void bq_clear(BucketQueue *q);
+
+static __attribute__((unused)) int bq_init(BucketQueue *q, size_t n) {
+    q->head = (uint32_t *)xmalloc((size_t)BUCKET_NB * sizeof(uint32_t));
+    q->next = (uint32_t *)xmalloc((n ? n : 1U) * sizeof(uint32_t));
+    q->prev = (uint32_t *)xmalloc((n ? n : 1U) * sizeof(uint32_t));
+    q->bucket = (uint32_t *)xmalloc((n ? n : 1U) * sizeof(uint32_t));
+    if (!q->head || !q->next || !q->prev || !q->bucket) {
+        xfree(q->head);
+        xfree(q->next);
+        xfree(q->prev);
+        xfree(q->bucket);
+        q->head = NULL;
+        q->next = NULL;
+        q->prev = NULL;
+        q->bucket = NULL;
+        return -1;
+    }
+    q->nb = BUCKET_NB;
+    q->cap = n ? n : 1U;
+    bq_clear(q);
+    return 0;
+}
+
+static __attribute__((unused)) void bq_free(BucketQueue *q) {
+    xfree(q->head);
+    xfree(q->next);
+    xfree(q->prev);
+    xfree(q->bucket);
+    q->head = NULL;
+    q->next = NULL;
+    q->prev = NULL;
+    q->bucket = NULL;
+}
+
+static inline void bq_clear(BucketQueue *q) {
+    memset(q->head, 0xFF, (size_t)q->nb * sizeof(uint32_t));
+    memset(q->bucket, 0xFF, (size_t)q->cap * sizeof(uint32_t));
+    q->cur = 0;
+    q->maxb = 0;
+    q->size = 0;
+}
+
+static inline void bq_remove(BucketQueue *q, uint32_t node) {
+    uint32_t b = q->bucket[node];
+    if (b == VMR_INVALID) {
+        return;
+    }
+    uint32_t p = q->prev[node], n = q->next[node];
+    if (p != VMR_INVALID) {
+        q->next[p] = n;
+    } else {
+        q->head[b] = n;
+    }
+    if (n != VMR_INVALID) {
+        q->prev[n] = p;
+    }
+    q->bucket[node] = VMR_INVALID;
+    q->size--;
+}
+
+static inline int bq_push(BucketQueue *q, uint32_t node, float prio) {
+    if (q->bucket[node] != VMR_INVALID) {
+        bq_remove(q, node);
+    }
+    uint32_t b = (uint32_t)prio;
+    if (b >= q->nb) {
+        b = q->nb - 1U;
+    }
+    q->next[node] = q->head[b];
+    q->prev[node] = VMR_INVALID;
+    if (q->head[b] != VMR_INVALID) {
+        q->prev[q->head[b]] = node;
+    }
+    q->head[b] = node;
+    q->bucket[node] = b;
+    if (b > q->maxb) {
+        q->maxb = b;
+    }
+    q->size++;
+    return 0;
+}
+
+static inline int bq_pop(BucketQueue *q, HeapEntry *out) {
+    while (q->cur <= q->maxb && q->head[q->cur] == VMR_INVALID) {
+        q->cur++;
+    }
+    if (q->cur > q->maxb) {
+        q->size = 0;
+        return 0;
+    }
+    uint32_t node = q->head[q->cur];
+    q->head[q->cur] = q->next[node];
+    if (q->head[q->cur] != VMR_INVALID) {
+        q->prev[q->head[q->cur]] = VMR_INVALID;
+    }
+    q->bucket[node] = VMR_INVALID;
+    q->size--;
+    out->node = node;
+    out->prio = (float)q->cur;
+    return 1;
+}
+
+static inline float bq_top(const BucketQueue *q) {
+    uint32_t b = q->cur;
+    while (b <= q->maxb && q->head[b] == VMR_INVALID) {
+        b++;
+    }
+    return (b <= q->maxb) ? (float)b : 1.0e30f;
+}
+
+/* Radix heap for monotone float A* keys (consistent ALT heuristic). */
+#define RADIX_B 33
+typedef struct {
+    HeapEntry *a[RADIX_B];
+    size_t n[RADIX_B], cap[RADIX_B];
+    size_t size;
+    float last;
+} RadixHeap;
+
+static __attribute__((unused)) int rh_init(RadixHeap *q) {
+    memset(q, 0, sizeof(*q));
+    return 0;
+}
+
+static __attribute__((unused)) void rh_free(RadixHeap *q) {
+    for (int b = 0; b < RADIX_B; b++) {
+        xfree(q->a[b]);
+    }
+    memset(q, 0, sizeof(*q));
+}
+
+static inline void rh_clear(RadixHeap *q) {
+    for (int b = 0; b < RADIX_B; b++) {
+        q->n[b] = 0;
+    }
+    q->size = 0;
+    q->last = 0.0f;
+}
+
+static inline int rh_push(RadixHeap *q, uint32_t node, float prio) {
+    if (q->size == 0) {
+        q->last = prio;
+    }
+    uint32_t kb, kp;
+    memcpy(&kb, &prio, 4);
+    memcpy(&kp, &q->last, 4);
+    uint32_t x = kb ^ kp;
+    int b = (x == 0) ? 0 : (31 - __builtin_clz(x));
+    if (b >= RADIX_B) {
+        b = RADIX_B - 1;
+    }
+    if (q->n[b] >= q->cap[b]) {
+        size_t nc = q->cap[b] ? q->cap[b] * 2 : 64;
+        HeapEntry *na = (HeapEntry *)xrealloc(q->a[b], nc * sizeof(HeapEntry));
+        if (!na) {
+            return -1;
+        }
+        q->a[b] = na;
+        q->cap[b] = nc;
+    }
+    q->a[b][q->n[b]++] = (HeapEntry){ node, prio };
+    q->size++;
+    return 0;
+}
+
+static inline int rh_pop(RadixHeap *q, HeapEntry *out) {
+    if (q->size == 0) {
+        return 0;
+    }
+    int b = 0;
+    while (b < RADIX_B && q->n[b] == 0) {
+        b++;
+    }
+    if (b == RADIX_B) {
+        return 0;
+    }
+    size_t mi = 0;
+    for (size_t i = 1; i < q->n[b]; i++) {
+        if (q->a[b][i].prio < q->a[b][mi].prio) {
+            mi = i;
+        }
+    }
+    *out = q->a[b][mi];
+    q->a[b][mi] = q->a[b][--q->n[b]];
+    q->size--;
+    q->last = out->prio;
+    return 1;
+}
+
+static inline float rh_top(const RadixHeap *q) {
+    return q->last;
+}
+
 /* ========================================================================= */
 /* SECTION 4: CONTIGUOUS SoA GRAPH & PREPROCESSED GRAPH DATA STRUCTURES      */
 /* ========================================================================= */
@@ -584,9 +794,9 @@ typedef struct {
 } VmrRawGraph;
 
 typedef struct __attribute__((aligned(64))) {
-    float fwd[16];
-    float bwd[16];
-} AltNode16;
+    float fwd[32];
+    float bwd[32];
+} AltNode32;
 
 /*
  * Final Preprocessed Graph in Structure-of-Arrays (SoA) Contiguous Memory:
@@ -645,7 +855,7 @@ typedef struct {
     /* ALT landmarks: L sources, dist(landmark -> node) and dist(node -> landmark) */
     uint32_t  landmark_count;
     uint32_t *landmark_node;
-    AltNode16 *alt_nodes;
+    AltNode32 *alt_nodes;
 
     /* Turn restrictions: per-via forbidden (from,to) pairs */
     uint32_t *turn_offsets;    /* [node_count + 1] */
@@ -687,6 +897,8 @@ typedef struct {
     uint32_t  rth_count;
 
     IdMap     osm_map;
+    void     *map;
+    HANDLE    map_h;
 } VmrGraph;
 
 typedef struct {
@@ -813,39 +1025,50 @@ static int raw_graph_add_edge(VmrRawGraph *rg, uint32_t from, uint32_t to,
     return 0;
 }
 
+static void vmr_unmap_file(void *base, HANDLE h) {
+    if (base) {
+        UnmapViewOfFile(base);
+    }
+    if (h) {
+        CloseHandle(h);
+    }
+}
+
 static void vmr_graph_init(VmrGraph *g) {
     memset(g, 0, sizeof(*g));
+    g->map = NULL;
+    g->map_h = NULL;
 }
 
 static void vmr_graph_free(VmrGraph *g) {
-    xfree(g->node_osm_id);
-    xfree(g->node_lat);
-    xfree(g->node_lon);
-    xfree(g->node_x);
-    xfree(g->node_y);
-    xfree(g->node_comp_id);
-    xfree(g->node_flags);
-    xfree(g->fwd_offsets);
-    xfree(g->edge_from);
-    xfree(g->edge_to);
-    xfree(g->edge_dx);
-    xfree(g->edge_dy);
-    xfree(g->edge_ux);
-    xfree(g->edge_uy);
-    xfree(g->edge_f_speed);
-    xfree(g->edge_f_class);
-    xfree(g->edge_f_straight);
-    xfree(g->edge_f_smooth);
-    xfree(g->edge_length_m);
-    xfree(g->edge_time_s);
-    xfree(g->edge_flags);
-    xfree(g->rev_offsets);
-    xfree(g->rev_src_node);
-    xfree(g->rev_fwd_eid);
-    xfree(g->grid_offsets);
-    xfree(g->grid_nodes);
-    xfree(g->landmark_node);
-    xfree_aligned(g->alt_nodes);
+    if (!g->map) xfree(g->node_osm_id);
+    if (!g->map) xfree(g->node_lat);
+    if (!g->map) xfree(g->node_lon);
+    if (!g->map) xfree(g->node_x);
+    if (!g->map) xfree(g->node_y);
+    if (!g->map) xfree(g->node_comp_id);
+    if (!g->map) xfree(g->node_flags);
+    if (!g->map) xfree(g->fwd_offsets);
+    if (!g->map) xfree(g->edge_from);
+    if (!g->map) xfree(g->edge_to);
+    if (!g->map) xfree(g->edge_dx);
+    if (!g->map) xfree(g->edge_dy);
+    if (!g->map) xfree(g->edge_ux);
+    if (!g->map) xfree(g->edge_uy);
+    if (!g->map) xfree(g->edge_f_speed);
+    if (!g->map) xfree(g->edge_f_class);
+    if (!g->map) xfree(g->edge_f_straight);
+    if (!g->map) xfree(g->edge_f_smooth);
+    if (!g->map) xfree(g->edge_length_m);
+    if (!g->map) xfree(g->edge_time_s);
+    if (!g->map) xfree(g->edge_flags);
+    if (!g->map) xfree(g->rev_offsets);
+    if (!g->map) xfree(g->rev_src_node);
+    if (!g->map) xfree(g->rev_fwd_eid);
+    if (!g->map) xfree(g->grid_offsets);
+    if (!g->map) xfree(g->grid_nodes);
+    if (!g->map) xfree(g->landmark_node);
+    if (!g->map) xfree_aligned(g->alt_nodes);
     xfree(g->turn_offsets);
     xfree(g->turn_from);
     xfree(g->turn_to);
@@ -866,17 +1089,16 @@ static void vmr_graph_free(VmrGraph *g) {
     }
     xfree_aligned(g->rev_blocks);
     xfree(g->rev_block_off);
-    xfree(g->th_off);
-    xfree(g->th_sx);
-    xfree(g->th_sy);
-    xfree(g->th_inv);
+    if (!g->map) {
+        xfree(g->th_off); xfree(g->th_sx); xfree(g->th_sy); xfree(g->th_inv);
+        xfree(g->rth_off); xfree(g->rth_sx); xfree(g->rth_sy); xfree(g->rth_inv);
+    }
     g->th_count = 0;
-    xfree(g->rth_off);
-    xfree(g->rth_sx);
-    xfree(g->rth_sy);
-    xfree(g->rth_inv);
     g->rth_count = 0;
     idmap_free(&g->osm_map);
+    vmr_unmap_file(g->map, g->map_h);
+    g->map = NULL;
+    g->map_h = NULL;
     vmr_graph_init(g);
 }
 
@@ -1481,14 +1703,14 @@ if ((uint64_t)od * (uint64_t)id > 32U && *(delay + u) < 8U) {
             *(noff + i + 1U) += *(noff + i);
         }
 
-        xfree(g->edge_from); xfree(g->edge_to);
-        xfree(g->edge_dx); xfree(g->edge_dy);
-        xfree(g->edge_ux); xfree(g->edge_uy);
-        xfree(g->edge_f_speed); xfree(g->edge_f_class);
-        xfree(g->edge_f_straight); xfree(g->edge_f_smooth);
-        xfree(g->edge_length_m); xfree(g->edge_time_s);
-        xfree(g->edge_flags); xfree(g->fwd_offsets);
-        xfree(g->rev_offsets); xfree(g->rev_src_node); xfree(g->rev_fwd_eid);
+        if (!g->map) xfree(g->edge_from); xfree(g->edge_to);
+        if (!g->map) xfree(g->edge_dx); xfree(g->edge_dy);
+        if (!g->map) xfree(g->edge_ux); xfree(g->edge_uy);
+        if (!g->map) xfree(g->edge_f_speed); xfree(g->edge_f_class);
+        if (!g->map) xfree(g->edge_f_straight); xfree(g->edge_f_smooth);
+        if (!g->map) xfree(g->edge_length_m); xfree(g->edge_time_s);
+        if (!g->map) xfree(g->edge_flags); xfree(g->fwd_offsets);
+        if (!g->map) xfree(g->rev_offsets); xfree(g->rev_src_node); xfree(g->rev_fwd_eid);
 
         g->edge_count = (uint32_t)live;
         g->edge_from = nfrom;
@@ -1805,21 +2027,29 @@ static void alt_dijkstra(const VmrGraph *g, uint32_t src, float *dist, int rever
 }
 
 static void vmr_build_landmarks(VmrGraph *g) {
-    static const double lat[16] = {
+    static const double lat[32] = {
         58.6440, 50.0700, 51.1300, 53.4800,
         55.9530, 51.5070, 52.4800, 57.4780,
         50.7200, 53.4000, 53.8000, 54.9700,
-        55.8600, 57.1500, 51.4500, 52.6300
+        55.8600, 57.1500, 51.4500, 52.6300,
+        51.4816, 54.6032, 55.8617, 53.4808,
+        52.4862, 53.8008, 53.4084, 54.9783,
+        53.3811, 51.4545, 52.9548, 52.6369,
+        50.8225, 57.1497, 57.4778, 51.6214
     };
-    static const double lon[16] = {
+    static const double lon[32] = {
         -3.0700, -5.7200, 1.3100, -2.2400,
         -3.1880, -0.1280, -1.9000, -4.2250,
         -3.5300, -2.9800, -1.5500, -1.6100,
-        -4.2500, -2.0900, -2.5900, 1.3000
+        -4.2500, -2.0900, -2.5900, 1.3000,
+        -3.1791, -5.9301, -4.2518, -2.2426,
+        -1.8904, -1.5491, -2.9916, -1.6178,
+        -1.4701, -2.5879, -1.1581, -1.1398,
+        -0.1372, -2.0943, -4.2247, -3.9436
     };
-    uint32_t nodes[16];
+    uint32_t nodes[32];
     uint32_t L = 0;
-    for (uint32_t i = 0; i < 16; i++) {
+    for (uint32_t i = 0; i < 32; i++) {
         uint32_t u = vmr_nearest_node_linear(g, lat[i], lon[i]);
         if (u == VMR_INVALID) {
             continue;
@@ -1840,9 +2070,9 @@ static void vmr_build_landmarks(VmrGraph *g) {
     }
     size_t n = g->node_count;
     g->landmark_node = (uint32_t *)xmalloc((size_t)L * sizeof(uint32_t));
-    g->alt_nodes = (AltNode16 *)xaligned_alloc(64, n * sizeof(AltNode16));
+    g->alt_nodes = (AltNode32 *)xaligned_alloc(64, n * sizeof(AltNode32));
     if (!g->landmark_node || !g->alt_nodes) {
-        xfree(g->landmark_node);
+        if (!g->map) xfree(g->landmark_node);
         xfree_aligned(g->alt_nodes);
         g->landmark_node = NULL;
         g->alt_nodes = NULL;
@@ -1852,7 +2082,7 @@ static void vmr_build_landmarks(VmrGraph *g) {
     }
     memcpy(g->landmark_node, nodes, (size_t)L * sizeof(uint32_t));
     for (size_t v = 0; v < n; v++) {
-        for (int k = 0; k < 16; k++) {
+        for (int k = 0; k < 32; k++) {
             (*(g->alt_nodes + v)).fwd[k] = 1.0e30f;
             (*(g->alt_nodes + v)).bwd[k] = -1.0e30f;
         }
@@ -2311,33 +2541,33 @@ static void vmr_reorder_graph(VmrGraph *g) {
         }
     }
 
-    xfree(g->node_osm_id);
-    xfree(g->node_lat);
-    xfree(g->node_lon);
-    xfree(g->node_x);
-    xfree(g->node_y);
-    xfree(g->node_comp_id);
-    xfree(g->node_flags);
-    xfree(g->fwd_offsets);
-    xfree(g->edge_from);
-    xfree(g->edge_to);
-    xfree(g->edge_dx);
-    xfree(g->edge_dy);
-    xfree(g->edge_ux);
-    xfree(g->edge_uy);
-    xfree(g->edge_f_speed);
-    xfree(g->edge_f_class);
-    xfree(g->edge_f_straight);
-    xfree(g->edge_f_smooth);
-    xfree(g->edge_length_m);
-    xfree(g->edge_time_s);
-    xfree(g->edge_flags);
+    if (!g->map) xfree(g->node_osm_id);
+    if (!g->map) xfree(g->node_lat);
+    if (!g->map) xfree(g->node_lon);
+    if (!g->map) xfree(g->node_x);
+    if (!g->map) xfree(g->node_y);
+    if (!g->map) xfree(g->node_comp_id);
+    if (!g->map) xfree(g->node_flags);
+    if (!g->map) xfree(g->fwd_offsets);
+    if (!g->map) xfree(g->edge_from);
+    if (!g->map) xfree(g->edge_to);
+    if (!g->map) xfree(g->edge_dx);
+    if (!g->map) xfree(g->edge_dy);
+    if (!g->map) xfree(g->edge_ux);
+    if (!g->map) xfree(g->edge_uy);
+    if (!g->map) xfree(g->edge_f_speed);
+    if (!g->map) xfree(g->edge_f_class);
+    if (!g->map) xfree(g->edge_f_straight);
+    if (!g->map) xfree(g->edge_f_smooth);
+    if (!g->map) xfree(g->edge_length_m);
+    if (!g->map) xfree(g->edge_time_s);
+    if (!g->map) xfree(g->edge_flags);
     for (uint32_t p = 0; p < 5; p++) {
-        xfree(g->edge_attr_scale[p]);
+        if (!g->map) xfree(g->edge_attr_scale[p]);
     }
-    xfree(g->rev_offsets);
-    xfree(g->rev_src_node);
-    xfree(g->rev_fwd_eid);
+    if (!g->map) xfree(g->rev_offsets);
+    if (!g->map) xfree(g->rev_src_node);
+    if (!g->map) xfree(g->rev_fwd_eid);
     xfree(g->turn_offsets);
     xfree(g->turn_from);
     xfree(g->turn_to);
@@ -2386,6 +2616,16 @@ static int vmr_blocks_enabled(void) {
     static int v = -1;
     if (v < 0) {
         v = (getenv("VMR_BLOCK") != NULL) ? 1 : 0;
+    }
+    return v;
+}
+
+static int vmr_rev_enabled(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *s = getenv("VMR_BLOCK");
+        v = (s && (strcmp(s, "rev") == 0 || strcmp(s, "2") == 0 ||
+                   strcmp(s, "full") == 0)) ? 1 : 0;
     }
     return v;
 }
@@ -2934,18 +3174,19 @@ static int vmr_preprocess_graph(VmrRawGraph *rg, VmrGraph *g) {
         }
     }
 
+    vmr_reorder_graph(g);
+
     vmr_build_two_hop(g);
     vmr_build_two_hop_rev(g);
-    if (vmr_blocks_enabled()) {
+    if (vmr_rev_enabled()) {
         vmr_build_edge_blocks(g);
     }
-
-    vmr_reorder_graph(g);
 
     if (vmr_build_spatial_grid(g) != 0) {
         return -1;
     }
 
+    g->landmark_count = 32;
     vmr_build_landmarks(g);
 
     /* Vector CH is not used for the exact-vector A* (UK measured slower). */
@@ -3073,7 +3314,7 @@ static int vmr_save_binary(const VmrGraph *g, const char *path) {
     ok &= (fwrite(&l, sizeof(uint32_t), 1, fp) == 1);
     if (l > 0 && n > 0) {
         ok &= (fwrite(g->landmark_node, sizeof(uint32_t), l, fp) == l);
-        ok &= vmr_fwrite_chunk(g->alt_nodes, sizeof(AltNode16), n, fp);
+        ok &= vmr_fwrite_chunk(g->alt_nodes, sizeof(AltNode32), n, fp);
     }
 
     uint32_t tc = g->turn_count;
@@ -3101,6 +3342,29 @@ static int vmr_save_binary(const VmrGraph *g, const char *path) {
         ok &= (fwrite(g->ch_via, sizeof(uint32_t), ce, fp) == ce);
         ok &= (fwrite(g->ch_child1, sizeof(uint32_t), ce, fp) == ce);
         ok &= (fwrite(g->ch_child2, sizeof(uint32_t), ce, fp) == ce);
+    }
+
+    /* Persist the two-hop continuation tables so a reload can mmap them
+     * instead of rebuilding (saves ~360 MB of heap and the O(E) rebuild). */
+    uint32_t thb = (g->th_off != NULL && m > 0) ? 1U : 0U;
+    ok &= (fwrite(&thb, sizeof(uint32_t), 1, fp) == 1);
+    if (thb) {
+        uint32_t thc = g->th_off[m];
+        ok &= (fwrite(&thc, sizeof(uint32_t), 1, fp) == 1);
+        ok &= (fwrite(g->th_off, sizeof(uint32_t), m + 1U, fp) == m + 1U);
+        ok &= (fwrite(g->th_sx, sizeof(float), thc, fp) == thc);
+        ok &= (fwrite(g->th_sy, sizeof(float), thc, fp) == thc);
+        ok &= (fwrite(g->th_inv, sizeof(float), thc, fp) == thc);
+    }
+    uint32_t rthb = (g->rth_off != NULL && m > 0) ? 1U : 0U;
+    ok &= (fwrite(&rthb, sizeof(uint32_t), 1, fp) == 1);
+    if (rthb) {
+        uint32_t rthc = g->rth_off[m];
+        ok &= (fwrite(&rthc, sizeof(uint32_t), 1, fp) == 1);
+        ok &= (fwrite(g->rth_off, sizeof(uint32_t), m + 1U, fp) == m + 1U);
+        ok &= (fwrite(g->rth_sx, sizeof(float), rthc, fp) == rthc);
+        ok &= (fwrite(g->rth_sy, sizeof(float), rthc, fp) == rthc);
+        ok &= (fwrite(g->rth_inv, sizeof(float), rthc, fp) == rthc);
     }
 
     fclose(fp);
@@ -3148,173 +3412,179 @@ static int vmr_load_binary(VmrGraph *g, const char *path) {
     g->grid_min_y = hdr.grid_min_y;
     g->grid_max_y = hdr.grid_max_y;
 
-    g->node_osm_id  = (int64_t *)xmalloc(n * sizeof(int64_t));
-    g->node_lat     = (double *)xmalloc(n * sizeof(double));
-    g->node_lon     = (double *)xmalloc(n * sizeof(double));
-    g->node_x       = (float *)xmalloc(n * sizeof(float));
-    g->node_y       = (float *)xmalloc(n * sizeof(float));
-    g->node_comp_id = (uint32_t *)xmalloc(n * sizeof(uint32_t));
-    g->node_flags   = (uint8_t *)xmalloc(n * sizeof(uint8_t));
-    g->fwd_offsets  = (uint32_t *)xmalloc((n + 1U) * sizeof(uint32_t));
+    {
+        HANDLE fh = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL,
+                                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (fh == INVALID_HANDLE_VALUE) {
+            fclose(fp);
+            vmr_graph_free(g);
+            return -1;
+        }
+        LARGE_INTEGER fsz;
+        if (!GetFileSizeEx(fh, &fsz) || fsz.QuadPart < (LONGLONG)sizeof(VgraphHeader)) {
+            CloseHandle(fh);
+            fclose(fp);
+            vmr_graph_free(g);
+            return -1;
+        }
+        HANDLE mh = CreateFileMappingA(fh, NULL, PAGE_READONLY, 0, 0, NULL);
+        CloseHandle(fh);
+        if (!mh) {
+            fclose(fp);
+            vmr_graph_free(g);
+            return -1;
+        }
+        void *base = MapViewOfFile(mh, FILE_MAP_READ, 0, 0, 0);
+        if (!base) {
+            CloseHandle(mh);
+            fclose(fp);
+            vmr_graph_free(g);
+            return -1;
+        }
+        g->map = base;
+        g->map_h = mh;
+        uint8_t *p = (uint8_t *)base;
+        if (memcmp(p, &hdr, sizeof(hdr)) != 0) {
+            /* header was already read; mapped copy must match */
+        }
+        size_t off = sizeof(VgraphHeader);
+        g->node_osm_id  = (int64_t *)(p + off); off += (size_t)n * sizeof(int64_t);
+        g->node_lat     = (double  *)(p + off); off += (size_t)n * sizeof(double);
+        g->node_lon     = (double  *)(p + off); off += (size_t)n * sizeof(double);
+        g->node_x       = (float   *)(p + off); off += (size_t)n * sizeof(float);
+        g->node_y       = (float   *)(p + off); off += (size_t)n * sizeof(float);
+        g->node_comp_id = (uint32_t*)(p + off); off += (size_t)n * sizeof(uint32_t);
+        g->node_flags   = (uint8_t *)(p + off); off += (size_t)n * sizeof(uint8_t);
+        g->fwd_offsets  = (uint32_t*)(p + off); off += (size_t)(n + 1U) * sizeof(uint32_t);
+        g->edge_from       = (uint32_t*)(p + off); off += esz * sizeof(uint32_t);
+        g->edge_to         = (uint32_t*)(p + off); off += esz * sizeof(uint32_t);
+        g->edge_dx         = (float   *)(p + off); off += esz * sizeof(float);
+        g->edge_dy         = (float   *)(p + off); off += esz * sizeof(float);
+        g->edge_ux         = (float   *)(p + off); off += esz * sizeof(float);
+        g->edge_uy         = (float   *)(p + off); off += esz * sizeof(float);
+        g->edge_f_speed    = (float   *)(p + off); off += esz * sizeof(float);
+        g->edge_f_class    = (float   *)(p + off); off += esz * sizeof(float);
+        g->edge_f_straight = (float   *)(p + off); off += esz * sizeof(float);
+        g->edge_f_smooth   = (float   *)(p + off); off += esz * sizeof(float);
+        g->edge_length_m   = (float   *)(p + off); off += esz * sizeof(float);
+        g->edge_time_s     = (float   *)(p + off); off += esz * sizeof(float);
+        g->edge_flags      = (uint8_t *)(p + off); off += esz * sizeof(uint8_t);
 
-    g->edge_from       = (uint32_t *)xmalloc(esz * sizeof(uint32_t));
-    g->edge_to         = (uint32_t *)xmalloc(esz * sizeof(uint32_t));
-    g->edge_dx         = (float *)xmalloc(esz * sizeof(float));
-    g->edge_dy         = (float *)xmalloc(esz * sizeof(float));
-    g->edge_ux         = (float *)xmalloc(esz * sizeof(float));
-    g->edge_uy         = (float *)xmalloc(esz * sizeof(float));
-    g->edge_f_speed    = (float *)xmalloc(esz * sizeof(float));
-    g->edge_f_class    = (float *)xmalloc(esz * sizeof(float));
-    g->edge_f_straight = (float *)xmalloc(esz * sizeof(float));
-    g->edge_f_smooth   = (float *)xmalloc(esz * sizeof(float));
-    g->edge_length_m   = (float *)xmalloc(esz * sizeof(float));
-    g->edge_time_s     = (float *)xmalloc(esz * sizeof(float));
-    g->edge_flags      = (uint8_t *)xmalloc(esz * sizeof(uint8_t));
+        /* attr_scale block (mask + float[m] per set profile) sits between the
+         * edge arrays and the reverse CSR on disk; consume it so the mapped
+         * suffix stays aligned. Copied to owned buffers (freed unconditionally). */
+        uint8_t amask = 0;
+        if (off < (size_t)fsz.QuadPart) { amask = *(const uint8_t *)(p + off); off += 1U; }
+        for (uint32_t pi = 0; pi < 5; pi++) {
+            if (amask & (uint8_t)(1U << pi)) {
+                g->edge_attr_scale[pi] = (float *)xmalloc((size_t)(m ? m : 1) * sizeof(float));
+                if (g->edge_attr_scale[pi] && m > 0 &&
+                    off + (size_t)m * sizeof(float) <= (size_t)fsz.QuadPart) {
+                    memcpy(g->edge_attr_scale[pi], p + off, (size_t)m * sizeof(float));
+                }
+                off += (size_t)m * sizeof(float);
+            }
+        }
 
-    g->rev_offsets  = (uint32_t *)xmalloc((n + 1U) * sizeof(uint32_t));
-    g->rev_src_node = (uint32_t *)xmalloc(esz * sizeof(uint32_t));
-    g->rev_fwd_eid  = (uint32_t *)xmalloc(esz * sizeof(uint32_t));
-    g->grid_offsets = (uint32_t *)xmalloc((cells + 1U) * sizeof(uint32_t));
-    g->grid_nodes   = (uint32_t *)xmalloc(n * sizeof(uint32_t));
+        g->rev_offsets  = (uint32_t*)(p + off); off += (size_t)(n + 1U) * sizeof(uint32_t);
+        g->rev_src_node = (uint32_t*)(p + off); off += esz * sizeof(uint32_t);
+        g->rev_fwd_eid  = (uint32_t*)(p + off); off += esz * sizeof(uint32_t);
+        g->grid_offsets = (uint32_t*)(p + off); off += (size_t)(cells + 1U) * sizeof(uint32_t);
+        g->grid_nodes   = (uint32_t*)(p + off); off += (size_t)n * sizeof(uint32_t);
 
-    if (!g->node_osm_id || !g->node_lat || !g->node_lon || !g->node_x || !g->node_y ||
-        !g->node_comp_id || !g->node_flags || !g->fwd_offsets || !g->edge_from || !g->edge_to ||
-        !g->edge_dx || !g->edge_dy || !g->edge_ux || !g->edge_uy ||
-        !g->edge_f_speed || !g->edge_f_class || !g->edge_f_straight || !g->edge_f_smooth ||
-        !g->edge_length_m || !g->edge_time_s || !g->edge_flags ||
-        !g->rev_offsets || !g->rev_src_node || !g->rev_fwd_eid ||
-        !g->grid_offsets || !g->grid_nodes) {
+        uint32_t l = 0;
+        if (off + 4 <= (size_t)fsz.QuadPart) { l = *(const uint32_t *)(p + off); off += 4U; }
+        if (l > 64U) { l = 0; }
+        g->landmark_count = l;
+        if (l > 0 && n > 0) {
+            /* point both into the mapping (no heap, no 124-byte leak) */
+            g->landmark_node = (uint32_t *)(p + off);
+            off += (size_t)l * sizeof(uint32_t);
+            /* mmap the (~695 MB) ALT table in place instead of a heap copy */
+            g->alt_nodes = (AltNode32 *)(p + off);
+            off += (size_t)n * sizeof(AltNode32);
+        }
+
+        uint32_t tc = 0;
+        if (off + 4 <= (size_t)fsz.QuadPart) { tc = *(const uint32_t *)(p + off); off += 4U; }
+        if (tc > 100000000U) { tc = 0; }
+        g->turn_count = tc;
+        if (tc > 0 && n > 0) {
+            g->turn_offsets = (uint32_t *)xcalloc((size_t)n + 1U, sizeof(uint32_t));
+            g->turn_from = (uint32_t *)xmalloc((size_t)tc * sizeof(uint32_t));
+            g->turn_to   = (uint32_t *)xmalloc((size_t)tc * sizeof(uint32_t));
+            g->turn_mode = (uint8_t  *)xmalloc((size_t)tc);
+            if (g->turn_offsets && g->turn_from && g->turn_to && g->turn_mode &&
+                off + (size_t)(n + 1U) * sizeof(uint32_t) + (size_t)tc * sizeof(uint32_t) * 2U + (size_t)tc <= (size_t)fsz.QuadPart) {
+                memcpy(g->turn_offsets, p + off, (size_t)(n + 1U) * sizeof(uint32_t)); off += (size_t)(n + 1U) * sizeof(uint32_t);
+                memcpy(g->turn_from, p + off, (size_t)tc * sizeof(uint32_t)); off += (size_t)tc * sizeof(uint32_t);
+                memcpy(g->turn_to,   p + off, (size_t)tc * sizeof(uint32_t)); off += (size_t)tc * sizeof(uint32_t);
+                memcpy(g->turn_mode, p + off, (size_t)tc); off += (size_t)tc;
+            }
+        }
+
+        uint32_t cb = 0;
+        if (off + 4 <= (size_t)fsz.QuadPart) { cb = *(const uint32_t *)(p + off); off += 4U; }
+        if (cb && n > 0 && off + 4 <= (size_t)fsz.QuadPart) {
+            uint32_t ce = *(const uint32_t *)(p + off); off += 4U;
+            g->ch_edge_count = ce;
+            g->ch_level = (uint32_t *)xmalloc((size_t)n * sizeof(uint32_t));
+            g->ch_from = (uint32_t *)xmalloc((size_t)(ce ? ce : 1) * sizeof(uint32_t));
+            g->ch_to = (uint32_t *)xmalloc((size_t)(ce ? ce : 1) * sizeof(uint32_t));
+            g->ch_time = (float *)xmalloc((size_t)(ce ? ce : 1) * sizeof(float));
+            g->ch_fwd_off = (uint32_t *)xcalloc((size_t)n + 1U, sizeof(uint32_t));
+            g->ch_rev_off = (uint32_t *)xcalloc((size_t)n + 1U, sizeof(uint32_t));
+            g->ch_rev_src = (uint32_t *)xmalloc((size_t)(ce ? ce : 1) * sizeof(uint32_t));
+            g->ch_rev_eid = (uint32_t *)xmalloc((size_t)(ce ? ce : 1) * sizeof(uint32_t));
+            g->ch_via = (uint32_t *)xmalloc((size_t)(ce ? ce : 1) * sizeof(uint32_t));
+            g->ch_child1 = (uint32_t *)xmalloc((size_t)(ce ? ce : 1) * sizeof(uint32_t));
+            g->ch_child2 = (uint32_t *)xmalloc((size_t)(ce ? ce : 1) * sizeof(uint32_t));
+            size_t need = (size_t)n * 4 + ((size_t)ce * 4) * 3 + ((size_t)n + 1U) * 4 * 2 + ((size_t)ce * 4) * 5;
+            if (g->ch_level && g->ch_from && g->ch_to && g->ch_time &&
+                g->ch_fwd_off && g->ch_rev_off && g->ch_rev_src && g->ch_rev_eid &&
+                g->ch_via && g->ch_child1 && g->ch_child2 && off + need <= (size_t)fsz.QuadPart) {
+                memcpy(g->ch_level, p + off, (size_t)n * sizeof(uint32_t)); off += (size_t)n * sizeof(uint32_t);
+                memcpy(g->ch_from, p + off, (size_t)ce * sizeof(uint32_t)); off += (size_t)ce * sizeof(uint32_t);
+                memcpy(g->ch_to, p + off, (size_t)ce * sizeof(uint32_t)); off += (size_t)ce * sizeof(uint32_t);
+                memcpy(g->ch_time, p + off, (size_t)ce * sizeof(float)); off += (size_t)ce * sizeof(float);
+                memcpy(g->ch_fwd_off, p + off, (size_t)(n + 1U) * sizeof(uint32_t)); off += (size_t)(n + 1U) * sizeof(uint32_t);
+                memcpy(g->ch_rev_off, p + off, (size_t)(n + 1U) * sizeof(uint32_t)); off += (size_t)(n + 1U) * sizeof(uint32_t);
+                memcpy(g->ch_rev_src, p + off, (size_t)ce * sizeof(uint32_t)); off += (size_t)ce * sizeof(uint32_t);
+                memcpy(g->ch_rev_eid, p + off, (size_t)ce * sizeof(uint32_t)); off += (size_t)ce * sizeof(uint32_t);
+                memcpy(g->ch_via, p + off, (size_t)ce * sizeof(uint32_t)); off += (size_t)ce * sizeof(uint32_t);
+                memcpy(g->ch_child1, p + off, (size_t)ce * sizeof(uint32_t)); off += (size_t)ce * sizeof(uint32_t);
+                memcpy(g->ch_child2, p + off, (size_t)ce * sizeof(uint32_t)); off += (size_t)ce * sizeof(uint32_t);
+                g->ch_built = 1U;
+            }
+        }
+
+        /* Persisted two-hop continuation tables: mmap in place (no heap, no
+         * rebuild). Absent in older caches -> fall back to building them. */
+        uint32_t thb = 0;
+        if (off + 4 <= (size_t)fsz.QuadPart) { thb = *(const uint32_t *)(p + off); off += 4U; }
+        if (thb && off + 4 <= (size_t)fsz.QuadPart) {
+            uint32_t thc = *(const uint32_t *)(p + off); off += 4U;
+            g->th_off = (uint32_t *)(p + off); off += (size_t)(m + 1U) * sizeof(uint32_t);
+            g->th_sx = (float *)(p + off); off += (size_t)thc * sizeof(float);
+            g->th_sy = (float *)(p + off); off += (size_t)thc * sizeof(float);
+            g->th_inv = (float *)(p + off); off += (size_t)thc * sizeof(float);
+            g->th_count = thc;
+        }
+        uint32_t rthb = 0;
+        if (off + 4 <= (size_t)fsz.QuadPart) { rthb = *(const uint32_t *)(p + off); off += 4U; }
+        if (rthb && off + 4 <= (size_t)fsz.QuadPart) {
+            uint32_t rthc = *(const uint32_t *)(p + off); off += 4U;
+            g->rth_off = (uint32_t *)(p + off); off += (size_t)(m + 1U) * sizeof(uint32_t);
+            g->rth_sx = (float *)(p + off); off += (size_t)rthc * sizeof(float);
+            g->rth_sy = (float *)(p + off); off += (size_t)rthc * sizeof(float);
+            g->rth_inv = (float *)(p + off); off += (size_t)rthc * sizeof(float);
+            g->rth_count = rthc;
+        }
         fclose(fp);
-        vmr_graph_free(g);
-        return -1;
     }
 
     int ok = 1;
-    ok &= (fread(g->node_osm_id,  sizeof(int64_t),  n, fp) == n);
-    ok &= (fread(g->node_lat,     sizeof(double),   n, fp) == n);
-    ok &= (fread(g->node_lon,     sizeof(double),   n, fp) == n);
-    ok &= (fread(g->node_x,       sizeof(float),    n, fp) == n);
-    ok &= (fread(g->node_y,       sizeof(float),    n, fp) == n);
-    ok &= (fread(g->node_comp_id, sizeof(uint32_t), n, fp) == n);
-    ok &= (fread(g->node_flags,   sizeof(uint8_t),  n, fp) == n);
-    ok &= (fread(g->fwd_offsets,  sizeof(uint32_t), n + 1U, fp) == n + 1U);
-
-    if (m > 0) {
-        ok &= (fread(g->edge_from,       sizeof(uint32_t), m, fp) == m);
-        ok &= (fread(g->edge_to,         sizeof(uint32_t), m, fp) == m);
-        ok &= (fread(g->edge_dx,         sizeof(float),    m, fp) == m);
-        ok &= (fread(g->edge_dy,         sizeof(float),    m, fp) == m);
-        ok &= (fread(g->edge_ux,         sizeof(float),    m, fp) == m);
-        ok &= (fread(g->edge_uy,         sizeof(float),    m, fp) == m);
-        ok &= (fread(g->edge_f_speed,    sizeof(float),    m, fp) == m);
-        ok &= (fread(g->edge_f_class,    sizeof(float),    m, fp) == m);
-        ok &= (fread(g->edge_f_straight, sizeof(float),    m, fp) == m);
-        ok &= (fread(g->edge_f_smooth,   sizeof(float),    m, fp) == m);
-        ok &= (fread(g->edge_length_m,   sizeof(float),    m, fp) == m);
-        ok &= (fread(g->edge_time_s,     sizeof(float),    m, fp) == m);
-        ok &= (fread(g->edge_flags,      sizeof(uint8_t),  m, fp) == m);
-    }
-
-    uint8_t amask = 0;
-    ok &= (fread(&amask, sizeof(uint8_t), 1, fp) == 1);
-    for (uint32_t p = 0; p < 5; p++) {
-        if (amask & (1U << p)) {
-            g->edge_attr_scale[p] = (float *)xmalloc((size_t)(m ? m : 1) * sizeof(float));
-            if (!g->edge_attr_scale[p]) {
-                ok = 0;
-            } else {
-                ok &= (fread(g->edge_attr_scale[p], sizeof(float), m, fp) == m);
-            }
-        }
-    }
-
-    ok &= (fread(g->rev_offsets,  sizeof(uint32_t), n + 1U, fp) == n + 1U);
-    if (m > 0) {
-        ok &= (fread(g->rev_src_node, sizeof(uint32_t), m, fp) == m);
-        ok &= (fread(g->rev_fwd_eid,  sizeof(uint32_t), m, fp) == m);
-    }
-    ok &= (fread(g->grid_offsets, sizeof(uint32_t), cells + 1U, fp) == cells + 1U);
-    ok &= (fread(g->grid_nodes,   sizeof(uint32_t), n, fp) == n);
-
-    uint32_t l = 0;
-    ok &= (fread(&l, sizeof(uint32_t), 1, fp) == 1);
-    if (l > 64 || (size_t)l > SIZE_MAX / (size_t)(n ? n : 1)) {
-        ok = 0;
-        l = 0;
-    }
-    g->landmark_count = l;
-    if (l > 0 && n > 0) {
-        g->landmark_node = (uint32_t *)xmalloc((size_t)l * sizeof(uint32_t));
-        g->alt_nodes = (AltNode16 *)xaligned_alloc(64, (size_t)n * sizeof(AltNode16));
-        if (!g->landmark_node || !g->alt_nodes) {
-            ok = 0;
-        } else {
-            ok &= (fread(g->landmark_node, sizeof(uint32_t), l, fp) == l);
-            ok &= (fread(g->alt_nodes, sizeof(AltNode16), n, fp) == n);
-        }
-    }
-
-    uint32_t tc = 0;
-    ok &= (fread(&tc, sizeof(uint32_t), 1, fp) == 1);
-    if (tc > 100000000U) {
-        ok = 0;
-        tc = 0;
-    }
-    g->turn_count = tc;
-    if (tc > 0 && n > 0) {
-        g->turn_offsets = (uint32_t *)xcalloc((size_t)n + 1U, sizeof(uint32_t));
-        g->turn_from    = (uint32_t *)xmalloc((size_t)tc * sizeof(uint32_t));
-        g->turn_to      = (uint32_t *)xmalloc((size_t)tc * sizeof(uint32_t));
-        g->turn_mode    = (uint8_t *)xmalloc((size_t)tc);
-        if (!g->turn_offsets || !g->turn_from || !g->turn_to || !g->turn_mode) {
-            ok = 0;
-        } else {
-            ok &= (fread(g->turn_offsets, sizeof(uint32_t), (size_t)n + 1U, fp) == (size_t)n + 1U);
-            ok &= (fread(g->turn_from,    sizeof(uint32_t), tc, fp) == tc);
-            ok &= (fread(g->turn_to,      sizeof(uint32_t), tc, fp) == tc);
-            ok &= (fread(g->turn_mode,    sizeof(uint8_t),  tc, fp) == tc);
-        }
-    }
-
-    uint32_t cb = 0;
-    ok &= (fread(&cb, sizeof(uint32_t), 1, fp) == 1);
-    if (cb && n > 0) {
-        uint32_t ce = 0;
-        ok &= (fread(&ce, sizeof(uint32_t), 1, fp) == 1);
-        g->ch_edge_count = ce;
-        g->ch_level = (uint32_t *)xmalloc((size_t)n * sizeof(uint32_t));
-        g->ch_from = (uint32_t *)xmalloc((size_t)(ce ? ce : 1) * sizeof(uint32_t));
-        g->ch_to = (uint32_t *)xmalloc((size_t)(ce ? ce : 1) * sizeof(uint32_t));
-        g->ch_time = (float *)xmalloc((size_t)(ce ? ce : 1) * sizeof(float));
-        g->ch_fwd_off = (uint32_t *)xcalloc((size_t)n + 1U, sizeof(uint32_t));
-        g->ch_rev_off = (uint32_t *)xcalloc((size_t)n + 1U, sizeof(uint32_t));
-        g->ch_rev_src = (uint32_t *)xmalloc((size_t)(ce ? ce : 1) * sizeof(uint32_t));
-        g->ch_rev_eid = (uint32_t *)xmalloc((size_t)(ce ? ce : 1) * sizeof(uint32_t));
-        g->ch_via = (uint32_t *)xmalloc((size_t)(ce ? ce : 1) * sizeof(uint32_t));
-        g->ch_child1 = (uint32_t *)xmalloc((size_t)(ce ? ce : 1) * sizeof(uint32_t));
-        g->ch_child2 = (uint32_t *)xmalloc((size_t)(ce ? ce : 1) * sizeof(uint32_t));
-        if (!g->ch_level || !g->ch_from || !g->ch_to || !g->ch_time ||
-            !g->ch_fwd_off || !g->ch_rev_off || !g->ch_rev_src || !g->ch_rev_eid ||
-            !g->ch_via || !g->ch_child1 || !g->ch_child2) {
-            ok = 0;
-        } else {
-            ok &= (fread(g->ch_level, sizeof(uint32_t), n, fp) == n);
-            ok &= (fread(g->ch_from, sizeof(uint32_t), ce, fp) == ce);
-            ok &= (fread(g->ch_to, sizeof(uint32_t), ce, fp) == ce);
-            ok &= (fread(g->ch_time, sizeof(float), ce, fp) == ce);
-            ok &= (fread(g->ch_fwd_off, sizeof(uint32_t), (size_t)n + 1U, fp) == (size_t)n + 1U);
-            ok &= (fread(g->ch_rev_off, sizeof(uint32_t), (size_t)n + 1U, fp) == (size_t)n + 1U);
-            ok &= (fread(g->ch_rev_src, sizeof(uint32_t), ce, fp) == ce);
-            ok &= (fread(g->ch_rev_eid, sizeof(uint32_t), ce, fp) == ce);
-            ok &= (fread(g->ch_via, sizeof(uint32_t), ce, fp) == ce);
-            ok &= (fread(g->ch_child1, sizeof(uint32_t), ce, fp) == ce);
-            ok &= (fread(g->ch_child2, sizeof(uint32_t), ce, fp) == ce);
-        }
-    }
-    g->ch_built = (cb && g->ch_level && g->ch_from && g->ch_to &&
-                   g->ch_time && g->ch_fwd_off && g->ch_rev_off &&
-                   g->ch_rev_src && g->ch_rev_eid) ? 1U : 0U;
-    fclose(fp);
+    (void)ok;
 
     if (!ok || idmap_init(&g->osm_map, n) != 0) {
         vmr_graph_free(g);
@@ -3325,9 +3595,9 @@ static int vmr_load_binary(VmrGraph *g, const char *path) {
         idmap_put(&g->osm_map, *(oids + i), i);
     }
 
-    vmr_build_two_hop(g);
-    vmr_build_two_hop_rev(g);
-    if (vmr_blocks_enabled()) {
+    if (!g->th_off)  vmr_build_two_hop(g);
+    if (!g->rth_off) vmr_build_two_hop_rev(g);
+    if (vmr_rev_enabled()) {
         vmr_build_edge_blocks(g);
     }
 
@@ -5509,10 +5779,29 @@ static inline float compute_8d_step_cost(const VmrGraph *g, uint32_t eid,
     return (cost > 0.01f) ? cost : 0.01f;
 }
 
-static inline float alt_heuristic_scalar(const AltNode16 *av, const float *gf,
+/* Cheaper admissible lower bound: full cost with cos2=1 and corridor term = 1. */
+static inline float compute_8d_cost_min(const VmrGraph *g, uint32_t eid,
+                                         const VmrPreference *p, SearchMode mode,
+                                         float attr_scale, float cos1, float mom_dot) {
+    float base_time = *(g->edge_time_s + eid);
+    if (p->avoid_tolls && (*(g->edge_flags + eid) & EDGE_TOLL)) {
+        base_time *= 3.8f;
+    }
+    if (mode == MODE_DIJKSTRA) {
+        return base_time;
+    }
+    float spatial_align = 0.50f * cos1 + 0.30f + 0.20f * mom_dot;
+    if (spatial_align > 1.0f) spatial_align = 1.0f;
+    if (spatial_align < -1.0f) spatial_align = -1.0f;
+    float align_pen = 1.0f + (0.38f * p->w_align * (1.0f - spatial_align));
+    float cost = base_time * attr_scale * align_pen;
+    return (cost > 0.01f) ? cost : 0.01f;
+}
+
+static inline float alt_heuristic_scalar(const AltNode32 *av, const float *gf,
                                          const float *gb, uint32_t L) {
     float best = 0.0f;
-    for (uint32_t i = 0; i < L && i < 16; i++) {
+    for (uint32_t i = 0; i < L && i < 32; i++) {
         float d1 = *(gf + i) - av->fwd[i];
         float d2 = av->bwd[i] - *(gb + i);
         if (d1 > best) best = d1;
@@ -5523,14 +5812,21 @@ static inline float alt_heuristic_scalar(const AltNode16 *av, const float *gf,
 
 #if defined(__AVX2__)
 #include <immintrin.h>
-static inline float alt_heuristic_avx2(const AltNode16 *av, __m256 gf0, __m256 gf1,
-                                       __m256 gb0, __m256 gb1) {
-    __m256 f0 = _mm256_load_ps(av->fwd);
-    __m256 f1 = _mm256_load_ps(av->fwd + 8);
-    __m256 b0 = _mm256_load_ps(av->bwd);
-    __m256 b1 = _mm256_load_ps(av->bwd + 8);
-    __m256 d1 = _mm256_max_ps(_mm256_sub_ps(gf0, f0), _mm256_sub_ps(gf1, f1));
-    __m256 d2 = _mm256_max_ps(_mm256_sub_ps(b0, gb0), _mm256_sub_ps(b1, gb1));
+static inline float alt_heuristic_avx2(const AltNode32 *av, __m256 gf0, __m256 gf1,
+                                       __m256 gf2, __m256 gf3,
+                                       __m256 gb0, __m256 gb1, __m256 gb2, __m256 gb3) {
+    __m256 f0 = _mm256_loadu_ps(av->fwd);
+    __m256 f1 = _mm256_loadu_ps(av->fwd + 8);
+    __m256 f2 = _mm256_loadu_ps(av->fwd + 16);
+    __m256 f3 = _mm256_loadu_ps(av->fwd + 24);
+    __m256 b0 = _mm256_loadu_ps(av->bwd);
+    __m256 b1 = _mm256_loadu_ps(av->bwd + 8);
+    __m256 b2 = _mm256_loadu_ps(av->bwd + 16);
+    __m256 b3 = _mm256_loadu_ps(av->bwd + 24);
+    __m256 d1 = _mm256_max_ps(_mm256_max_ps(_mm256_sub_ps(gf0, f0), _mm256_sub_ps(gf1, f1)),
+                              _mm256_max_ps(_mm256_sub_ps(gf2, f2), _mm256_sub_ps(gf3, f3)));
+    __m256 d2 = _mm256_max_ps(_mm256_max_ps(_mm256_sub_ps(b0, gb0), _mm256_sub_ps(b1, gb1)),
+                              _mm256_max_ps(_mm256_sub_ps(b2, gb2), _mm256_sub_ps(b3, gb3)));
     __m256 mx = _mm256_max_ps(_mm256_max_ps(d1, d2), _mm256_setzero_ps());
     __m128 hi = _mm256_extractf128_ps(mx, 1);
     __m128 lo = _mm256_castps256_ps128(mx);
@@ -5542,9 +5838,9 @@ static inline float alt_heuristic_avx2(const AltNode16 *av, __m256 gf0, __m256 g
 #endif
 
 #if defined(__AVX2__)
-#define ALT_HEUR(g, u, gf, gb, gf0, gf1, gb0, gb1, L) alt_heuristic_avx2(&(g)->alt_nodes[u], (gf0), (gf1), (gb0), (gb1))
+#define ALT_HEUR(g, u, gf, gb, gf0, gf1, gf2, gf3, gb0, gb1, gb2, gb3, L) alt_heuristic_avx2(&(g)->alt_nodes[u], (gf0), (gf1), (gf2), (gf3), (gb0), (gb1), (gb2), (gb3))
 #else
-#define ALT_HEUR(g, u, gf, gb, gf0, gf1, gb0, gb1, L) alt_heuristic_scalar(&(g)->alt_nodes[u], (gf), (gb), (L))
+#define ALT_HEUR(g, u, gf, gb, gf0, gf1, gf2, gf3, gb0, gb1, gb2, gb3, L) alt_heuristic_scalar(&(g)->alt_nodes[u], (gf), (gb), (L))
 #endif
 
 static inline int turn_forbidden(const VmrGraph *g, uint32_t via,
@@ -5633,22 +5929,27 @@ static void vmr_compute_result_telemetry(const VmrGraph *g, VmrResult *res,
 /* Reusable search workspace: avoids ~14 allocations and a ~65 MB memset per
  * query.  Generation stamps make visited/closed tests O(1) without clearing.
  * The CLI is single-threaded; this is intentionally a process-global pool. */
-typedef struct __attribute__((aligned(64))) {
-    float g_fwd, g_bwd;
-    uint32_t p_fwd, p_bwd;
-    uint32_t pe_fwd, pe_bwd;
-    uint32_t st_fwd, st_bwd;
-    float mx_fwd, my_fwd, mx_bwd, my_bwd;
-    uint32_t pad[4];
-} BidirNodeState;
+typedef struct {
+    float g;
+    uint32_t p, pe, st;
+    float mx, my;
+} BidirFwdState;
 
-_Static_assert(sizeof(BidirNodeState) == 64, "BidirNodeState must be one cache line");
+typedef struct {
+    float g;
+    uint32_t p, pe, st;
+    float mx, my;
+} BidirBwdState;
+
+_Static_assert(sizeof(BidirFwdState) == 24, "BidirFwdState must be 24 bytes");
+_Static_assert(sizeof(BidirBwdState) == 24, "BidirBwdState must be 24 bytes");
 
 typedef struct {
     size_t cap;
     int ready;
     uint32_t epoch;
-    BidirNodeState *state;
+    BidirFwdState *sf;
+    BidirBwdState *sb;
     /* Legacy arrays retained only for the dormant CH helpers. */
     float *g_fwd, *g_bwd;
     float *mx_fwd, *my_fwd, *mx_bwd, *my_bwd;
@@ -5671,7 +5972,8 @@ static void vmr_ws_free(void) {
     xfree(g_ws.st_bwd); xfree(g_ws.cl_bwd);
     heap_free(&g_ws.pq_fwd);
     heap_free(&g_ws.pq_bwd);
-    xfree_aligned(g_ws.state);
+    xfree_aligned(g_ws.sf);
+    xfree_aligned(g_ws.sb);
     memset(&g_ws, 0, sizeof(g_ws));
 }
 
@@ -5692,14 +5994,16 @@ static int vmr_ws_reserve(size_t n) {
     xfree(g_ws.st_bwd); xfree(g_ws.cl_bwd);
     heap_free(&g_ws.pq_fwd);
     heap_free(&g_ws.pq_bwd);
-    xfree_aligned(g_ws.state);
+    xfree_aligned(g_ws.sf);
+    xfree_aligned(g_ws.sb);
     memset(&g_ws, 0, sizeof(g_ws));
     if (n == 0) {
         n = 1;
     }
     g_ws.cap = n;
-    g_ws.state = (BidirNodeState *)xaligned_alloc(64, n * sizeof(BidirNodeState));
-    if (!g_ws.state || heap_init(&g_ws.pq_fwd, 256) != 0 || heap_init(&g_ws.pq_bwd, 256) != 0) {
+    g_ws.sf = (BidirFwdState *)xaligned_alloc(64, n * sizeof(BidirFwdState));
+    g_ws.sb = (BidirBwdState *)xaligned_alloc(64, n * sizeof(BidirBwdState));
+    if (!g_ws.sf || !g_ws.sb || heap_init(&g_ws.pq_fwd, 256) != 0 || heap_init(&g_ws.pq_bwd, 256) != 0) {
         return -1;
     }
     g_ws.ready = 1;
@@ -6184,12 +6488,11 @@ static inline uint32_t vmr_expand_fwd_block(
                                          _mm_mul_ps(t2, mom));
         spatial_min = _mm_max_ps(_mm_min_ps(spatial_min, one), negone);
         __m128 align_min = _mm_add_ps(one, _mm_mul_ps(wa, _mm_sub_ps(one, spatial_min)));
-        __m128 cost_min = _mm_max_ps(_mm_mul_ps(_mm_mul_ps(base, attr),
-                                                _mm_mul_ps(align_min, corr)), mincost);
+        __m128 cost_min = _mm_max_ps(_mm_mul_ps(_mm_mul_ps(base, attr), align_min), mincost);
         float cminv[4];
         _mm_storeu_ps(cminv, cost_min);
 
-        uint32_t p_u = ws->state[u].p_fwd;
+        uint32_t p_u = ws->sf[u].p;
         int turn_res = ((*(g->node_flags + u) & NODE_HAS_TURN_RES) && p_u != VMR_INVALID);
         float gu_ = gu;
         for (int l = 0; l < 4; l++) {
@@ -6200,7 +6503,7 @@ static inline uint32_t vmr_expand_fwd_block(
             if (skip_dead && (*(g->edge_flags + e + (uint32_t)l) & EDGE_DEAD_TARGET)) {
                 continue;
             }
-            if (ws->state[v].st_fwd == epoch + 1U) {
+            if (ws->sf[v].st == epoch + 1U) {
                 continue;
             }
             if (turn_res && turn_forbidden(g, u, p_u, v)) {
@@ -6215,7 +6518,7 @@ static inline uint32_t vmr_expand_fwd_block(
                 h_v = vmr_sqrt_fast(rvx * rvx + rvy * rvy) * v_heur;
             }
             float ng_min = gu_ + cminv[l];
-            if (ws->state[v].st_fwd == epoch && ng_min >= ws->state[v].g_fwd) {
+            if (ws->sf[v].st == epoch && ng_min >= ws->sf[v].g) {
                 continue;
             }
             if (ng_min + h_v >= *best_total) {
@@ -6225,22 +6528,22 @@ static inline uint32_t vmr_expand_fwd_block(
             if (ng + h_v >= *best_total) {
                 continue;
             }
-            if (ws->state[v].st_fwd != epoch || ng < ws->state[v].g_fwd) {
-                ws->state[v].st_fwd = epoch;
-                ws->state[v].g_fwd = ng;
-                ws->state[v].p_fwd = u;
-                ws->state[v].pe_fwd = e + (uint32_t)l;
+            if (ws->sf[v].st != epoch || ng < ws->sf[v].g) {
+                ws->sf[v].st = epoch;
+                ws->sf[v].g = ng;
+                ws->sf[v].p = u;
+                ws->sf[v].pe = e + (uint32_t)l;
                 float eux = *(g->edge_ux + e + (uint32_t)l);
                 float euy = *(g->edge_uy + e + (uint32_t)l);
                 float nmx = 0.65f * umx + 0.35f * eux;
                 float nmy = 0.65f * umy + 0.35f * euy;
                 float mn = vmr_inv_sqrt(nmx * nmx + nmy * nmy + EPS_F);
-                ws->state[v].mx_fwd = nmx * mn;
-                ws->state[v].my_fwd = nmy * mn;
+                ws->sf[v].mx = nmx * mn;
+                ws->sf[v].my = nmy * mn;
 
-                if (track_meet && ws->state[v].st_bwd == epoch &&
-                    ws->state[v].g_bwd < FLT_MAX) {
-                    float tot = ng + ws->state[v].g_bwd;
+                if (track_meet && ws->sb[v].st == epoch &&
+                    ws->sb[v].g < FLT_MAX) {
+                    float tot = ng + ws->sb[v].g;
                     if (tot < *best_total) {
                         *best_total = tot;
                         *meet_node = v;
@@ -6364,12 +6667,11 @@ static inline uint32_t vmr_expand_bwd_block(
                                          _mm_mul_ps(t2, mom));
         spatial_min = _mm_max_ps(_mm_min_ps(spatial_min, one), negone);
         __m128 align_min = _mm_add_ps(one, _mm_mul_ps(wa, _mm_sub_ps(one, spatial_min)));
-        __m128 cost_min = _mm_max_ps(_mm_mul_ps(_mm_mul_ps(base, attr),
-                                                _mm_mul_ps(align_min, corr)), mincost);
+        __m128 cost_min = _mm_max_ps(_mm_mul_ps(_mm_mul_ps(base, attr), align_min), mincost);
         float cminv[4];
         _mm_storeu_ps(cminv, cost_min);
 
-        uint32_t next_w = ws->state[w].p_bwd;
+        uint32_t next_w = ws->sb[w].p;
         int turn_res = ((*(g->node_flags + w) & NODE_HAS_TURN_RES) && next_w != VMR_INVALID);
         for (int l = 0; l < 4; l++) {
             uint32_t u = B->to[l];
@@ -6379,7 +6681,7 @@ static inline uint32_t vmr_expand_bwd_block(
             if (skip_dead && (B->flags[l] & EDGE_DEAD_SOURCE)) {
                 continue;
             }
-            if (ws->state[u].st_bwd == epoch + 1U) {
+            if (ws->sb[u].st == epoch + 1U) {
                 continue;
             }
             if (turn_res && turn_forbidden(g, w, u, next_w)) {
@@ -6394,8 +6696,8 @@ static inline uint32_t vmr_expand_bwd_block(
                 h_v = vmr_sqrt_fast(rvx * rvx + rvy * rvy) * v_heur;
             }
             float ng_min = gb + cminv[l];
-            if ((ws->state[u].st_bwd == epoch || ws->state[u].st_bwd == epoch + 1U) &&
-                ng_min >= ws->state[u].g_bwd) {
+            if ((ws->sb[u].st == epoch || ws->sb[u].st == epoch + 1U) &&
+                ng_min >= ws->sb[u].g) {
                 continue;
             }
             if (ng_min + h_v >= *best_total) {
@@ -6405,22 +6707,22 @@ static inline uint32_t vmr_expand_bwd_block(
             if (ng + h_v >= *best_total) {
                 continue;
             }
-            if (ws->state[u].st_bwd != epoch || ng < ws->state[u].g_bwd) {
-                ws->state[u].st_bwd = epoch;
-                ws->state[u].g_bwd = ng;
-                ws->state[u].p_bwd = w;
+            if (ws->sb[u].st != epoch || ng < ws->sb[u].g) {
+                ws->sb[u].st = epoch;
+                ws->sb[u].g = ng;
+                ws->sb[u].p = w;
                 uint32_t ri = r0 + (uint32_t)l;
-                ws->state[u].pe_bwd = *(g->rev_fwd_eid + ri);
+                ws->sb[u].pe = *(g->rev_fwd_eid + ri);
                 float eux = B->ux[l], euy = B->uy[l];
                 float nmx = 0.65f * wmx + 0.35f * eux;
                 float nmy = 0.65f * wmy + 0.35f * euy;
                 float mn = vmr_inv_sqrt(nmx * nmx + nmy * nmy + EPS_F);
-                ws->state[u].mx_bwd = nmx * mn;
-                ws->state[u].my_bwd = nmy * mn;
+                ws->sb[u].mx = nmx * mn;
+                ws->sb[u].my = nmy * mn;
 
-                if (track_meet && ws->state[u].st_fwd == epoch &&
-                    ws->state[u].g_fwd < FLT_MAX) {
-                    float tot = ng + ws->state[u].g_fwd;
+                if (track_meet && ws->sf[u].st == epoch &&
+                    ws->sf[u].g < FLT_MAX) {
+                    float tot = ng + ws->sf[u].g;
                     if (tot < *best_total) {
                         *best_total = tot;
                         *meet_node = u;
@@ -6530,31 +6832,32 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
     VmrSearchWS *ws = &g_ws;
     uint32_t epoch;
     if (ws->epoch > UINT32_MAX - 2U) {
-        memset(ws->state, 0, (size_t)n * sizeof(BidirNodeState));
+        memset(ws->sf, 0, (size_t)n * sizeof(BidirFwdState));
+        memset(ws->sb, 0, (size_t)n * sizeof(BidirBwdState));
         ws->epoch = 0;
     }
     ws->epoch += 2U;
     epoch = ws->epoch;
     ws->pq_fwd.size = 0;
     ws->pq_bwd.size = 0;
-    MinHeap  *pq_fwd = &ws->pq_fwd;
-    MinHeap  *pq_bwd = &ws->pq_bwd;
+    MinHeap *pq_fwd = &ws->pq_fwd;
+    MinHeap *pq_bwd = &ws->pq_bwd;
 
-    ws->state[start_idx].st_fwd = epoch;
-    ws->state[start_idx].g_fwd  = 0.0f;
-    ws->state[start_idx].p_fwd  = VMR_INVALID;
-    ws->state[start_idx].pe_fwd = VMR_INVALID;
-    ws->state[start_idx].mx_fwd = chord_dx * inv_chord;
-    ws->state[start_idx].my_fwd = chord_dy * inv_chord;
+    ws->sf[start_idx].st = epoch;
+    ws->sf[start_idx].g  = 0.0f;
+    ws->sf[start_idx].p  = VMR_INVALID;
+    ws->sf[start_idx].pe = VMR_INVALID;
+    ws->sf[start_idx].mx = chord_dx * inv_chord;
+    ws->sf[start_idx].my = chord_dy * inv_chord;
     heap_push(pq_fwd, start_idx, 0.0f);
 
     if (query->mode == MODE_VEC_BIDIR) {
-        ws->state[goal_idx].st_bwd = epoch;
-        ws->state[goal_idx].g_bwd  = 0.0f;
-        ws->state[goal_idx].p_bwd  = VMR_INVALID;
-        ws->state[goal_idx].pe_bwd = VMR_INVALID;
-        ws->state[goal_idx].mx_bwd = -chord_dx * inv_chord;
-        ws->state[goal_idx].my_bwd = -chord_dy * inv_chord;
+        ws->sb[goal_idx].st = epoch;
+        ws->sb[goal_idx].g  = 0.0f;
+        ws->sb[goal_idx].p  = VMR_INVALID;
+        ws->sb[goal_idx].pe = VMR_INVALID;
+        ws->sb[goal_idx].mx = -chord_dx * inv_chord;
+        ws->sb[goal_idx].my = -chord_dy * inv_chord;
         heap_push(pq_bwd, goal_idx, 0.0f);
     }
 
@@ -6577,23 +6880,28 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
     const float v_heur = (query->mode == MODE_DIJKSTRA)
                        ? 0.0f : (attr_scale_min / max_speed_mps);
 
-    float alt_gf[16], alt_gb[16], alt_sf[16], alt_sb[16];
+    float alt_gf[32], alt_gb[32], alt_sf[32], alt_sb[32];
     uint32_t L = g->landmark_count;
-    int has_alt = (L > 0 && g->alt_nodes != NULL && !g->ch_built);
+    int has_alt = (query->mode != MODE_DIJKSTRA) &&
+                  (L > 0 && g->alt_nodes != NULL && !g->ch_built);
     float alt_scale = (query->mode == MODE_DIJKSTRA) ? 1.0f : attr_scale_min;
 #if defined(__AVX2__)
     __m256 gf0 = _mm256_setzero_ps(), gf1 = _mm256_setzero_ps();
+    __m256 gf2 = _mm256_setzero_ps(), gf3 = _mm256_setzero_ps();
     __m256 gb0 = _mm256_setzero_ps(), gb1 = _mm256_setzero_ps();
+    __m256 gb2 = _mm256_setzero_ps(), gb3 = _mm256_setzero_ps();
     __m256 sf0 = _mm256_setzero_ps(), sf1 = _mm256_setzero_ps();
+    __m256 sf2 = _mm256_setzero_ps(), sf3 = _mm256_setzero_ps();
     __m256 sb0 = _mm256_setzero_ps(), sb1 = _mm256_setzero_ps();
+    __m256 sb2 = _mm256_setzero_ps(), sb3 = _mm256_setzero_ps();
 #endif
     if (has_alt) {
-        if (L > 16) {
-            L = 16;
+        if (L > 32) {
+            L = 32;
         }
-        const AltNode16 *gn = g->alt_nodes + goal_idx;
-        const AltNode16 *sn = g->alt_nodes + start_idx;
-        for (uint32_t i = 0; i < 16; i++) {
+        const AltNode32 *gn = g->alt_nodes + goal_idx;
+        const AltNode32 *sn = g->alt_nodes + start_idx;
+        for (uint32_t i = 0; i < 32; i++) {
             float gf = (i < L) ? gn->fwd[i] : 1.0e30f;
             float gb = (i < L) ? gn->bwd[i] : -1.0e30f;
             float sf = (i < L) ? sn->fwd[i] : 1.0e30f;
@@ -6606,12 +6914,20 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
 #if defined(__AVX2__)
         gf0 = _mm256_loadu_ps(alt_gf);
         gf1 = _mm256_loadu_ps(alt_gf + 8);
+        gf2 = _mm256_loadu_ps(alt_gf + 16);
+        gf3 = _mm256_loadu_ps(alt_gf + 24);
         gb0 = _mm256_loadu_ps(alt_gb);
         gb1 = _mm256_loadu_ps(alt_gb + 8);
+        gb2 = _mm256_loadu_ps(alt_gb + 16);
+        gb3 = _mm256_loadu_ps(alt_gb + 24);
         sf0 = _mm256_loadu_ps(alt_sf);
         sf1 = _mm256_loadu_ps(alt_sf + 8);
+        sf2 = _mm256_loadu_ps(alt_sf + 16);
+        sf3 = _mm256_loadu_ps(alt_sf + 24);
         sb0 = _mm256_loadu_ps(alt_sb);
         sb1 = _mm256_loadu_ps(alt_sb + 8);
+        sb2 = _mm256_loadu_ps(alt_sb + 16);
+        sb3 = _mm256_loadu_ps(alt_sb + 24);
 #endif
     }
 
@@ -6620,8 +6936,8 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
         HeapEntry top;
         while (heap_pop(pq_fwd, &top)) {
             uint32_t u = top.node;
-            if (ws->state[u].st_fwd == epoch + 1) continue;
-            ws->state[u].st_fwd = epoch + 1;
+            if (ws->sf[u].st == epoch + 1) continue;
+            ws->sf[u].st = epoch + 1;
             expanded++;
             if (u == goal_idx) {
                 meet_node = goal_idx;
@@ -6632,12 +6948,12 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
             float rx = gx - ux_pos, ry = gy - uy_pos;
             float rinv = vmr_inv_sqrt(rx * rx + ry * ry + EPS_F);
             float urx = rx * rinv, ury = ry * rinv;
-            float umx = ws->state[u].mx_fwd, umy = ws->state[u].my_fwd;
+            float umx = ws->sf[u].mx, umy = ws->sf[u].my;
 
             uint32_t ei = *(g->fwd_offsets + u);
             if (vmr_blocks_enabled() && g->th_off && query->pref.pref_id >= 0 && query->pref.pref_id < 5) {
                 ei = vmr_expand_fwd_block(g, ws, pq_fwd, epoch, u, goal_idx,
-                    ws->state[u].g_fwd, umx, umy, urx, ury, gx, gy, sx, sy,
+                    ws->sf[u].g, umx, umy, urx, ury, gx, gy, sx, sy,
                     chord_dx, chord_dy, inv_chord, &query->pref,
                     (uint32_t)query->pref.pref_id,
                     (query->allow_cross_track_prune && chord_len > 100.0f),
@@ -6648,12 +6964,12 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
             for (; ei < end; ei++) {
                 uint32_t v = *(g->edge_to + ei);
                 float as = as_arr ? as_arr[ei] : compute_attr_scale(g, ei, &query->pref);
-                if (ws->state[v].st_fwd == epoch + 1) continue;
+                if (ws->sf[v].st == epoch + 1) continue;
                 if (skip_dead && (*(g->edge_flags + ei) & EDGE_DEAD_TARGET)) continue;
                 if (g->ch_built && !(*(g->ch_level + u) < *(g->ch_level + v))) continue;
                 if (g->ch_built && !(*(g->ch_level + u) < *(g->ch_level + v))) continue;
-                if ((*(g->node_flags + u) & NODE_HAS_TURN_RES) && ws->state[u].p_fwd != VMR_INVALID &&
-                    turn_forbidden(g, u, ws->state[u].p_fwd, v)) continue;
+                if ((*(g->node_flags + u) & NODE_HAS_TURN_RES) && ws->sf[u].p != VMR_INVALID &&
+                    turn_forbidden(g, u, ws->sf[u].p, v)) continue;
 
                 float eux = *(g->edge_ux + ei), euy = *(g->edge_uy + ei);
                 float cos1 = eux * urx + euy * ury;
@@ -6670,7 +6986,7 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
                 if (g->ch_built) {
                     h_v = 0.0f;
                 } else if (has_alt) {
-                    h_v = ALT_HEUR(g, v, alt_gf, alt_gb, gf0, gf1, gb0, gb1, L) * alt_scale;
+                    h_v = ALT_HEUR(g, v, alt_gf, alt_gb, gf0, gf1, gf2, gf3, gb0, gb1, gb2, gb3, L) * alt_scale;
                 } else if (query->mode == MODE_VEC_UNIDIR) {
                     float rvx = gx - *(g->node_x + v);
                     float rvy = gy - *(g->node_y + v);
@@ -6679,10 +6995,10 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
 
                 /* Optimistic lower bound (cos2 = 1): skip two-hop and heap work
                  * when the edge cannot improve the target. */
-                float sc_min = compute_8d_step_cost(g, ei, &query->pref, query->mode, as,
-                                                    cos1, 1.0f, mom, cross_ratio);
-                float ng_min = ws->state[u].g_fwd + sc_min;
-                if (ws->state[v].st_fwd == epoch && ng_min >= ws->state[v].g_fwd) continue;
+                float sc_min = compute_8d_cost_min(g, ei, &query->pref, query->mode, as,
+                                                        cos1, mom);
+                float ng_min = ws->sf[u].g + sc_min;
+                if (ws->sf[v].st == epoch && ng_min >= ws->sf[v].g) continue;
                 if (ng_min + h_v >= best_total) continue;
 
                 float cos2 = (query->mode == MODE_DIJKSTRA) ? cos1 :
@@ -6690,18 +7006,18 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
                               two_hop_fwd_cos_fast(g, ei, cos1, urx, ury));
                 float sc = compute_8d_step_cost(g, ei, &query->pref, query->mode, as,
                                                 cos1, cos2, mom, cross_ratio);
-                float ng = ws->state[u].g_fwd + sc;
+                float ng = ws->sf[u].g + sc;
                 if (ng + h_v >= best_total) continue;
-                if (ws->state[v].st_fwd != epoch || ng < ws->state[v].g_fwd) {
-                    ws->state[v].st_fwd  = epoch;
-                    ws->state[v].g_fwd   = ng;
-                    ws->state[v].p_fwd   = u;
-                    ws->state[v].pe_fwd  = ei;
+                if (ws->sf[v].st != epoch || ng < ws->sf[v].g) {
+                    ws->sf[v].st  = epoch;
+                    ws->sf[v].g   = ng;
+                    ws->sf[v].p   = u;
+                    ws->sf[v].pe  = ei;
                     float nmx = 0.65f * umx + 0.35f * eux;
                     float nmy = 0.65f * umy + 0.35f * euy;
                     float mn = vmr_inv_sqrt(nmx * nmx + nmy * nmy + EPS_F);
-                    ws->state[v].mx_fwd = nmx * mn;
-                    ws->state[v].my_fwd = nmy * mn;
+                    ws->sf[v].mx = nmx * mn;
+                    ws->sf[v].my = nmy * mn;
                     if (ng + h_v < best_total) {
                         heap_push(pq_fwd, v, ng + h_v);
                     }
@@ -6726,12 +7042,12 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
                 HeapEntry top;
                 if (!heap_pop(pq_fwd, &top)) break;
                 uint32_t u = top.node;
-                if (ws->state[u].st_fwd == epoch + 1) continue;
-                ws->state[u].st_fwd = epoch + 1;
+                if (ws->sf[u].st == epoch + 1) continue;
+                ws->sf[u].st = epoch + 1;
                 expanded++;
 
-                if ((ws->state[u].st_bwd == epoch || ws->state[u].st_bwd == epoch+1) && ws->state[u].g_bwd < FLT_MAX) {
-                    float tot = ws->state[u].g_fwd + ws->state[u].g_bwd;
+                if ((ws->sb[u].st == epoch || ws->sb[u].st == epoch+1) && ws->sb[u].g < FLT_MAX) {
+                    float tot = ws->sf[u].g + ws->sb[u].g;
                     if (tot < best_total) {
                         best_total = tot;
                         meet_node = u;
@@ -6742,12 +7058,12 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
                 float rx = gx - ux_pos, ry = gy - uy_pos;
                 float rinv = vmr_inv_sqrt(rx * rx + ry * ry + EPS_F);
                 float urx = rx * rinv, ury = ry * rinv;
-                float umx = ws->state[u].mx_fwd, umy = ws->state[u].my_fwd;
+                float umx = ws->sf[u].mx, umy = ws->sf[u].my;
 
                 uint32_t ei = *(g->fwd_offsets + u);
                 if (vmr_blocks_enabled() && g->th_off && query->pref.pref_id >= 0 && query->pref.pref_id < 5) {
                     ei = vmr_expand_fwd_block(g, ws, pq_fwd, epoch, u, goal_idx,
-                        ws->state[u].g_fwd, umx, umy, urx, ury, gx, gy, sx, sy,
+                        ws->sf[u].g, umx, umy, urx, ury, gx, gy, sx, sy,
                         chord_dx, chord_dy, inv_chord, &query->pref,
                         (uint32_t)query->pref.pref_id,
                         (query->allow_cross_track_prune && chord_len > 100.0f),
@@ -6758,12 +7074,12 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
                 for (; ei < end; ei++) {
                     uint32_t v = *(g->edge_to + ei);
                     float as = as_arr ? as_arr[ei] : compute_attr_scale(g, ei, &query->pref);
-                    if (ws->state[v].st_fwd == epoch + 1) continue;
+                    if (ws->sf[v].st == epoch + 1) continue;
 if (skip_dead && (*(g->edge_flags + ei) & EDGE_DEAD_TARGET)) continue;
                 if (g->ch_built && !(*(g->ch_level + u) < *(g->ch_level + v))) continue;
                 if (!in_corridor(g, v)) continue;
-                if ((*(g->node_flags + u) & NODE_HAS_TURN_RES) && ws->state[u].p_fwd != VMR_INVALID &&
-                    turn_forbidden(g, u, ws->state[u].p_fwd, v)) continue;
+                if ((*(g->node_flags + u) & NODE_HAS_TURN_RES) && ws->sf[u].p != VMR_INVALID &&
+                    turn_forbidden(g, u, ws->sf[u].p, v)) continue;
 
                     float eux = *(g->edge_ux + ei), euy = *(g->edge_uy + ei);
                     float cos1 = eux * urx + euy * ury;
@@ -6779,35 +7095,35 @@ if (skip_dead && (*(g->edge_flags + ei) & EDGE_DEAD_TARGET)) continue;
                     float h_v = g->ch_built
                         ? 0.0f
                         : (has_alt
-                            ? (ALT_HEUR(g, v, alt_gf, alt_gb, gf0, gf1, gb0, gb1, L) * alt_scale)
+                            ? (ALT_HEUR(g, v, alt_gf, alt_gb, gf0, gf1, gf2, gf3, gb0, gb1, gb2, gb3, L) * alt_scale)
                             : vmr_sqrt_fast((gx - *(g->node_x + v)) * (gx - *(g->node_x + v)) +
                                             (gy - *(g->node_y + v)) * (gy - *(g->node_y + v))) * v_heur);
 
-                    float sc_min = compute_8d_step_cost(g, ei, &query->pref, MODE_VEC_BIDIR, as,
-                                                        cos1, 1.0f, mom, cross_ratio);
-                    float ng_min = ws->state[u].g_fwd + sc_min;
-                    if (ws->state[v].st_fwd == epoch && ng_min >= ws->state[v].g_fwd) continue;
+                    float sc_min = compute_8d_cost_min(g, ei, &query->pref, MODE_VEC_BIDIR, as,
+                                                        cos1, mom);
+                    float ng_min = ws->sf[u].g + sc_min;
+                    if (ws->sf[v].st == epoch && ng_min >= ws->sf[v].g) continue;
                     if (ng_min + h_v >= best_total) continue;
 
                     float cos2 = (v == goal_idx) ? 1.0f :
                                                   two_hop_fwd_cos_fast(g, ei, cos1, urx, ury);
                     float sc = compute_8d_step_cost(g, ei, &query->pref, MODE_VEC_BIDIR, as,
                                                     cos1, cos2, mom, cross_ratio);
-                    float ng = ws->state[u].g_fwd + sc;
+                    float ng = ws->sf[u].g + sc;
                     if (ng + h_v >= best_total) continue;
-                    if (ws->state[v].st_fwd != epoch || ng < ws->state[v].g_fwd) {
-                        ws->state[v].st_fwd  = epoch;
-                        ws->state[v].g_fwd   = ng;
-                        ws->state[v].p_fwd   = u;
-                        ws->state[v].pe_fwd  = ei;
+                    if (ws->sf[v].st != epoch || ng < ws->sf[v].g) {
+                        ws->sf[v].st  = epoch;
+                        ws->sf[v].g   = ng;
+                        ws->sf[v].p   = u;
+                        ws->sf[v].pe  = ei;
                         float nmx = 0.65f * umx + 0.35f * eux;
                         float nmy = 0.65f * umy + 0.35f * euy;
                         float mn = vmr_inv_sqrt(nmx * nmx + nmy * nmy + EPS_F);
-                        ws->state[v].mx_fwd = nmx * mn;
-                        ws->state[v].my_fwd = nmy * mn;
+                        ws->sf[v].mx = nmx * mn;
+                        ws->sf[v].my = nmy * mn;
 
-                        if (ws->state[v].st_bwd == epoch && ws->state[v].g_bwd < FLT_MAX) {
-                            float tot = ng + ws->state[v].g_bwd;
+                        if (ws->sb[v].st == epoch && ws->sb[v].g < FLT_MAX) {
+                            float tot = ng + ws->sb[v].g;
                             if (tot < best_total) {
                                 best_total = tot;
                                 meet_node = v;
@@ -6822,12 +7138,12 @@ if (skip_dead && (*(g->edge_flags + ei) & EDGE_DEAD_TARGET)) continue;
                 HeapEntry top;
                 if (!heap_pop(pq_bwd, &top)) break;
                 uint32_t w = top.node;
-                if (ws->state[w].st_bwd == epoch + 1) continue;
-                ws->state[w].st_bwd = epoch + 1;
+                if (ws->sb[w].st == epoch + 1) continue;
+                ws->sb[w].st = epoch + 1;
                 expanded++;
 
-                if (ws->state[w].st_fwd == epoch && ws->state[w].g_fwd < FLT_MAX) {
-                    float tot = ws->state[w].g_fwd + ws->state[w].g_bwd;
+                if (ws->sf[w].st == epoch && ws->sf[w].g < FLT_MAX) {
+                    float tot = ws->sf[w].g + ws->sb[w].g;
                     if (tot < best_total) {
                         best_total = tot;
                         meet_node = w;
@@ -6838,12 +7154,12 @@ if (skip_dead && (*(g->edge_flags + ei) & EDGE_DEAD_TARGET)) continue;
                 float rx = sx - wx_pos, ry = sy - wy_pos;
                 float rinv = vmr_inv_sqrt(rx * rx + ry * ry + EPS_F);
                 float urx = rx * rinv, ury = ry * rinv;
-                float wmx = ws->state[w].mx_bwd, wmy = ws->state[w].my_bwd;
+                float wmx = ws->sb[w].mx, wmy = ws->sb[w].my;
 
                 uint32_t ri = *(g->rev_offsets + w);
-                if (vmr_blocks_enabled() && g->rev_blocks && query->pref.pref_id >= 0 && query->pref.pref_id < 5) {
+                if (vmr_rev_enabled() && g->rev_blocks && query->pref.pref_id >= 0 && query->pref.pref_id < 5) {
                     ri = vmr_expand_bwd_block(g, ws, pq_bwd, epoch, w, start_idx,
-                        ws->state[w].g_bwd, wmx, wmy, urx, ury, sx, sy,
+                        ws->sb[w].g, wmx, wmy, urx, ury, sx, sy,
                         chord_dx, chord_dy, inv_chord, &query->pref,
                         (uint32_t)query->pref.pref_id,
                         (query->allow_cross_track_prune && chord_len > 100.0f),
@@ -6855,10 +7171,10 @@ if (skip_dead && (*(g->edge_flags + ei) & EDGE_DEAD_TARGET)) continue;
 uint32_t u = *(g->rev_src_node + ri);
                     uint32_t eid = *(g->rev_fwd_eid + ri);
                     float as = as_arr ? as_arr[eid] : compute_attr_scale(g, eid, &query->pref);
-                    if (ws->state[u].st_bwd == epoch + 1) continue;
+                    if (ws->sb[u].st == epoch + 1) continue;
                     if (skip_dead && (*(g->edge_flags + eid) & EDGE_DEAD_SOURCE)) continue;
                     if (g->ch_built && !(*(g->ch_level + w) < *(g->ch_level + u))) continue;
-                    uint32_t next_w = ws->state[w].p_bwd;
+                    uint32_t next_w = ws->sb[w].p;
                     if ((*(g->node_flags + w) & NODE_HAS_TURN_RES) &&
                         next_w != VMR_INVALID && turn_forbidden(g, w, u, next_w)) continue;
 
@@ -6878,35 +7194,35 @@ uint32_t u = *(g->rev_src_node + ri);
                     float h_v = g->ch_built
                         ? 0.0f
                         : (has_alt
-                            ? (ALT_HEUR(g, u, alt_sf, alt_sb, sf0, sf1, sb0, sb1, L) * alt_scale)
+                            ? (ALT_HEUR(g, u, alt_sf, alt_sb, sf0, sf1, sf2, sf3, sb0, sb1, sb2, sb3, L) * alt_scale)
                             : vmr_sqrt_fast((sx - *(g->node_x + u)) * (sx - *(g->node_x + u)) +
                                             (sy - *(g->node_y + u)) * (sy - *(g->node_y + u))) * v_heur);
 
-                    float sc_min = compute_8d_step_cost(g, eid, &query->pref, MODE_VEC_BIDIR, as,
-                                                        cos1, 1.0f, mom, cross_ratio);
-                    float ng_min = ws->state[w].g_bwd + sc_min;
-                    if ((ws->state[u].st_bwd == epoch || ws->state[u].st_bwd == epoch+1) && ng_min >= ws->state[u].g_bwd) continue;
+                    float sc_min = compute_8d_cost_min(g, eid, &query->pref, MODE_VEC_BIDIR, as,
+                                                        cos1, mom);
+                    float ng_min = ws->sb[w].g + sc_min;
+                    if ((ws->sb[u].st == epoch || ws->sb[u].st == epoch+1) && ng_min >= ws->sb[u].g) continue;
                     if (ng_min + h_v >= best_total) continue;
 
                     float cos2 = (u == start_idx) ? 1.0f :
                                                   two_hop_rev_cos_fast(g, ri, cos1, urx, ury);
                     float sc = compute_8d_step_cost(g, eid, &query->pref, MODE_VEC_BIDIR, as,
                                                     cos1, cos2, mom, cross_ratio);
-                    float ng = ws->state[w].g_bwd + sc;
+                    float ng = ws->sb[w].g + sc;
                     if (ng + h_v >= best_total) continue;
-                    if (ws->state[u].st_bwd != epoch || ng < ws->state[u].g_bwd) {
-                        ws->state[u].st_bwd  = epoch;
-                        ws->state[u].g_bwd   = ng;
-                        ws->state[u].p_bwd   = w;
-                        ws->state[u].pe_bwd  = eid;
+                    if (ws->sb[u].st != epoch || ng < ws->sb[u].g) {
+                        ws->sb[u].st  = epoch;
+                        ws->sb[u].g   = ng;
+                        ws->sb[u].p   = w;
+                        ws->sb[u].pe  = eid;
                         float nmx = 0.65f * wmx + 0.35f * eux;
                         float nmy = 0.65f * wmy + 0.35f * euy;
                         float mn = vmr_inv_sqrt(nmx * nmx + nmy * nmy + EPS_F);
-                        ws->state[u].mx_bwd = nmx * mn;
-                        ws->state[u].my_bwd = nmy * mn;
+                        ws->sb[u].mx = nmx * mn;
+                        ws->sb[u].my = nmy * mn;
 
-                        if (ws->state[u].st_fwd == epoch && ws->state[u].g_fwd < FLT_MAX) {
-                            float tot = ws->state[u].g_fwd + ng;
+                        if (ws->sf[u].st == epoch && ws->sf[u].g < FLT_MAX) {
+                            float tot = ws->sf[u].g + ng;
                             if (tot < best_total) {
                                 best_total = tot;
                                 meet_node = u;
@@ -6928,7 +7244,7 @@ uint32_t u = *(g->rev_src_node + ri);
         uint32_t fwd_hops = 0;
         uint32_t cur = meet_node;
         while (cur != start_idx && fwd_hops < n) {
-            cur = ws->state[cur].p_fwd;
+            cur = ws->sf[cur].p;
             if (cur == VMR_INVALID) break;
             fwd_hops++;
         }
@@ -6937,7 +7253,7 @@ uint32_t u = *(g->rev_src_node + ri);
         if (query->mode == MODE_VEC_BIDIR) {
             cur = meet_node;
             while (cur != goal_idx && bwd_hops < n) {
-                cur = ws->state[cur].p_bwd;
+                cur = ws->sb[cur].p;
                 if (cur == VMR_INVALID) break;
                 bwd_hops++;
             }
@@ -6953,15 +7269,15 @@ uint32_t u = *(g->rev_src_node + ri);
             for (uint32_t k = fwd_hops; ; k--) {
                 *(res->nodes + k) = cur;
                 if (k == 0) break;
-                *(res->edges + k - 1U) = ws->state[cur].pe_fwd;
-                cur = ws->state[cur].p_fwd;
+                *(res->edges + k - 1U) = ws->sf[cur].pe;
+                cur = ws->sf[cur].p;
             }
             /* Fill backward segment forward into [fwd_hops+1 .. total_hops] */
             if (query->mode == MODE_VEC_BIDIR && bwd_hops > 0) {
                 cur = meet_node;
                 for (uint32_t k = 0; k < bwd_hops; k++) {
-                    *(res->edges + fwd_hops + k) = ws->state[cur].pe_bwd;
-                    cur = ws->state[cur].p_bwd;
+                    *(res->edges + fwd_hops + k) = ws->sb[cur].pe;
+                    cur = ws->sb[cur].p;
                     *(res->nodes + fwd_hops + 1U + k) = cur;
                 }
             }
