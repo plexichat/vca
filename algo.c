@@ -2289,26 +2289,47 @@ static void vmr_build_two_hop_rev(VmrGraph *g) {
     if (m == 0) {
         return;
     }
-    size_t total = 0;
-    for (uint32_t ri = 0; ri < m; ri++) {
-        uint32_t u = *(g->rev_src_node + ri);
-        uint32_t deg = *(g->rev_offsets + u + 1U) - *(g->rev_offsets + u);
-        if (deg > 8U || deg == 0) {
-            continue;
-        }
-        total += deg;
-    }
     uint32_t *off = (uint32_t *)xmalloc((m + 1U) * sizeof(uint32_t));
-    float *sx = (float *)xmalloc((total ? total : 1U) * sizeof(float));
-    float *sy = (float *)xmalloc((total ? total : 1U) * sizeof(float));
-    float *iv = (float *)xmalloc((total ? total : 1U) * sizeof(float));
-    if (!off || !sx || !sy || !iv) {
+    if (!off) {
+        return;
+    }
+    /* Pass 1: count continuations per reverse edge (parallel). */
+    #pragma omp parallel for schedule(static)
+    for (uint32_t ri = 0; ri < m; ri++) {
+        uint32_t eid = *(g->rev_fwd_eid + ri);
+        uint32_t w = *(g->edge_from + eid);
+        uint32_t u = *(g->rev_src_node + ri);
+        uint32_t beg = *(g->rev_offsets + u);
+        uint32_t end = *(g->rev_offsets + u + 1U);
+        uint32_t cnt = 0;
+        if (end - beg <= 8U) {
+            const uint32_t *rs = g->rev_src_node;
+            for (uint32_t r2 = beg; r2 < end; r2++) {
+                if (*(rs + r2) != w) {
+                    cnt++;
+                }
+            }
+        }
+        *(off + ri + 1U) = cnt;
+    }
+    uint32_t total = 0;
+    for (uint32_t ri = 0; ri < m; ri++) {
+        uint32_t cnt = *(off + ri + 1U);
+        *(off + ri) = total;
+        total += cnt;
+    }
+    *(off + m) = total;
+    float *sx = (float *)xmalloc((size_t)(total ? total : 1U) * sizeof(float));
+    float *sy = (float *)xmalloc((size_t)(total ? total : 1U) * sizeof(float));
+    float *iv = (float *)xmalloc((size_t)(total ? total : 1U) * sizeof(float));
+    if (!sx || !sy || !iv) {
         xfree(off); xfree(sx); xfree(sy); xfree(iv);
         return;
     }
-    size_t c = 0;
+    /* Pass 2: fill (parallel). */
+    #pragma omp parallel for schedule(static)
     for (uint32_t ri = 0; ri < m; ri++) {
-        *(off + ri) = (uint32_t)c;
+        uint32_t c = *(off + ri);
         uint32_t eid = *(g->rev_fwd_eid + ri);
         uint32_t w = *(g->edge_from + eid);
         uint32_t u = *(g->rev_src_node + ri);
@@ -2319,19 +2340,21 @@ static void vmr_build_two_hop_rev(VmrGraph *g) {
         }
         float d1x = -(*(g->edge_dx + eid));
         float d1y = -(*(g->edge_dy + eid));
+        const uint32_t *rs = g->rev_src_node;
+        const uint32_t *re = g->rev_fwd_eid;
+        const float *dxp = g->edge_dx, *dyp = g->edge_dy;
         for (uint32_t r2 = beg; r2 < end; r2++) {
-            uint32_t prev = *(g->rev_src_node + r2);
+            uint32_t prev = *(rs + r2);
             if (prev == w) continue;
-            uint32_t eid2 = *(g->rev_fwd_eid + r2);
-            float ax = d1x - *(g->edge_dx + eid2);
-            float ay = d1y - *(g->edge_dy + eid2);
+            uint32_t eid2 = *(re + r2);
+            float ax = d1x - *(dxp + eid2);
+            float ay = d1y - *(dyp + eid2);
             *(sx + c) = ax;
             *(sy + c) = ay;
             *(iv + c) = 1.0f / (sqrtf(ax * ax + ay * ay) + EPS_F);
             c++;
         }
     }
-    *(off + m) = (uint32_t)c;
     xfree(g->rth_off);
     xfree(g->rth_sx);
     xfree(g->rth_sy);
@@ -2340,8 +2363,8 @@ static void vmr_build_two_hop_rev(VmrGraph *g) {
     g->rth_sx = sx;
     g->rth_sy = sy;
     g->rth_inv = iv;
-    g->rth_count = (uint32_t)c;
-    LOG_INFO("Two-hop reverse continuations: %u entries", (uint32_t)c);
+    g->rth_count = total;
+    LOG_INFO("Two-hop reverse continuations: %u entries", total);
 }
 
 /*
@@ -2354,26 +2377,47 @@ static void vmr_build_two_hop(VmrGraph *g) {
     if (m == 0) {
         return;
     }
-    size_t total = 0;
+    uint32_t *off = (uint32_t *)xmalloc((m + 1U) * sizeof(uint32_t));
+    if (!off) {
+        return;
+    }
+    /* Pass 1: count continuations per edge (parallel). */
+    #pragma omp parallel for schedule(static)
     for (uint32_t e = 0; e < m; e++) {
         uint32_t v = *(g->edge_to + e);
-        uint32_t deg = *(g->fwd_offsets + v + 1U) - *(g->fwd_offsets + v);
-        if (deg > 8U || deg == 0) {
-            continue;
+        uint32_t beg = *(g->fwd_offsets + v);
+        uint32_t end = *(g->fwd_offsets + v + 1U);
+        uint32_t cnt = 0;
+        if (end - beg <= 8U) {
+            uint32_t u = *(g->edge_from + e);
+            const uint32_t *to_p = g->edge_to;
+            for (uint32_t e2 = beg; e2 < end; e2++) {
+                if (*(to_p + e2) != u) {
+                    cnt++;
+                }
+            }
         }
-        total += deg;
+        *(off + e + 1U) = cnt;
     }
-    uint32_t *off = (uint32_t *)xmalloc((m + 1U) * sizeof(uint32_t));
-    float *sx = (float *)xmalloc((total ? total : 1U) * sizeof(float));
-    float *sy = (float *)xmalloc((total ? total : 1U) * sizeof(float));
-    float *iv = (float *)xmalloc((total ? total : 1U) * sizeof(float));
-    if (!off || !sx || !sy || !iv) {
+    /* Prefix sum -> start offset per edge. */
+    uint32_t total = 0;
+    for (uint32_t e = 0; e < m; e++) {
+        uint32_t cnt = *(off + e + 1U);
+        *(off + e) = total;
+        total += cnt;
+    }
+    *(off + m) = total;
+    float *sx = (float *)xmalloc((size_t)(total ? total : 1U) * sizeof(float));
+    float *sy = (float *)xmalloc((size_t)(total ? total : 1U) * sizeof(float));
+    float *iv = (float *)xmalloc((size_t)(total ? total : 1U) * sizeof(float));
+    if (!sx || !sy || !iv) {
         xfree(off); xfree(sx); xfree(sy); xfree(iv);
         return;
     }
-    size_t c = 0;
+    /* Pass 2: fill (parallel). */
+    #pragma omp parallel for schedule(static)
     for (uint32_t e = 0; e < m; e++) {
-        *(off + e) = (uint32_t)c;
+        uint32_t c = *(off + e);
         uint32_t u = *(g->edge_from + e);
         uint32_t v = *(g->edge_to + e);
         uint32_t beg = *(g->fwd_offsets + v);
@@ -2395,7 +2439,6 @@ static void vmr_build_two_hop(VmrGraph *g) {
             c++;
         }
     }
-    *(off + m) = (uint32_t)c;
     xfree(g->th_off);
     xfree(g->th_sx);
     xfree(g->th_sy);
@@ -2404,8 +2447,8 @@ static void vmr_build_two_hop(VmrGraph *g) {
     g->th_sx = sx;
     g->th_sy = sy;
     g->th_inv = iv;
-    g->th_count = (uint32_t)c;
-    LOG_INFO("Two-hop continuations: %u entries", (uint32_t)c);
+    g->th_count = total;
+    LOG_INFO("Two-hop continuations: %u entries", total);
 }
 
 typedef struct {
