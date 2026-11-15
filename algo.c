@@ -61,7 +61,7 @@ static inline float vmr_sqrt_fast(float x) {
 
 #define UVR_VERSION      "2.0.0"
 #define VGRAPH_MAGIC     0x564D5235U /* "VMR5" */
-#define VGRAPH_FORMAT_V  5U
+#define VGRAPH_FORMAT_V  6U
 
 #define VMR_INVALID      UINT32_MAX
 #define EARTH_RADIUS_M   6371008.8
@@ -2063,6 +2063,333 @@ static void vmr_build_two_hop(VmrGraph *g) {
     LOG_INFO("Two-hop continuations: %u entries", (uint32_t)c);
 }
 
+typedef struct {
+    uint32_t id;
+    uint32_t d;
+} VmrHNode;
+
+static int vmr_hnode_cmp(const void *a, const void *b) {
+    const VmrHNode *x = (const VmrHNode *)a;
+    const VmrHNode *y = (const VmrHNode *)b;
+    if (x->d != y->d) {
+        return (x->d < y->d) ? -1 : 1;
+    }
+    return (x->id > y->id) - (x->id < y->id);
+}
+
+static uint32_t vmr_hilbert_xy2d(uint32_t x, uint32_t y, uint32_t order) {
+    uint32_t n = 1u << order;
+    uint32_t d = 0;
+    for (uint32_t s = n >> 1; s; s >>= 1) {
+        uint32_t rx = (x & s) ? 1u : 0u;
+        uint32_t ry = (y & s) ? 1u : 0u;
+        d += s * s * ((3u * rx) ^ ry);
+        if (ry == 0) {
+            if (rx) {
+                x = n - 1u - x;
+                y = n - 1u - y;
+            }
+            uint32_t t = x;
+            x = y;
+            y = t;
+        }
+    }
+    return d;
+}
+
+/*
+ * Locality reorder: assign new node ids along a Hilbert curve over the
+ * projected (x, y) plane, and permute every per-node/per-edge array to match.
+ * The search frontier then touches nearby cache lines, which is the dominant
+ * cost at 84k expansions on a 2.7M-node graph.
+ */
+static void vmr_reorder_graph(VmrGraph *g) {
+    uint32_t n = g->node_count;
+    size_t m = g->edge_count;
+    if (n < 2 || m == 0 || !g->fwd_offsets || !g->node_x || !g->node_y) {
+        return;
+    }
+    float minx = *(g->node_x), maxx = minx;
+    float miny = *(g->node_y), maxy = miny;
+    for (uint32_t i = 1; i < n; i++) {
+        float x = *(g->node_x + i), y = *(g->node_y + i);
+        if (x < minx) minx = x;
+        if (x > maxx) maxx = x;
+        if (y < miny) miny = y;
+        if (y > maxy) maxy = y;
+    }
+    float scx = (maxx > minx) ? 65535.0f / (maxx - minx) : 0.0f;
+    float scy = (maxy > miny) ? 65535.0f / (maxy - miny) : 0.0f;
+
+    VmrHNode *hn = (VmrHNode *)xmalloc((size_t)n * sizeof(VmrHNode));
+    uint32_t *perm = (uint32_t *)xmalloc((size_t)n * sizeof(uint32_t));
+    uint32_t *iperm = (uint32_t *)xmalloc((size_t)n * sizeof(uint32_t));
+    uint32_t *nfill = (uint32_t *)xmalloc((size_t)n * sizeof(uint32_t));
+    uint32_t *rfill = (uint32_t *)xmalloc((size_t)n * sizeof(uint32_t));
+    if (!hn || !perm || !iperm || !nfill || !rfill) {
+        xfree(hn); xfree(perm); xfree(iperm); xfree(nfill); xfree(rfill);
+        return;
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        hn[i].id = i;
+        uint32_t hx = (uint32_t)((*(g->node_x + i) - minx) * scx);
+        uint32_t hy = (uint32_t)((*(g->node_y + i) - miny) * scy);
+        hn[i].d = vmr_hilbert_xy2d(hx, hy, 16);
+    }
+    qsort(hn, n, sizeof(VmrHNode), vmr_hnode_cmp);
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t old = hn[i].id;
+        perm[old] = i;
+        iperm[i] = old;
+    }
+    xfree(hn);
+
+    int64_t *n_oid = (int64_t *)xmalloc((size_t)n * sizeof(int64_t));
+    double *n_lat = (double *)xmalloc((size_t)n * sizeof(double));
+    double *n_lon = (double *)xmalloc((size_t)n * sizeof(double));
+    float *n_x = (float *)xmalloc((size_t)n * sizeof(float));
+    float *n_y = (float *)xmalloc((size_t)n * sizeof(float));
+    uint32_t *n_comp = (uint32_t *)xmalloc((size_t)n * sizeof(uint32_t));
+    uint8_t *n_flags = (uint8_t *)xmalloc((size_t)n);
+    if (!n_oid || !n_lat || !n_lon || !n_x || !n_y || !n_comp || !n_flags) {
+        xfree(n_oid); xfree(n_lat); xfree(n_lon); xfree(n_x); xfree(n_y);
+        xfree(n_comp); xfree(n_flags);
+        xfree(perm); xfree(iperm); xfree(nfill); xfree(rfill);
+        return;
+    }
+    for (uint32_t old = 0; old < n; old++) {
+        uint32_t i = perm[old];
+        *(n_oid + i) = *(g->node_osm_id + old);
+        *(n_lat + i) = *(g->node_lat + old);
+        *(n_lon + i) = *(g->node_lon + old);
+        *(n_x + i) = *(g->node_x + old);
+        *(n_y + i) = *(g->node_y + old);
+        *(n_comp + i) = *(g->node_comp_id + old);
+        *(n_flags + i) = *(g->node_flags + old);
+    }
+
+    uint32_t *noff = (uint32_t *)xcalloc((size_t)n + 1U, sizeof(uint32_t));
+    if (!noff) {
+        xfree(n_oid); xfree(n_lat); xfree(n_lon); xfree(n_x); xfree(n_y);
+        xfree(n_comp); xfree(n_flags);
+        xfree(perm); xfree(iperm); xfree(nfill); xfree(rfill);
+        return;
+    }
+    for (uint32_t old = 0; old < n; old++) {
+        uint32_t deg = *(g->fwd_offsets + old + 1U) - *(g->fwd_offsets + old);
+        *(noff + perm[old] + 1U) = deg;
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        *(noff + i + 1U) += *(noff + i);
+    }
+    memcpy(nfill, noff, (size_t)n * sizeof(uint32_t));
+
+    uint32_t *n_from = (uint32_t *)xmalloc(m * sizeof(uint32_t));
+    uint32_t *n_to = (uint32_t *)xmalloc(m * sizeof(uint32_t));
+    float *n_dx = (float *)xmalloc(m * sizeof(float));
+    float *n_dy = (float *)xmalloc(m * sizeof(float));
+    float *n_ux = (float *)xmalloc(m * sizeof(float));
+    float *n_uy = (float *)xmalloc(m * sizeof(float));
+    float *n_fs = (float *)xmalloc(m * sizeof(float));
+    float *n_fc = (float *)xmalloc(m * sizeof(float));
+    float *n_fst = (float *)xmalloc(m * sizeof(float));
+    float *n_fsm = (float *)xmalloc(m * sizeof(float));
+    float *n_len = (float *)xmalloc(m * sizeof(float));
+    float *n_time = (float *)xmalloc(m * sizeof(float));
+    uint8_t *n_eflags = (uint8_t *)xmalloc(m);
+    float *n_attr[5];
+    for (uint32_t p = 0; p < 5; p++) {
+        n_attr[p] = (float *)xmalloc(m * sizeof(float));
+    }
+    if (!n_from || !n_to || !n_dx || !n_dy || !n_ux || !n_uy || !n_fs || !n_fc ||
+        !n_fst || !n_fsm || !n_len || !n_time || !n_eflags) {
+        xfree(n_from); xfree(n_to); xfree(n_dx); xfree(n_dy); xfree(n_ux); xfree(n_uy);
+        xfree(n_fs); xfree(n_fc); xfree(n_fst); xfree(n_fsm); xfree(n_len);
+        xfree(n_time); xfree(n_eflags);
+        xfree(n_oid); xfree(n_lat); xfree(n_lon); xfree(n_x); xfree(n_y);
+        xfree(n_comp); xfree(n_flags); xfree(noff);
+        xfree(perm); xfree(iperm); xfree(nfill); xfree(rfill);
+        return;
+    }
+    for (uint32_t p = 0; p < 5; p++) {
+        if (n_attr[p]) {
+            continue;
+        }
+        xfree(n_from); xfree(n_to); xfree(n_dx); xfree(n_dy); xfree(n_ux); xfree(n_uy);
+        xfree(n_fs); xfree(n_fc); xfree(n_fst); xfree(n_fsm); xfree(n_len);
+        xfree(n_time); xfree(n_eflags);
+        xfree(n_oid); xfree(n_lat); xfree(n_lon); xfree(n_x); xfree(n_y);
+        xfree(n_comp); xfree(n_flags); xfree(noff);
+        xfree(perm); xfree(iperm); xfree(nfill); xfree(rfill);
+        return;
+    }
+    for (uint32_t old = 0; old < n; old++) {
+        uint32_t u2 = perm[old];
+        uint32_t beg = *(g->fwd_offsets + old);
+        uint32_t end = *(g->fwd_offsets + old + 1U);
+        for (uint32_t e = beg; e < end; e++) {
+            uint32_t pos = *(nfill + u2);
+            *(nfill + u2) = pos + 1U;
+            *(n_from + pos) = u2;
+            *(n_to + pos) = perm[*(g->edge_to + e)];
+            *(n_dx + pos) = *(g->edge_dx + e);
+            *(n_dy + pos) = *(g->edge_dy + e);
+            *(n_ux + pos) = *(g->edge_ux + e);
+            *(n_uy + pos) = *(g->edge_uy + e);
+            *(n_fs + pos) = *(g->edge_f_speed + e);
+            *(n_fc + pos) = *(g->edge_f_class + e);
+            *(n_fst + pos) = *(g->edge_f_straight + e);
+            *(n_fsm + pos) = *(g->edge_f_smooth + e);
+            *(n_len + pos) = *(g->edge_length_m + e);
+            *(n_time + pos) = *(g->edge_time_s + e);
+            *(n_eflags + pos) = *(g->edge_flags + e);
+            for (uint32_t p = 0; p < 5; p++) {
+                *(n_attr[p] + pos) = g->edge_attr_scale[p]
+                                         ? *(g->edge_attr_scale[p] + e) : 1.0f;
+            }
+        }
+    }
+
+    uint32_t *roff = (uint32_t *)xcalloc((size_t)n + 1U, sizeof(uint32_t));
+    uint32_t *rsrc = (uint32_t *)xmalloc(m * sizeof(uint32_t));
+    uint32_t *reid = (uint32_t *)xmalloc(m * sizeof(uint32_t));
+    if (roff && rsrc && reid) {
+        for (size_t e = 0; e < m; e++) {
+            *(roff + *(n_to + e) + 1U) += 1U;
+        }
+        for (uint32_t i = 0; i < n; i++) {
+            *(roff + i + 1U) += *(roff + i);
+        }
+        memcpy(rfill, roff, (size_t)n * sizeof(uint32_t));
+        for (size_t e = 0; e < m; e++) {
+            uint32_t v = *(n_to + e);
+            uint32_t r = *(rfill + v);
+            *(rfill + v) = r + 1U;
+            *(rsrc + r) = *(n_from + e);
+            *(reid + r) = (uint32_t)e;
+        }
+    } else {
+        xfree(roff);
+        roff = NULL;
+        xfree(rsrc);
+        xfree(reid);
+    }
+
+    uint32_t *ntoff = NULL;
+    uint32_t *ntfrom = NULL;
+    uint32_t *ntto = NULL;
+    uint8_t *ntmode = NULL;
+    if (g->turn_count > 0 && g->turn_offsets && g->turn_from && g->turn_to && g->turn_mode) {
+        ntoff = (uint32_t *)xmalloc((size_t)(n + 1U) * sizeof(uint32_t));
+        ntfrom = (uint32_t *)xmalloc(g->turn_count * sizeof(uint32_t));
+        ntto = (uint32_t *)xmalloc(g->turn_count * sizeof(uint32_t));
+        ntmode = (uint8_t *)xmalloc(g->turn_count);
+        if (ntoff && ntfrom && ntto && ntmode) {
+            uint32_t tc = 0;
+            for (uint32_t v = 0; v < n; v++) {
+                uint32_t old = iperm[v];
+                *(ntoff + v) = tc;
+                uint32_t beg = *(g->turn_offsets + old);
+                uint32_t end = *(g->turn_offsets + old + 1U);
+                for (uint32_t i = beg; i < end; i++) {
+                    *(ntfrom + tc) = perm[*(g->turn_from + i)];
+                    *(ntto + tc) = perm[*(g->turn_to + i)];
+                    *(ntmode + tc) = *(g->turn_mode + i);
+                    tc++;
+                }
+            }
+            *(ntoff + n) = tc;
+        } else {
+            xfree(ntoff);
+            ntoff = NULL;
+            xfree(ntfrom);
+            ntfrom = NULL;
+            xfree(ntto);
+            ntto = NULL;
+            xfree(ntmode);
+            ntmode = NULL;
+        }
+    }
+
+    xfree(g->node_osm_id);
+    xfree(g->node_lat);
+    xfree(g->node_lon);
+    xfree(g->node_x);
+    xfree(g->node_y);
+    xfree(g->node_comp_id);
+    xfree(g->node_flags);
+    xfree(g->fwd_offsets);
+    xfree(g->edge_from);
+    xfree(g->edge_to);
+    xfree(g->edge_dx);
+    xfree(g->edge_dy);
+    xfree(g->edge_ux);
+    xfree(g->edge_uy);
+    xfree(g->edge_f_speed);
+    xfree(g->edge_f_class);
+    xfree(g->edge_f_straight);
+    xfree(g->edge_f_smooth);
+    xfree(g->edge_length_m);
+    xfree(g->edge_time_s);
+    xfree(g->edge_flags);
+    for (uint32_t p = 0; p < 5; p++) {
+        xfree(g->edge_attr_scale[p]);
+    }
+    xfree(g->rev_offsets);
+    xfree(g->rev_src_node);
+    xfree(g->rev_fwd_eid);
+    xfree(g->turn_offsets);
+    xfree(g->turn_from);
+    xfree(g->turn_to);
+    xfree(g->turn_mode);
+
+    g->node_osm_id = n_oid;
+    g->node_lat = n_lat;
+    g->node_lon = n_lon;
+    g->node_x = n_x;
+    g->node_y = n_y;
+    g->node_comp_id = n_comp;
+    g->node_flags = n_flags;
+    g->fwd_offsets = noff;
+    g->edge_from = n_from;
+    g->edge_to = n_to;
+    g->edge_dx = n_dx;
+    g->edge_dy = n_dy;
+    g->edge_ux = n_ux;
+    g->edge_uy = n_uy;
+    g->edge_f_speed = n_fs;
+    g->edge_f_class = n_fc;
+    g->edge_f_straight = n_fst;
+    g->edge_f_smooth = n_fsm;
+    g->edge_length_m = n_len;
+    g->edge_time_s = n_time;
+    g->edge_flags = n_eflags;
+    for (uint32_t p = 0; p < 5; p++) {
+        g->edge_attr_scale[p] = n_attr[p];
+    }
+    g->rev_offsets = roff;
+    g->rev_src_node = rsrc;
+    g->rev_fwd_eid = reid;
+    g->turn_offsets = ntoff;
+    g->turn_from = ntfrom;
+    g->turn_to = ntto;
+    g->turn_mode = ntmode;
+
+    xfree(perm);
+    xfree(iperm);
+    xfree(nfill);
+    xfree(rfill);
+    LOG_INFO("Hilbert reorder: %u nodes, %u edges", n, (uint32_t)m);
+}
+
+static int vmr_blocks_enabled(void) {
+    static int v = -1;
+    if (v < 0) {
+        v = (getenv("VMR_BLOCK") != NULL) ? 1 : 0;
+    }
+    return v;
+}
+
 static int vmr_preprocess_graph(VmrRawGraph *rg, VmrGraph *g) {
     vmr_graph_free(g);
     vmr_graph_init(g);
@@ -2609,7 +2936,11 @@ static int vmr_preprocess_graph(VmrRawGraph *rg, VmrGraph *g) {
 
     vmr_build_two_hop(g);
     vmr_build_two_hop_rev(g);
-    vmr_build_edge_blocks(g);
+    if (vmr_blocks_enabled()) {
+        vmr_build_edge_blocks(g);
+    }
+
+    vmr_reorder_graph(g);
 
     if (vmr_build_spatial_grid(g) != 0) {
         return -1;
@@ -2996,7 +3327,9 @@ static int vmr_load_binary(VmrGraph *g, const char *path) {
 
     vmr_build_two_hop(g);
     vmr_build_two_hop_rev(g);
-    vmr_build_edge_blocks(g);
+    if (vmr_blocks_enabled()) {
+        vmr_build_edge_blocks(g);
+    }
 
     clock_t t1 = clock();
     LOG_INFO("Loaded binary SoA graph '%s' in %.1f ms (%zu nodes, %zu edges)",
@@ -5089,6 +5422,51 @@ static inline float two_hop_rev_cos(const VmrGraph *g, uint32_t w, uint32_t u,
 }
 
 /*
+ * Cache-friendly two-hop lookup: the continuation sums and inverse norms are
+ * precomputed per edge, so this is a contiguous dot product with no adjacency
+ * scan and no runtime sqrt. `e` is the forward edge id, `ri` the reverse index.
+ */
+static inline float two_hop_fwd_cos_fast(const VmrGraph *g, uint32_t e,
+                                          float cos1, float rx, float ry) {
+    uint32_t c0 = *(g->th_off + e), c1 = *(g->th_off + e + 1U);
+    if (c0 == c1) {
+        return cos1;
+    }
+    float best = cos1;
+    int found = 0;
+    const float *sx = g->th_sx + c0, *sy = g->th_sy + c0, *iv = g->th_inv + c0;
+    for (uint32_t c = c0; c < c1; c++) {
+        uint32_t k = c - c0;
+        float cc = (*(sx + k) * rx + *(sy + k) * ry) * *(iv + k);
+        if (!found || cc > best) {
+            best = cc;
+            found = 1;
+        }
+    }
+    return best;
+}
+
+static inline float two_hop_rev_cos_fast(const VmrGraph *g, uint32_t ri,
+                                          float cos1, float rx, float ry) {
+    uint32_t c0 = *(g->rth_off + ri), c1 = *(g->rth_off + ri + 1U);
+    if (c0 == c1) {
+        return cos1;
+    }
+    float best = cos1;
+    int found = 0;
+    const float *sx = g->rth_sx + c0, *sy = g->rth_sy + c0, *iv = g->rth_inv + c0;
+    for (uint32_t c = c0; c < c1; c++) {
+        uint32_t k = c - c0;
+        float cc = (*(sx + k) * rx + *(sy + k) * ry) * *(iv + k);
+        if (!found || cc > best) {
+            best = cc;
+            found = 1;
+        }
+    }
+    return best;
+}
+
+/*
  * Computes the 8-Dimensional Vector Edge Cost:
  *   Spatial dims:  (1) unit dot product cos_1, (2) 2-hop cos_2, (3) momentum dot
  *   Feature dims:  (4) speed, (5) class, (6) straightness, (7) smoothness,
@@ -6257,7 +6635,7 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
             float umx = ws->state[u].mx_fwd, umy = ws->state[u].my_fwd;
 
             uint32_t ei = *(g->fwd_offsets + u);
-            if (g->th_off && query->pref.pref_id >= 0 && query->pref.pref_id < 5) {
+            if (vmr_blocks_enabled() && g->th_off && query->pref.pref_id >= 0 && query->pref.pref_id < 5) {
                 ei = vmr_expand_fwd_block(g, ws, pq_fwd, epoch, u, goal_idx,
                     ws->state[u].g_fwd, umx, umy, urx, ury, gx, gy, sx, sy,
                     chord_dx, chord_dy, inv_chord, &query->pref,
@@ -6308,9 +6686,8 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
                 if (ng_min + h_v >= best_total) continue;
 
                 float cos2 = (query->mode == MODE_DIJKSTRA) ? cos1 :
-                             two_hop_fwd_cos(g, u, v, goal_idx,
-                                             *(g->edge_dx + ei), *(g->edge_dy + ei),
-                                             cos1, urx, ury);
+                             ((v == goal_idx) ? 1.0f :
+                              two_hop_fwd_cos_fast(g, ei, cos1, urx, ury));
                 float sc = compute_8d_step_cost(g, ei, &query->pref, query->mode, as,
                                                 cos1, cos2, mom, cross_ratio);
                 float ng = ws->state[u].g_fwd + sc;
@@ -6368,7 +6745,7 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
                 float umx = ws->state[u].mx_fwd, umy = ws->state[u].my_fwd;
 
                 uint32_t ei = *(g->fwd_offsets + u);
-                if (g->th_off && query->pref.pref_id >= 0 && query->pref.pref_id < 5) {
+                if (vmr_blocks_enabled() && g->th_off && query->pref.pref_id >= 0 && query->pref.pref_id < 5) {
                     ei = vmr_expand_fwd_block(g, ws, pq_fwd, epoch, u, goal_idx,
                         ws->state[u].g_fwd, umx, umy, urx, ury, gx, gy, sx, sy,
                         chord_dx, chord_dy, inv_chord, &query->pref,
@@ -6412,9 +6789,8 @@ if (skip_dead && (*(g->edge_flags + ei) & EDGE_DEAD_TARGET)) continue;
                     if (ws->state[v].st_fwd == epoch && ng_min >= ws->state[v].g_fwd) continue;
                     if (ng_min + h_v >= best_total) continue;
 
-                    float cos2 = two_hop_fwd_cos(g, u, v, goal_idx,
-                                                 *(g->edge_dx + ei), *(g->edge_dy + ei),
-                                                 cos1, urx, ury);
+                    float cos2 = (v == goal_idx) ? 1.0f :
+                                                  two_hop_fwd_cos_fast(g, ei, cos1, urx, ury);
                     float sc = compute_8d_step_cost(g, ei, &query->pref, MODE_VEC_BIDIR, as,
                                                     cos1, cos2, mom, cross_ratio);
                     float ng = ws->state[u].g_fwd + sc;
@@ -6465,7 +6841,7 @@ if (skip_dead && (*(g->edge_flags + ei) & EDGE_DEAD_TARGET)) continue;
                 float wmx = ws->state[w].mx_bwd, wmy = ws->state[w].my_bwd;
 
                 uint32_t ri = *(g->rev_offsets + w);
-                if (g->rev_blocks && query->pref.pref_id >= 0 && query->pref.pref_id < 5) {
+                if (vmr_blocks_enabled() && g->rev_blocks && query->pref.pref_id >= 0 && query->pref.pref_id < 5) {
                     ri = vmr_expand_bwd_block(g, ws, pq_bwd, epoch, w, start_idx,
                         ws->state[w].g_bwd, wmx, wmy, urx, ury, sx, sy,
                         chord_dx, chord_dy, inv_chord, &query->pref,
@@ -6512,9 +6888,8 @@ uint32_t u = *(g->rev_src_node + ri);
                     if ((ws->state[u].st_bwd == epoch || ws->state[u].st_bwd == epoch+1) && ng_min >= ws->state[u].g_bwd) continue;
                     if (ng_min + h_v >= best_total) continue;
 
-                    float cos2 = two_hop_rev_cos(g, w, u, start_idx,
-                                                 *(g->edge_dx + eid), *(g->edge_dy + eid),
-                                                 cos1, urx, ury);
+                    float cos2 = (u == start_idx) ? 1.0f :
+                                                  two_hop_rev_cos_fast(g, ri, cos1, urx, ury);
                     float sc = compute_8d_step_cost(g, eid, &query->pref, MODE_VEC_BIDIR, as,
                                                     cos1, cos2, mom, cross_ratio);
                     float ng = ws->state[w].g_bwd + sc;
