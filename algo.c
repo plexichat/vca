@@ -1,7 +1,7 @@
 /*
- * uk_vector_router.c
+ * uk_vector_router.c  --  Vector-Corridor A* (VCA*) routing engine
  *
- * High-Performance Preprocessed 8D Vector-Corridor Pathfinding Engine
+ * High-Performance Vector-Corridor A* (VCA*) Pathfinding Engine
  * designed for Geofabrik Whole-UK scale road networks with SQLite3 storage,
  * Structure-of-Arrays (SoA) contiguous memory, and raw pointer arithmetic.
  *
@@ -130,8 +130,8 @@ typedef enum {
 } EdgeFlags;
 
 typedef enum {
-    MODE_VEC_BIDIR   = 0, /* Bidirectional 8D Vector-Corridor Search   */
-    MODE_VEC_UNIDIR  = 1, /* Unidirectional 8D Vector-Corridor Search  */
+    MODE_VEC_BIDIR   = 0, /* Bidirectional Vector-Corridor A* (VCA*)    */
+    MODE_VEC_UNIDIR  = 1, /* Unidirectional Vector-Corridor A* (VCA*)   */
     MODE_DIJKSTRA    = 2, /* True uninformed Dijkstra (travel time)    */
     MODE_ASTAR       = 3, /* ALT-guided A* on travel time (efficient)  */
     MODE_CCH         = 4  /* Contraction Hierarchy (CCH) query         */
@@ -5700,7 +5700,7 @@ static int db_load_raw_graph(sqlite3 *db, VmrRawGraph *rg) {
 }
 
 /* ========================================================================= */
-/* SECTION 8: SPATIAL SNAP & 8D VECTOR-CORRIDOR BIDIRECTIONAL PATHFINDER     */
+/* SECTION 8: SPATIAL SNAP & VECTOR-CORRIDOR A* (VCA*) BIDIRECTIONAL PATHFINDER */
 /* ========================================================================= */
 
 static uint32_t vmr_snap_coord(const VmrGraph *g, double lat, double lon, int prefer_non_dead) {
@@ -7183,8 +7183,8 @@ static int vmr_cch_query(const VmrGraph *g, uint32_t start, uint32_t goal,
 
 /*
  * Primary Pathfinding Entrypoint:
- *   MODE_VEC_BIDIR  -> Bidirectional 8D Vector-Corridor Search
- *   MODE_VEC_UNIDIR -> Unidirectional 8D Vector-Corridor Search
+ *   MODE_VEC_BIDIR  -> Bidirectional Vector-Corridor A* (VCA*)
+ *   MODE_VEC_UNIDIR -> Unidirectional Vector-Corridor A* (VCA*)
  *   MODE_ASTAR      -> ALT-guided A* on travel time
  *   MODE_DIJKSTRA   -> True uninformed Dijkstra (travel time)
  *   MODE_CCH        -> Contraction-Hierarchy query
@@ -7507,7 +7507,7 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
             }
         }
     } else {
-        /* Bidirectional 8D Vector-Corridor Search */
+        /* Bidirectional Vector-Corridor A* (VCA*) */
         int turn = 0;
         while (pq_fwd->size > 0 && pq_bwd->size > 0) {
             if (meet_node != VMR_INVALID) {
@@ -7862,8 +7862,8 @@ static int vmr_export_geojson(const VmrGraph *g, const VmrResult *res, const cha
 
 static const char *mode_str(SearchMode m) {
     switch (m) {
-        case MODE_VEC_BIDIR:  return "vec-bidir-8d";
-        case MODE_VEC_UNIDIR: return "vec-unidir-8d";
+        case MODE_VEC_BIDIR:  return "vca-bidir";
+        case MODE_VEC_UNIDIR: return "vca-unidir";
         case MODE_ASTAR:      return "astar";
         case MODE_CCH:        return "cch";
         default:              return "dijkstra";
