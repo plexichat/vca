@@ -572,9 +572,9 @@ typedef struct {
 } VmrRawGraph;
 
 typedef struct __attribute__((aligned(64))) {
-    float fwd[8];
-    float bwd[8];
-} AltNode8;
+    float fwd[16];
+    float bwd[16];
+} AltNode16;
 
 /*
  * Final Preprocessed Graph in Structure-of-Arrays (SoA) Contiguous Memory:
@@ -633,7 +633,7 @@ typedef struct {
     /* ALT landmarks: L sources, dist(landmark -> node) and dist(node -> landmark) */
     uint32_t  landmark_count;
     uint32_t *landmark_node;
-    AltNode8 *alt_nodes;
+    AltNode16 *alt_nodes;
 
     /* Turn restrictions: per-via forbidden (from,to) pairs */
     uint32_t *turn_offsets;    /* [node_count + 1] */
@@ -1761,17 +1761,21 @@ static void alt_dijkstra(const VmrGraph *g, uint32_t src, float *dist, int rever
 }
 
 static void vmr_build_landmarks(VmrGraph *g) {
-    static const double lat[8] = {
+    static const double lat[16] = {
         58.6440, 50.0700, 51.1300, 53.4800,
-        55.9530, 51.5070, 52.4800, 57.4780
+        55.9530, 51.5070, 52.4800, 57.4780,
+        50.7200, 53.4000, 53.8000, 54.9700,
+        55.8600, 57.1500, 51.4500, 52.6300
     };
-    static const double lon[8] = {
+    static const double lon[16] = {
         -3.0700, -5.7200, 1.3100, -2.2400,
-        -3.1880, -0.1280, -1.9000, -4.2250
+        -3.1880, -0.1280, -1.9000, -4.2250,
+        -3.5300, -2.9800, -1.5500, -1.6100,
+        -4.2500, -2.0900, -2.5900, 1.3000
     };
-    uint32_t nodes[8];
+    uint32_t nodes[16];
     uint32_t L = 0;
-    for (uint32_t i = 0; i < 8; i++) {
+    for (uint32_t i = 0; i < 16; i++) {
         uint32_t u = vmr_nearest_node_linear(g, lat[i], lon[i]);
         if (u == VMR_INVALID) {
             continue;
@@ -1792,7 +1796,7 @@ static void vmr_build_landmarks(VmrGraph *g) {
     }
     size_t n = g->node_count;
     g->landmark_node = (uint32_t *)xmalloc((size_t)L * sizeof(uint32_t));
-    g->alt_nodes = (AltNode8 *)xaligned_alloc(64, n * sizeof(AltNode8));
+    g->alt_nodes = (AltNode16 *)xaligned_alloc(64, n * sizeof(AltNode16));
     if (!g->landmark_node || !g->alt_nodes) {
         xfree(g->landmark_node);
         xfree_aligned(g->alt_nodes);
@@ -1804,7 +1808,7 @@ static void vmr_build_landmarks(VmrGraph *g) {
     }
     memcpy(g->landmark_node, nodes, (size_t)L * sizeof(uint32_t));
     for (size_t v = 0; v < n; v++) {
-        for (int k = 0; k < 8; k++) {
+        for (int k = 0; k < 16; k++) {
             (*(g->alt_nodes + v)).fwd[k] = 1.0e30f;
             (*(g->alt_nodes + v)).bwd[k] = -1.0e30f;
         }
@@ -2458,7 +2462,7 @@ static int vmr_save_binary(const VmrGraph *g, const char *path) {
     ok &= (fwrite(&l, sizeof(uint32_t), 1, fp) == 1);
     if (l > 0 && n > 0) {
         ok &= (fwrite(g->landmark_node, sizeof(uint32_t), l, fp) == l);
-        ok &= (fwrite(g->alt_nodes, sizeof(AltNode8), n, fp) == n);
+        ok &= (fwrite(g->alt_nodes, sizeof(AltNode16), n, fp) == n);
     }
 
     uint32_t tc = g->turn_count;
@@ -2617,12 +2621,12 @@ static int vmr_load_binary(VmrGraph *g, const char *path) {
     g->landmark_count = l;
     if (l > 0 && n > 0) {
         g->landmark_node = (uint32_t *)xmalloc((size_t)l * sizeof(uint32_t));
-        g->alt_nodes = (AltNode8 *)xaligned_alloc(64, (size_t)n * sizeof(AltNode8));
+        g->alt_nodes = (AltNode16 *)xaligned_alloc(64, (size_t)n * sizeof(AltNode16));
         if (!g->landmark_node || !g->alt_nodes) {
             ok = 0;
         } else {
             ok &= (fread(g->landmark_node, sizeof(uint32_t), l, fp) == l);
-            ok &= (fread(g->alt_nodes, sizeof(AltNode8), n, fp) == n);
+            ok &= (fread(g->alt_nodes, sizeof(AltNode16), n, fp) == n);
         }
     }
 
@@ -4819,10 +4823,10 @@ static inline float compute_8d_step_cost(const VmrGraph *g, uint32_t eid,
     return (cost > 0.01f) ? cost : 0.01f;
 }
 
-static inline float alt_heuristic_scalar(const AltNode8 *av, const float *gf,
+static inline float alt_heuristic_scalar(const AltNode16 *av, const float *gf,
                                          const float *gb, uint32_t L) {
     float best = 0.0f;
-    for (uint32_t i = 0; i < L; i++) {
+    for (uint32_t i = 0; i < L && i < 16; i++) {
         float d1 = *(gf + i) - av->fwd[i];
         float d2 = av->bwd[i] - *(gb + i);
         if (d1 > best) best = d1;
@@ -4833,11 +4837,14 @@ static inline float alt_heuristic_scalar(const AltNode8 *av, const float *gf,
 
 #if defined(__AVX2__)
 #include <immintrin.h>
-static inline float alt_heuristic_avx2(const AltNode8 *av, __m256 gf, __m256 gb) {
-    __m256 df = _mm256_load_ps(av->fwd);
-    __m256 db = _mm256_load_ps(av->bwd);
-    __m256 d1 = _mm256_sub_ps(gf, df);
-    __m256 d2 = _mm256_sub_ps(db, gb);
+static inline float alt_heuristic_avx2(const AltNode16 *av, __m256 gf0, __m256 gf1,
+                                       __m256 gb0, __m256 gb1) {
+    __m256 f0 = _mm256_load_ps(av->fwd);
+    __m256 f1 = _mm256_load_ps(av->fwd + 8);
+    __m256 b0 = _mm256_load_ps(av->bwd);
+    __m256 b1 = _mm256_load_ps(av->bwd + 8);
+    __m256 d1 = _mm256_max_ps(_mm256_sub_ps(gf0, f0), _mm256_sub_ps(gf1, f1));
+    __m256 d2 = _mm256_max_ps(_mm256_sub_ps(b0, gb0), _mm256_sub_ps(b1, gb1));
     __m256 mx = _mm256_max_ps(_mm256_max_ps(d1, d2), _mm256_setzero_ps());
     __m128 hi = _mm256_extractf128_ps(mx, 1);
     __m128 lo = _mm256_castps256_ps128(mx);
@@ -4849,9 +4856,9 @@ static inline float alt_heuristic_avx2(const AltNode8 *av, __m256 gf, __m256 gb)
 #endif
 
 #if defined(__AVX2__)
-#define ALT_HEUR(g, v, gf, gb, gfv, gbv, L) alt_heuristic_avx2(&(g)->alt_nodes[v], (gfv), (gbv))
+#define ALT_HEUR(g, u, gf, gb, gf0, gf1, gb0, gb1, L) alt_heuristic_avx2(&(g)->alt_nodes[u], (gf0), (gf1), (gb0), (gb1))
 #else
-#define ALT_HEUR(g, v, gf, gb, gfv, gbv, L) alt_heuristic_scalar(&(g)->alt_nodes[v], (gf), (gb), (L))
+#define ALT_HEUR(g, u, gf, gb, gf0, gf1, gb0, gb1, L) alt_heuristic_scalar(&(g)->alt_nodes[u], (gf), (gb), (L))
 #endif
 
 static inline int turn_forbidden(const VmrGraph *g, uint32_t via,
@@ -5511,23 +5518,23 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
     const float v_heur = (query->mode == MODE_DIJKSTRA)
                        ? 0.0f : (attr_scale_min / max_speed_mps);
 
-    float alt_gf[8], alt_gb[8], alt_sf[8], alt_sb[8];
+    float alt_gf[16], alt_gb[16], alt_sf[16], alt_sb[16];
     uint32_t L = g->landmark_count;
     int has_alt = (L > 0 && g->alt_nodes != NULL);
     float alt_scale = (query->mode == MODE_DIJKSTRA) ? 1.0f : attr_scale_min;
 #if defined(__AVX2__)
-    __m256 gf_vec = _mm256_setzero_ps();
-    __m256 gb_vec = _mm256_setzero_ps();
-    __m256 sf_vec = _mm256_setzero_ps();
-    __m256 sb_vec = _mm256_setzero_ps();
+    __m256 gf0 = _mm256_setzero_ps(), gf1 = _mm256_setzero_ps();
+    __m256 gb0 = _mm256_setzero_ps(), gb1 = _mm256_setzero_ps();
+    __m256 sf0 = _mm256_setzero_ps(), sf1 = _mm256_setzero_ps();
+    __m256 sb0 = _mm256_setzero_ps(), sb1 = _mm256_setzero_ps();
 #endif
     if (has_alt) {
-        if (L > 8) {
-            L = 8;
+        if (L > 16) {
+            L = 16;
         }
-        const AltNode8 *gn = g->alt_nodes + goal_idx;
-        const AltNode8 *sn = g->alt_nodes + start_idx;
-        for (uint32_t i = 0; i < 8; i++) {
+        const AltNode16 *gn = g->alt_nodes + goal_idx;
+        const AltNode16 *sn = g->alt_nodes + start_idx;
+        for (uint32_t i = 0; i < 16; i++) {
             float gf = (i < L) ? gn->fwd[i] : 1.0e30f;
             float gb = (i < L) ? gn->bwd[i] : -1.0e30f;
             float sf = (i < L) ? sn->fwd[i] : 1.0e30f;
@@ -5538,10 +5545,14 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
             *(alt_sb + i) = (sb <= -1.0e29f) ? 1.0e30f : sb;
         }
 #if defined(__AVX2__)
-        gf_vec = _mm256_loadu_ps(alt_gf);
-        gb_vec = _mm256_loadu_ps(alt_gb);
-        sf_vec = _mm256_loadu_ps(alt_sf);
-        sb_vec = _mm256_loadu_ps(alt_sb);
+        gf0 = _mm256_loadu_ps(alt_gf);
+        gf1 = _mm256_loadu_ps(alt_gf + 8);
+        gb0 = _mm256_loadu_ps(alt_gb);
+        gb1 = _mm256_loadu_ps(alt_gb + 8);
+        sf0 = _mm256_loadu_ps(alt_sf);
+        sf1 = _mm256_loadu_ps(alt_sf + 8);
+        sb0 = _mm256_loadu_ps(alt_sb);
+        sb1 = _mm256_loadu_ps(alt_sb + 8);
 #endif
     }
 
@@ -5587,7 +5598,7 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
 
                 float h_v = 0.0f;
                 if (has_alt) {
-                    h_v = ALT_HEUR(g, v, alt_gf, alt_gb, gf_vec, gb_vec, L) * alt_scale;
+                    h_v = ALT_HEUR(g, v, alt_gf, alt_gb, gf0, gf1, gb0, gb1, L) * alt_scale;
                 } else if (query->mode == MODE_VEC_UNIDIR) {
                     float rvx = gx - *(g->node_x + v);
                     float rvy = gy - *(g->node_y + v);
@@ -5684,7 +5695,7 @@ if (skip_dead && (*(g->edge_flags + ei) & EDGE_DEAD_TARGET)) continue;
                     }
 
                     float h_v = has_alt
-                        ? (ALT_HEUR(g, v, alt_gf, alt_gb, gf_vec, gb_vec, L) * alt_scale)
+                        ? (ALT_HEUR(g, v, alt_gf, alt_gb, gf0, gf1, gb0, gb1, L) * alt_scale)
                         : vmr_sqrt_fast((gx - *(g->node_x + v)) * (gx - *(g->node_x + v)) +
                                         (gy - *(g->node_y + v)) * (gy - *(g->node_y + v))) * v_heur;
 
@@ -5771,7 +5782,7 @@ uint32_t u = *(g->rev_src_node + ri);
                     }
 
                     float h_v = has_alt
-                        ? (ALT_HEUR(g, u, alt_sf, alt_sb, sf_vec, sb_vec, L) * alt_scale)
+                        ? (ALT_HEUR(g, u, alt_sf, alt_sb, sf0, sf1, sb0, sb1, L) * alt_scale)
                         : vmr_sqrt_fast((sx - *(g->node_x + u)) * (sx - *(g->node_x + u)) +
                                         (sy - *(g->node_y + u)) * (sy - *(g->node_y + u))) * v_heur;
 
