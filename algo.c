@@ -132,7 +132,9 @@ typedef enum {
 typedef enum {
     MODE_VEC_BIDIR   = 0, /* Bidirectional 8D Vector-Corridor Search   */
     MODE_VEC_UNIDIR  = 1, /* Unidirectional 8D Vector-Corridor Search  */
-    MODE_DIJKSTRA    = 2  /* Classic Dijkstra baseline (same weights)  */
+    MODE_DIJKSTRA    = 2, /* True uninformed Dijkstra (travel time)    */
+    MODE_ASTAR       = 3, /* ALT-guided A* on travel time (efficient)  */
+    MODE_CCH         = 4  /* Contraction Hierarchy (CCH) query         */
 } SearchMode;
 
 /* 5D Preference Query Vector paired with 3D runtime spatial context -> 8D */
@@ -3189,6 +3191,19 @@ static int vmr_preprocess_graph(VmrRawGraph *rg, VmrGraph *g) {
     g->landmark_count = 32;
     vmr_build_landmarks(g);
 
+    /* Contraction Hierarchy (CCH) on travel time; opt-in via VMR_CCH so the
+     * default vector pipeline stays lean. */
+    if (getenv("VMR_CCH") != NULL) {
+        clock_t tc0 = clock();
+        if (vmr_build_ch(g) != 0) {
+            LOG_WARN("CCH build failed; CCH mode disabled");
+        } else {
+            LOG_INFO("CCH built in %.1f ms (%u levels, %u ch-edges)",
+                     1000.0 * (double)(clock() - tc0) / (double)CLOCKS_PER_SEC,
+                     g->node_count, g->ch_edge_count);
+        }
+    }
+
     /* Vector CH is not used for the exact-vector A* (UK measured slower). */
 
     clock_t t1 = clock();
@@ -5760,7 +5775,7 @@ static inline float compute_8d_step_cost(const VmrGraph *g, uint32_t eid,
     if (p->avoid_tolls && (*(g->edge_flags + eid) & EDGE_TOLL)) {
         base_time *= 3.8f;
     }
-    if (mode == MODE_DIJKSTRA) {
+    if (mode == MODE_DIJKSTRA || mode == MODE_ASTAR) {
         return base_time;
     }
 
@@ -5787,7 +5802,7 @@ static inline float compute_8d_cost_min(const VmrGraph *g, uint32_t eid,
     if (p->avoid_tolls && (*(g->edge_flags + eid) & EDGE_TOLL)) {
         base_time *= 3.8f;
     }
-    if (mode == MODE_DIJKSTRA) {
+    if (mode == MODE_DIJKSTRA || mode == MODE_ASTAR) {
         return base_time;
     }
     float spatial_align = 0.50f * cos1 + 0.30f + 0.20f * mom_dot;
@@ -6737,11 +6752,203 @@ static inline uint32_t vmr_expand_bwd_block(
     return rbase + (bb1 - bb0) * 4U;
 }
 
+/* =========================================================================
+ * CCH: Contraction-Hierarchy (customizable) query on travel-time weights.
+ * Forward search climbs the hierarchy (up-edges), backward search descends;
+ * the original path is recovered by recursively unpacking shortcuts.
+ * ========================================================================= */
+
+typedef struct { uint32_t *d; size_t n, cap; } CchVec;
+
+static void cch_vec_push(CchVec *v, uint32_t x) {
+    if (v->n >= v->cap) {
+        v->cap = v->cap ? v->cap * 2 : 256;
+        v->d = (uint32_t *)xrealloc(v->d, v->cap * sizeof(uint32_t));
+    }
+    v->d[v->n++] = x;
+}
+
+static uint32_t cch_lookup_orig(const VmrGraph *g, uint32_t from, uint32_t to) {
+    uint32_t e = *(g->fwd_offsets + from + 1U);
+    for (uint32_t i = *(g->fwd_offsets + from); i < e; i++) {
+        if (*(g->edge_to + i) == to) {
+            return i;
+        }
+    }
+    return VMR_INVALID;
+}
+
+static void cch_unpack(const VmrGraph *g, uint32_t eid, CchVec *out) {
+    if (eid == VMR_INVALID) {
+        return;
+    }
+    if (*(g->ch_via + eid) != VMR_INVALID) {
+        cch_unpack(g, *(g->ch_child1 + eid), out);
+        cch_unpack(g, *(g->ch_child2 + eid), out);
+    } else {
+        uint32_t f = *(g->ch_from + eid), t = *(g->ch_to + eid);
+        cch_vec_push(out, cch_lookup_orig(g, f, t));
+    }
+}
+
+static int vmr_cch_query(const VmrGraph *g, uint32_t start, uint32_t goal,
+                         const VmrQuery *query, VmrResult *res) {
+    clock_t t0 = clock();
+    uint32_t n = g->node_count;
+    if (vmr_ws_reserve(n) != 0) {
+        return -1;
+    }
+    VmrSearchWS *ws = &g_ws;
+    uint32_t epoch;
+    if (ws->epoch > UINT32_MAX - 2U) {
+        memset(ws->sf, 0, (size_t)n * sizeof(BidirFwdState));
+        memset(ws->sb, 0, (size_t)n * sizeof(BidirBwdState));
+        ws->epoch = 0;
+    }
+    ws->epoch += 2U;
+    epoch = ws->epoch;
+    ws->pq_fwd.size = 0;
+    ws->pq_bwd.size = 0;
+    MinHeap *pf = &ws->pq_fwd, *pb = &ws->pq_bwd;
+    const uint32_t *lvl = g->ch_level;
+
+    ws->sf[start].st = epoch; ws->sf[start].g = 0.0f;
+    ws->sf[start].p = VMR_INVALID; ws->sf[start].pe = VMR_INVALID;
+    heap_push(pf, start, 0.0f);
+    ws->sb[goal].st = epoch; ws->sb[goal].g = 0.0f;
+    ws->sb[goal].p = VMR_INVALID; ws->sb[goal].pe = VMR_INVALID;
+    heap_push(pb, goal, 0.0f);
+
+    uint32_t expanded = 0;
+    float best = FLT_MAX;
+    uint32_t meet = VMR_INVALID;
+
+    while (pf->size > 0 && pb->size > 0) {
+        if (meet != VMR_INVALID && pf->buf->prio + pb->buf->prio >= best) {
+            break;
+        }
+        HeapEntry top;
+        if (heap_pop(pf, &top)) {
+            uint32_t u = top.node;
+            if (ws->sf[u].st != epoch + 1) {
+                ws->sf[u].st = epoch + 1;
+                expanded++;
+                if ((ws->sb[u].st == epoch || ws->sb[u].st == epoch + 1) && ws->sb[u].g < FLT_MAX) {
+                    float tot = ws->sf[u].g + ws->sb[u].g;
+                    if (tot < best) { best = tot; meet = u; }
+                }
+                uint32_t be = *(g->ch_fwd_off + u + 1U);
+                for (uint32_t e = *(g->ch_fwd_off + u); e < be; e++) {
+                    uint32_t w = *(g->ch_to + e);
+                    if (*(lvl + w) <= *(lvl + u)) continue; /* up-edge only */
+                    float ng = ws->sf[u].g + *(g->ch_time + e);
+                    if (ws->sf[w].st != epoch || ng < ws->sf[w].g) {
+                        ws->sf[w].st = epoch; ws->sf[w].g = ng;
+                        ws->sf[w].p = u; ws->sf[w].pe = e;
+                        if (ng < best) heap_push(pf, w, ng);
+                    }
+                }
+            }
+        }
+        if (heap_pop(pb, &top)) {
+            uint32_t w = top.node;
+            if (ws->sb[w].st != epoch + 1) {
+                ws->sb[w].st = epoch + 1;
+                expanded++;
+                if ((ws->sf[w].st == epoch || ws->sf[w].st == epoch + 1) && ws->sf[w].g < FLT_MAX) {
+                    float tot = ws->sf[w].g + ws->sb[w].g;
+                    if (tot < best) { best = tot; meet = w; }
+                }
+                uint32_t re = *(g->ch_rev_off + w + 1U);
+                for (uint32_t r = *(g->ch_rev_off + w); r < re; r++) {
+                    uint32_t u = *(g->ch_rev_src + r);
+                    if (*(lvl + u) >= *(lvl + w)) continue; /* up-edge (u,w) */
+                    uint32_t eid = *(g->ch_rev_eid + r);
+                    float ng = ws->sb[w].g + *(g->ch_time + eid);
+                    if (ws->sb[u].st != epoch || ng < ws->sb[u].g) {
+                        ws->sb[u].st = epoch; ws->sb[u].g = ng;
+                        ws->sb[u].p = w; ws->sb[u].pe = eid;
+                        if (ng < best) heap_push(pb, u, ng);
+                    }
+                }
+            }
+        }
+    }
+
+    if (meet == VMR_INVALID) {
+        res->elapsed_ms = 1000.0 * (double)(clock() - t0) / (double)CLOCKS_PER_SEC;
+        return 0;
+    }
+
+    CchVec fwd, bwd, all, orig;
+    memset(&fwd, 0, sizeof(fwd)); memset(&bwd, 0, sizeof(bwd));
+    memset(&all, 0, sizeof(all)); memset(&orig, 0, sizeof(orig));
+    for (uint32_t u = meet; u != start;) {
+        uint32_t p = ws->sf[u].p;
+        cch_vec_push(&fwd, ws->sf[u].pe);
+        u = p;
+    }
+    for (uint32_t w = meet; w != goal;) {
+        uint32_t p = ws->sb[w].p;
+        cch_vec_push(&bwd, ws->sb[w].pe);
+        w = p;
+    }
+    for (size_t i = fwd.n; i-- > 0;) {
+        cch_vec_push(&all, fwd.d[i]);
+    }
+    for (size_t i = 0; i < bwd.n; i++) {
+        cch_vec_push(&all, bwd.d[i]);
+    }
+    xfree(fwd.d);
+    xfree(bwd.d);
+    for (size_t i = 0; i < all.n; i++) {
+        cch_unpack(g, all.d[i], &orig);
+    }
+    xfree(all.d);
+
+    uint32_t ohop = (uint32_t)orig.n;
+    res->nodes = (uint32_t *)xmalloc((size_t)(ohop + 1U) * sizeof(uint32_t));
+    res->edges = (uint32_t *)xmalloc((size_t)(ohop ? ohop : 1U) * sizeof(uint32_t));
+    uint32_t at = 0;
+    *(res->nodes + at++) = start;
+    double tot_time = 0.0, tot_dist = 0.0;
+    int bad = 0;
+    for (uint32_t i = 0; i < ohop; i++) {
+        uint32_t eid = orig.d[i];
+        if (eid == VMR_INVALID || eid >= g->edge_count) { bad = 1; break; }
+        *(res->edges + i) = eid;
+        *(res->nodes + at++) = *(g->edge_to + eid);
+        tot_time += (double)*(g->edge_time_s + eid);
+        tot_dist += (double)*(g->edge_length_m + eid);
+    }
+    xfree(orig.d);
+    if (bad) {
+        vmr_result_free(res);
+        vmr_result_init(res);
+        res->elapsed_ms = 1000.0 * (double)(clock() - t0) / (double)CLOCKS_PER_SEC;
+        return 0;
+    }
+
+    res->found = 1;
+    res->mode_used = MODE_CCH;
+    res->hop_count = ohop;
+    res->est_time_s = tot_time;
+    res->total_distance_m = tot_dist;
+    res->nodes_expanded = expanded;
+    res->start_idx = start;
+    res->goal_idx = goal;
+    res->elapsed_ms = 1000.0 * (double)(clock() - t0) / (double)CLOCKS_PER_SEC;
+    vmr_compute_result_telemetry(g, res, &query->pref);
+    return 0;
+}
+
 /*
  * Primary Pathfinding Entrypoint:
  *   MODE_VEC_BIDIR  -> Bidirectional 8D Vector-Corridor Search
  *   MODE_VEC_UNIDIR -> Unidirectional 8D Vector-Corridor Search
- *   MODE_DIJKSTRA   -> Baseline Dijkstra
+ *   MODE_ASTAR      -> ALT-guided A* on travel time
+ *   MODE_DIJKSTRA   -> True uninformed Dijkstra (travel time)
+ *   MODE_CCH        -> Contraction-Hierarchy query
  */
 static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_idx,
                          const VmrQuery *query, VmrResult *res) {
@@ -6773,6 +6980,14 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
     if (*(g->node_comp_id + start_idx) != *(g->node_comp_id + goal_idx)) {
         LOG_WARN("Start and Goal lie on disconnected components (e.g., island without ferry link)");
         return 0;
+    }
+
+    if (query->mode == MODE_CCH) {
+        if (!g->ch_built) {
+            LOG_WARN("CCH requested but no contraction hierarchy was built");
+            return -1;
+        }
+        return vmr_cch_query(g, start_idx, goal_idx, query, res);
     }
 
     vmr_corridor_free();
@@ -6884,7 +7099,8 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
     uint32_t L = g->landmark_count;
     int has_alt = (query->mode != MODE_DIJKSTRA) &&
                   (L > 0 && g->alt_nodes != NULL && !g->ch_built);
-    float alt_scale = (query->mode == MODE_DIJKSTRA) ? 1.0f : attr_scale_min;
+    float alt_scale = (query->mode == MODE_DIJKSTRA || query->mode == MODE_ASTAR)
+                          ? 1.0f : attr_scale_min;
 #if defined(__AVX2__)
     __m256 gf0 = _mm256_setzero_ps(), gf1 = _mm256_setzero_ps();
     __m256 gf2 = _mm256_setzero_ps(), gf3 = _mm256_setzero_ps();
@@ -7001,7 +7217,7 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
                 if (ws->sf[v].st == epoch && ng_min >= ws->sf[v].g) continue;
                 if (ng_min + h_v >= best_total) continue;
 
-                float cos2 = (query->mode == MODE_DIJKSTRA) ? cos1 :
+                float cos2 = (query->mode == MODE_DIJKSTRA || query->mode == MODE_ASTAR) ? cos1 :
                              ((v == goal_idx) ? 1.0f :
                               two_hop_fwd_cos_fast(g, ei, cos1, urx, ury));
                 float sc = compute_8d_step_cost(g, ei, &query->pref, query->mode, as,
@@ -7369,6 +7585,8 @@ static const char *mode_str(SearchMode m) {
     switch (m) {
         case MODE_VEC_BIDIR:  return "vec-bidir-8d";
         case MODE_VEC_UNIDIR: return "vec-unidir-8d";
+        case MODE_ASTAR:      return "astar";
+        case MODE_CCH:        return "cch";
         default:              return "dijkstra";
     }
 }
@@ -7406,13 +7624,13 @@ static void vmr_print_result(const VmrGraph *g, const VmrResult *res) {
 }
 
 static void vmr_benchmark(const VmrGraph *g, uint32_t s, uint32_t t, const VmrPreference *pref) {
-    SearchMode modes[3] = { MODE_VEC_BIDIR, MODE_VEC_UNIDIR, MODE_DIJKSTRA };
+    SearchMode modes[5] = { MODE_VEC_BIDIR, MODE_VEC_UNIDIR, MODE_ASTAR, MODE_DIJKSTRA, MODE_CCH };
     printf("\n=== UK Benchmark (%lld -> %lld) ===\n",
            (long long)*(g->node_osm_id + s), (long long)*(g->node_osm_id + t));
     printf("%-15s %-6s %-6s %-10s %-9s %-8s %-8s %-9s %-9s\n",
            "Algorithm", "Found", "Hops", "Dist(km)", "Time(min)", "MeanCos", "CumCos", "Expanded", "CPU(ms)");
 
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < 5; i++) {
         VmrQuery q = { modes[i], *pref, 1 };
         VmrResult r;
         vmr_result_init(&r);
@@ -7608,7 +7826,8 @@ static void print_usage(const char *prog) {
         "Routing & Evaluation:\n"
         "  --route-coord <la1> <lo1> <la2> <lo2>   Snap WGS84 coords & route\n"
         "  --route-id <osmA> <osmB>                Route between OSM intersection IDs\n"
-        "  --mode <bidir|unidir|dijkstra>          Search algorithm (default: bidir)\n"
+        "  --mode <bidir|unidir|astar|dijkstra|cch>\n"
+        "                                        Search algorithm (default: bidir)\n"
         "  --profile <balanced|fastest|direct|highway|local>\n"
         "  --weights <a,s,c,t,m>                   Custom 5D weights (align,spd,cls,str,sm)\n"
         "  --benchmark                             Compare bidir vs unidir vs dijkstra\n"
@@ -7690,9 +7909,11 @@ int main(int argc, char **argv) {
             }
         } else if (strcmp(a, "--mode") == 0 && i + 1 < argc) {
             const char *m = *(argv + (++i));
-            if (c_stricmp(m, "bidir") == 0) mode = MODE_VEC_BIDIR;
-            else if (c_stricmp(m, "unidir") == 0) mode = MODE_VEC_UNIDIR;
-            else if (c_stricmp(m, "dijkstra") == 0) mode = MODE_DIJKSTRA;
+        if (c_stricmp(m, "bidir") == 0) mode = MODE_VEC_BIDIR;
+        else if (c_stricmp(m, "unidir") == 0) mode = MODE_VEC_UNIDIR;
+        else if (c_stricmp(m, "astar") == 0) mode = MODE_ASTAR;
+        else if (c_stricmp(m, "dijkstra") == 0) mode = MODE_DIJKSTRA;
+        else if (c_stricmp(m, "cch") == 0) mode = MODE_CCH;
         } else if (strcmp(a, "--route-coord") == 0 && i + 4 < argc) {
             do_rcoord = 1;
             la1 = strtod(*(argv + (++i)), NULL);
