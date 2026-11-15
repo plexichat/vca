@@ -26,18 +26,45 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#if defined(__SSE__)
+#include <xmmintrin.h>
+#endif
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
+
+static inline float vmr_inv_sqrt(float x) {
+    if (x <= 0.0f) {
+        return 0.0f;
+    }
+#if defined(__SSE__)
+    float y = _mm_cvtss_f32(_mm_rsqrt_ss(_mm_set_ss(x)));
+    y *= 0.5f * (3.0f - x * y * y);
+    if (!(y > 0.0f) || !isfinite(y)) {
+        return 1.0f / sqrtf(x);
+    }
+    return y;
+#else
+    return 1.0f / sqrtf(x);
+#endif
+}
+
+static inline float vmr_sqrt_fast(float x) {
+    if (x <= 0.0f) {
+        return 0.0f;
+    }
+    float y = vmr_inv_sqrt(x);
+    return (y > 0.0f) ? (x * y) : sqrtf(x);
+}
 
 /* ========================================================================= */
 /* SECTION 1: CONSTANTS, TYPES & LOGGING                                     */
 /* ========================================================================= */
 
 #define UVR_VERSION      "2.0.0"
-#define VGRAPH_MAGIC     0x564D5232U /* "VMR2" */
-#define VGRAPH_FORMAT_V  2U
+#define VGRAPH_MAGIC     0x564D5234U /* "VMR4" */
+#define VGRAPH_FORMAT_V  4U
 
 #define VMR_INVALID      UINT32_MAX
 #define EARTH_RADIUS_M   6371008.8
@@ -436,7 +463,7 @@ static int heap_push(MinHeap *h, uint32_t node, float prio) {
     *(base + i) = (HeapEntry){ node, prio };
 
     while (i > 0) {
-        size_t p = (i - 1) >> 1;
+        size_t p = (i - 1) >> 2;
         HeapEntry *ci = base + i;
         HeapEntry *cp = base + p;
         if (ci->prio < cp->prio) {
@@ -463,20 +490,19 @@ static int heap_pop(MinHeap *h, HeapEntry *out) {
         size_t i = 0;
         size_t n = h->size;
         while (1) {
-            size_t l = (i << 1) + 1;
-            size_t r = l + 1;
-            size_t m = i;
-            if (l < n && (base + l)->prio < (base + m)->prio) {
-                m = l;
+            size_t child = i * 4 + 1;
+            if (child >= n) break;
+            size_t end = child + 4;
+            if (end > n) end = n;
+            size_t best = child;
+            for (size_t c = child + 1; c < end; c++) {
+                if ((base + c)->prio < (base + best)->prio) best = c;
             }
-            if (r < n && (base + r)->prio < (base + m)->prio) {
-                m = r;
-            }
-            if (m != i) {
+            if ((base + best)->prio < (base + i)->prio) {
                 HeapEntry tmp = *(base + i);
-                *(base + i) = *(base + m);
-                *(base + m) = tmp;
-                i = m;
+                *(base + i) = *(base + best);
+                *(base + best) = tmp;
+                i = best;
             } else {
                 break;
             }
@@ -514,6 +540,12 @@ typedef struct {
     RawEdge *edges;
     uint32_t edge_count;
     uint32_t edge_cap;
+
+    uint32_t *turn_via;
+    uint32_t *turn_from;
+    uint32_t *turn_to;
+    uint8_t  *turn_mode;
+    uint32_t turn_count;
 
     IdMap    osm_map;
 } VmrRawGraph;
@@ -572,6 +604,19 @@ typedef struct {
     uint32_t *grid_offsets;    /* len = SPATIAL_GRID_DIM * SPATIAL_GRID_DIM + 1 */
     uint32_t *grid_nodes;      /* len = node_count */
 
+    /* ALT landmarks: L sources, dist(landmark -> node) and dist(node -> landmark) */
+    uint32_t  landmark_count;
+    uint32_t *landmark_node;
+    float    *landmark_dist_fwd;   /* [L * node_count] */
+    float    *landmark_dist_bwd;   /* [L * node_count] */
+
+    /* Turn restrictions: per-via forbidden (from,to) pairs */
+    uint32_t *turn_offsets;    /* [node_count + 1] */
+    uint32_t *turn_from;
+    uint32_t *turn_to;
+    uint8_t  *turn_mode;       /* 0=forbid */
+    uint32_t  turn_count;
+
     IdMap     osm_map;
 } VmrGraph;
 
@@ -607,6 +652,10 @@ static void raw_graph_free(VmrRawGraph *rg) {
     xfree(rg->node_x);
     xfree(rg->node_y);
     xfree(rg->edges);
+    xfree(rg->turn_via);
+    xfree(rg->turn_from);
+    xfree(rg->turn_to);
+    xfree(rg->turn_mode);
     idmap_free(&rg->osm_map);
     raw_graph_init(rg);
 }
@@ -726,6 +775,13 @@ static void vmr_graph_free(VmrGraph *g) {
     xfree(g->rev_fwd_eid);
     xfree(g->grid_offsets);
     xfree(g->grid_nodes);
+    xfree(g->landmark_node);
+    xfree(g->landmark_dist_fwd);
+    xfree(g->landmark_dist_bwd);
+    xfree(g->turn_offsets);
+    xfree(g->turn_from);
+    xfree(g->turn_to);
+    xfree(g->turn_mode);
     idmap_free(&g->osm_map);
     vmr_graph_init(g);
 }
@@ -905,6 +961,146 @@ static int vmr_build_reverse_csr_and_components(VmrGraph *g) {
  * The raw graph storage is consumed and released before `g` is fully packed, so
  * preprocessing peak RSS stays close to a single graph copy instead of three.
  */
+/* ------------------------------------------------------------------------- */
+/* ALT landmarks (8 sources): exact landmark distances for goal-directed A*.  */
+/* ------------------------------------------------------------------------- */
+
+static uint32_t vmr_nearest_node_linear(const VmrGraph *g, double lat, double lon) {
+    float kx = (float)(cos(lat * DEG_TO_RAD) * 111320.0);
+    float ky = 110540.0f;
+    float qx = (float)lon * kx;
+    float qy = (float)lat * ky;
+    float best = FLT_MAX;
+    uint32_t bi = VMR_INVALID;
+    for (uint32_t i = 0; i < g->node_count; i++) {
+        float dx = (float)*(g->node_lon + i) * kx - qx;
+        float dy = (float)*(g->node_lat + i) * ky - qy;
+        float d2 = dx * dx + dy * dy;
+        if (d2 < best) {
+            best = d2;
+            bi = i;
+        }
+    }
+    return bi;
+}
+
+static void alt_dijkstra(const VmrGraph *g, uint32_t src, float *dist, int reverse) {
+    if (!dist || src >= g->node_count) {
+        return;
+    }
+    uint32_t n = g->node_count;
+    uint8_t *closed = (uint8_t *)xcalloc(n, 1);
+    MinHeap pq;
+    if (!closed || heap_init(&pq, 1024) != 0) {
+        xfree(closed);
+        return;
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        *(dist + i) = FLT_MAX;
+    }
+    *(dist + src) = 0.0f;
+    heap_push(&pq, src, 0.0f);
+
+    HeapEntry top;
+    while (heap_pop(&pq, &top)) {
+        uint32_t u = top.node;
+        if (*(closed + u)) {
+            continue;
+        }
+        *(closed + u) = 1;
+        float du = *(dist + u);
+        if (!reverse) {
+            uint32_t beg = *(g->fwd_offsets + u);
+            uint32_t end = *(g->fwd_offsets + u + 1U);
+            for (uint32_t e = beg; e < end; e++) {
+                uint32_t v = *(g->edge_to + e);
+                if (*(closed + v)) {
+                    continue;
+                }
+                float nd = du + *(g->edge_time_s + e);
+                if (nd < *(dist + v)) {
+                    *(dist + v) = nd;
+                    heap_push(&pq, v, nd);
+                }
+            }
+        } else {
+            uint32_t beg = *(g->rev_offsets + u);
+            uint32_t end = *(g->rev_offsets + u + 1U);
+            for (uint32_t r = beg; r < end; r++) {
+                uint32_t v = *(g->rev_src_node + r);
+                if (*(closed + v)) {
+                    continue;
+                }
+                uint32_t e = *(g->rev_fwd_eid + r);
+                float nd = du + *(g->edge_time_s + e);
+                if (nd < *(dist + v)) {
+                    *(dist + v) = nd;
+                    heap_push(&pq, v, nd);
+                }
+            }
+        }
+    }
+    xfree(closed);
+    heap_free(&pq);
+}
+
+static void vmr_build_landmarks(VmrGraph *g) {
+    static const double lat[8] = {
+        58.6440, 50.0700, 51.1300, 53.4800,
+        55.9530, 51.5070, 52.4800, 57.4780
+    };
+    static const double lon[8] = {
+        -3.0700, -5.7200, 1.3100, -2.2400,
+        -3.1880, -0.1280, -1.9000, -4.2250
+    };
+    uint32_t nodes[8];
+    uint32_t L = 0;
+    for (uint32_t i = 0; i < 8; i++) {
+        uint32_t u = vmr_nearest_node_linear(g, lat[i], lon[i]);
+        if (u == VMR_INVALID) {
+            continue;
+        }
+        int dup = 0;
+        for (uint32_t j = 0; j < L; j++) {
+            if (*(nodes + j) == u) {
+                dup = 1;
+                break;
+            }
+        }
+        if (!dup) {
+            *(nodes + L++) = u;
+        }
+    }
+    if (L == 0) {
+        return;
+    }
+    size_t n = g->node_count;
+    size_t ln = (size_t)L * n;
+    g->landmark_node     = (uint32_t *)xmalloc((size_t)L * sizeof(uint32_t));
+    g->landmark_dist_fwd = (float *)xmalloc(ln * sizeof(float));
+    g->landmark_dist_bwd = (float *)xmalloc(ln * sizeof(float));
+    if (!g->landmark_node || !g->landmark_dist_fwd || !g->landmark_dist_bwd) {
+        xfree(g->landmark_node); xfree(g->landmark_dist_fwd); xfree(g->landmark_dist_bwd);
+        g->landmark_node = NULL;
+        g->landmark_dist_fwd = NULL;
+        g->landmark_dist_bwd = NULL;
+        g->landmark_count = 0;
+        LOG_WARN("ALT landmark allocation failed; falling back to Euclidean heuristic");
+        return;
+    }
+    memcpy(g->landmark_node, nodes, (size_t)L * sizeof(uint32_t));
+    g->landmark_count = L;
+    clock_t t0 = clock();
+    for (uint32_t i = 0; i < L; i++) {
+        uint32_t u = *(g->landmark_node + i);
+        alt_dijkstra(g, u, g->landmark_dist_fwd + (size_t)i * n, 0);
+        alt_dijkstra(g, u, g->landmark_dist_bwd + (size_t)i * n, 1);
+    }
+    clock_t t1 = clock();
+    LOG_INFO("ALT landmarks: %u built in %.1f ms", L,
+             1000.0 * (double)(t1 - t0) / (double)CLOCKS_PER_SEC);
+}
+
 static int vmr_preprocess_graph(VmrRawGraph *rg, VmrGraph *g) {
     vmr_graph_free(g);
     vmr_graph_init(g);
@@ -957,6 +1153,15 @@ static int vmr_preprocess_graph(VmrRawGraph *rg, VmrGraph *g) {
 
     /* Step 2: Degree-2 Chain Contraction (iterative pass until fixed point) */
     uint32_t contracted_cnt = 0;
+    uint8_t *no_contract = NULL;
+    if (rg->turn_count > 0) {
+        no_contract = (uint8_t *)xcalloc(rn, sizeof(uint8_t));
+        if (no_contract) {
+            for (uint32_t i = 0; i < rg->turn_count; i++) {
+                *(no_contract + *(rg->turn_via + i)) = 1;
+            }
+        }
+    }
     uint32_t *cq = (uint32_t *)xmalloc((size_t)rn * sizeof(uint32_t));
     uint8_t  *in_cq = (uint8_t *)xcalloc(rn, sizeof(uint8_t));
     if (!cq || !in_cq) {
@@ -971,6 +1176,7 @@ static int vmr_preprocess_graph(VmrRawGraph *rg, VmrGraph *g) {
         uint32_t od = *(out_deg + i);
         uint32_t id = *(in_deg + i);
         if ((od == 1 && id == 1) || (od == 2 && id == 2)) {
+            if (no_contract && *(no_contract + i)) continue;
             *(cq + cq_tail++) = i;
             *(in_cq + i) = 1;
         }
@@ -1108,6 +1314,7 @@ static int vmr_preprocess_graph(VmrRawGraph *rg, VmrGraph *g) {
     xfree(in_next);
     xfree(out_deg);
     xfree(in_deg);
+    xfree(no_contract);
 
     /* Step 3: Compact surviving nodes & live edges in place */
     uint32_t *remap = (uint32_t *)xmalloc((size_t)rn * sizeof(uint32_t));
@@ -1200,6 +1407,71 @@ static int vmr_preprocess_graph(VmrRawGraph *rg, VmrGraph *g) {
             *(g->node_y + ni)      = *(rg->node_y + i);
             idmap_put(&g->osm_map, oid, ni);
         }
+    }
+    if (rg->turn_count > 0 && sn > 0) {
+        uint32_t *cnt = (uint32_t *)xcalloc(sn, sizeof(uint32_t));
+        uint32_t valid = 0;
+        if (cnt) {
+            for (uint32_t i = 0; i < rg->turn_count; i++) {
+                uint32_t vi = *(remap + *(rg->turn_via + i));
+                uint32_t fi = *(remap + *(rg->turn_from + i));
+                uint32_t ti = *(remap + *(rg->turn_to + i));
+                if (vi == VMR_INVALID || fi == VMR_INVALID || ti == VMR_INVALID || vi == fi || vi == ti) {
+                    continue;
+                }
+                (*(cnt + vi))++;
+                valid++;
+            }
+        }
+        uint32_t *off = (uint32_t *)xcalloc((size_t)sn + 1U, sizeof(uint32_t));
+        uint32_t *tf = NULL, *tt = NULL;
+        uint8_t *tm = NULL;
+        uint32_t *cur = NULL;
+        if (off && valid > 0) {
+            uint32_t sum = 0;
+            for (uint32_t i = 0; i < sn; i++) {
+                *(off + i) = sum;
+                sum += *(cnt + i);
+            }
+            *(off + sn) = sum;
+            tf = (uint32_t *)xmalloc((size_t)valid * sizeof(uint32_t));
+            tt = (uint32_t *)xmalloc((size_t)valid * sizeof(uint32_t));
+            tm = (uint8_t *)xmalloc((size_t)valid);
+            cur = (uint32_t *)xmalloc((size_t)sn * sizeof(uint32_t));
+            if (tf && tt && tm && cur) {
+                memcpy(cur, off, (size_t)sn * sizeof(uint32_t));
+                uint32_t w = 0;
+                for (uint32_t i = 0; i < rg->turn_count; i++) {
+                    uint32_t vi = *(remap + *(rg->turn_via + i));
+                    uint32_t fi = *(remap + *(rg->turn_from + i));
+                    uint32_t ti = *(remap + *(rg->turn_to + i));
+                    if (vi == VMR_INVALID || fi == VMR_INVALID || ti == VMR_INVALID || vi == fi || vi == ti) {
+                        continue;
+                    }
+                    uint32_t at = (*(cur + vi))++;
+                    *(tf + at) = fi;
+                    *(tt + at) = ti;
+                    *(tm + at) = *(rg->turn_mode + i);
+                    w++;
+                }
+                if (w == valid) {
+                    g->turn_offsets = off;
+                    g->turn_from = tf;
+                    g->turn_to = tt;
+                    g->turn_mode = tm;
+                    g->turn_count = valid;
+                    off = NULL;
+                    tf = tt = NULL;
+                    tm = NULL;
+                }
+            }
+        }
+        xfree(cnt);
+        xfree(off);
+        xfree(tf);
+        xfree(tt);
+        xfree(tm);
+        xfree(cur);
     }
     xfree(remap);
 
@@ -1341,6 +1613,8 @@ static int vmr_preprocess_graph(VmrRawGraph *rg, VmrGraph *g) {
         return -1;
     }
 
+    vmr_build_landmarks(g);
+
     clock_t t1 = clock();
     double ms = 1000.0 * (double)(t1 - t0) / (double)CLOCKS_PER_SEC;
     LOG_INFO("Preprocessed UK SoA Graph in %.1f ms: %u -> %u nodes (-%.1f%% contracted), "
@@ -1431,6 +1705,24 @@ static int vmr_save_binary(const VmrGraph *g, const char *path) {
     }
     ok &= (fwrite(g->grid_offsets, sizeof(uint32_t), cells + 1U, fp) == cells + 1U);
     ok &= (fwrite(g->grid_nodes,   sizeof(uint32_t), n, fp) == n);
+
+    uint32_t l = g->landmark_count;
+    ok &= (fwrite(&l, sizeof(uint32_t), 1, fp) == 1);
+    if (l > 0 && n > 0) {
+        size_t ln = (size_t)l * (size_t)n;
+        ok &= (fwrite(g->landmark_node,    sizeof(uint32_t), l, fp) == l);
+        ok &= (fwrite(g->landmark_dist_fwd, sizeof(float),    ln, fp) == ln);
+        ok &= (fwrite(g->landmark_dist_bwd, sizeof(float),    ln, fp) == ln);
+    }
+
+    uint32_t tc = g->turn_count;
+    ok &= (fwrite(&tc, sizeof(uint32_t), 1, fp) == 1);
+    if (tc > 0 && n > 0) {
+        ok &= (fwrite(g->turn_offsets, sizeof(uint32_t), n + 1U, fp) == n + 1U);
+        ok &= (fwrite(g->turn_from,    sizeof(uint32_t), tc, fp) == tc);
+        ok &= (fwrite(g->turn_to,      sizeof(uint32_t), tc, fp) == tc);
+        ok &= (fwrite(g->turn_mode,    sizeof(uint8_t),  tc, fp) == tc);
+    }
 
     fclose(fp);
     if (!ok) {
@@ -1551,6 +1843,49 @@ static int vmr_load_binary(VmrGraph *g, const char *path) {
     }
     ok &= (fread(g->grid_offsets, sizeof(uint32_t), cells + 1U, fp) == cells + 1U);
     ok &= (fread(g->grid_nodes,   sizeof(uint32_t), n, fp) == n);
+
+    uint32_t l = 0;
+    ok &= (fread(&l, sizeof(uint32_t), 1, fp) == 1);
+    if (l > 64 || (size_t)l > SIZE_MAX / (size_t)(n ? n : 1)) {
+        ok = 0;
+        l = 0;
+    }
+    g->landmark_count = l;
+    if (l > 0 && n > 0) {
+        size_t ln = (size_t)l * (size_t)n;
+        g->landmark_node    = (uint32_t *)xmalloc((size_t)l * sizeof(uint32_t));
+        g->landmark_dist_fwd = (float *)xmalloc(ln * sizeof(float));
+        g->landmark_dist_bwd = (float *)xmalloc(ln * sizeof(float));
+        if (!g->landmark_node || !g->landmark_dist_fwd || !g->landmark_dist_bwd) {
+            ok = 0;
+        } else {
+            ok &= (fread(g->landmark_node,    sizeof(uint32_t), l, fp) == l);
+            ok &= (fread(g->landmark_dist_fwd, sizeof(float),    ln, fp) == ln);
+            ok &= (fread(g->landmark_dist_bwd, sizeof(float),    ln, fp) == ln);
+        }
+    }
+
+    uint32_t tc = 0;
+    ok &= (fread(&tc, sizeof(uint32_t), 1, fp) == 1);
+    if (tc > 100000000U) {
+        ok = 0;
+        tc = 0;
+    }
+    g->turn_count = tc;
+    if (tc > 0 && n > 0) {
+        g->turn_offsets = (uint32_t *)xcalloc((size_t)n + 1U, sizeof(uint32_t));
+        g->turn_from    = (uint32_t *)xmalloc((size_t)tc * sizeof(uint32_t));
+        g->turn_to      = (uint32_t *)xmalloc((size_t)tc * sizeof(uint32_t));
+        g->turn_mode    = (uint8_t *)xmalloc((size_t)tc);
+        if (!g->turn_offsets || !g->turn_from || !g->turn_to || !g->turn_mode) {
+            ok = 0;
+        } else {
+            ok &= (fread(g->turn_offsets, sizeof(uint32_t), (size_t)n + 1U, fp) == (size_t)n + 1U);
+            ok &= (fread(g->turn_from,    sizeof(uint32_t), tc, fp) == tc);
+            ok &= (fread(g->turn_to,      sizeof(uint32_t), tc, fp) == tc);
+            ok &= (fread(g->turn_mode,    sizeof(uint8_t),  tc, fp) == tc);
+        }
+    }
     fclose(fp);
 
     if (!ok || idmap_init(&g->osm_map, n) != 0) {
@@ -1597,6 +1932,13 @@ static int db_init_schema(sqlite3 *db) {
         "    speed_kmh  REAL NOT NULL,\n"
         "    smooth     REAL NOT NULL DEFAULT 0.85,\n"
         "    flags      INTEGER NOT NULL DEFAULT 0\n"
+        ");\n"
+        "CREATE TABLE IF NOT EXISTS turn_restrictions (\n"
+        "    via_node  INTEGER NOT NULL,\n"
+        "    from_node INTEGER NOT NULL,\n"
+        "    to_node   INTEGER NOT NULL,\n"
+        "    mode      INTEGER NOT NULL DEFAULT 0,\n"
+        "    PRIMARY KEY(via_node, from_node, to_node, mode)\n"
         ");\n";
     return sql_exec(db, sql);
 }
@@ -2032,10 +2374,24 @@ typedef struct {
 } PbfWayRec;
 
 typedef struct {
+    int64_t  from_way;
+    int64_t  to_way;
+    int64_t  via_node;
+    uint8_t  type;   /* 1=no_left 2=no_right 3=no_u_turn 4=no_straight */
+} PbfTurnRes;
+
+typedef struct {
     sqlite3 *db;
     sqlite3_stmt *nstmt;
     FILE *way_tmp;
     int pass;
+    IdMap way_map;
+    uint64_t *way_off;
+    size_t way_off_n;
+    size_t way_off_cap;
+    PbfTurnRes *turn_res;
+    size_t turn_res_n;
+    size_t turn_res_cap;
     int64_t *needed;
     size_t needed_n;
     size_t needed_cap;
@@ -2391,12 +2747,213 @@ static void pbf_handle_way(PbfCtx *c, PbBlock *b, const uint8_t *p, size_t n) {
     rec.spd = spd;
     rec.smooth = smooth;
     rec.ref_cnt = (uint32_t)rc;
+    long off = ftell(c->way_tmp);
+    if (off >= 0) {
+        if (c->way_off_n == c->way_off_cap) {
+            size_t ncap = c->way_off_cap ? c->way_off_cap * 2U : 1024U;
+            uint64_t *no = (uint64_t *)xrealloc(c->way_off, ncap * sizeof(uint64_t));
+            if (no) {
+                c->way_off = no;
+                c->way_off_cap = ncap;
+            }
+        }
+        if (c->way_off_n < c->way_off_cap) {
+            *(c->way_off + c->way_off_n) = (uint64_t)off;
+            idmap_put(&c->way_map, rec.id, (uint32_t)c->way_off_n);
+            c->way_off_n++;
+        }
+    }
     if (fwrite(&rec, sizeof rec, 1, c->way_tmp) != 1 ||
         (rc > 0 && fwrite(ra, sizeof(int64_t), rc, c->way_tmp) != rc)) {
         LOG_ERR("Failed writing PBF way cache");
     }
     c->ways_routable++;
     xfree(ra);
+}
+
+static void pbf_handle_relation(PbfCtx *c, PbBlock *b, const uint8_t *p, size_t n) {
+    PbReader r = { p, n, 0, 0 };
+    const uint8_t *keys = NULL, *vals = NULL, *roles = NULL, *memids = NULL, *types = NULL;
+    size_t kn = 0, vn = 0, rolen = 0, mlen = 0, tlen = 0;
+    int have_keys = 0, have_vals = 0, have_roles = 0, have_memids = 0, have_types = 0;
+    int f, w;
+    while (pb_next(&r, &f, &w)) {
+        if (f == 2 && w == 2) { keys = pb_bytes(&r, &kn); have_keys = 1; }
+        else if (f == 3 && w == 2) { vals = pb_bytes(&r, &vn); have_vals = 1; }
+        else if (f == 8 && w == 2) { roles = pb_bytes(&r, &rolen); have_roles = 1; }
+        else if (f == 9 && w == 2) { memids = pb_bytes(&r, &mlen); have_memids = 1; }
+        else if (f == 10 && w == 2) { types = pb_bytes(&r, &tlen); have_types = 1; }
+        else pb_skip(&r, w);
+    }
+    if (r.err || !have_roles || !have_memids || !have_types) {
+        return;
+    }
+
+    int is_restriction = 0;
+    int rtype = 0;
+    int except_car = 0;
+    if (have_keys && have_vals) {
+        PbReader kr = { keys, kn, 0, 0 };
+        PbReader vr = { vals, vn, 0, 0 };
+        while (kr.pos < kr.len && vr.pos < vr.len) {
+            uint64_t ki = pb_varint(&kr);
+            uint64_t vi = pb_varint(&vr);
+            if (kr.err || vr.err) break;
+            if (ki >= b->strings.n || vi >= b->strings.n) continue;
+            const PbStr *k = b->strings.v + ki;
+            const PbStr *v = b->strings.v + vi;
+            if (pb_str_is(k, "type")) {
+                if (pb_str_is(v, "restriction")) is_restriction = 1;
+            } else if (pb_str_is(k, "restriction")) {
+                if (pb_str_is(v, "no_left_turn")) rtype = 1;
+                else if (pb_str_is(v, "no_right_turn")) rtype = 2;
+                else if (pb_str_is(v, "no_u_turn")) rtype = 3;
+                else if (pb_str_is(v, "no_straight_on")) rtype = 4;
+            } else if (pb_str_is(k, "except")) {
+                if (pb_str_is(v, "motorcar") || pb_str_is(v, "car")) except_car = 1;
+            }
+        }
+    }
+    if (!is_restriction || rtype == 0 || except_car) {
+        return;
+    }
+
+    PbReader rr = { roles, rolen, 0, 0 };
+    PbReader mr = { memids, mlen, 0, 0 };
+    PbReader tr = { types, tlen, 0, 0 };
+    int64_t cur = 0;
+    int64_t from_way = 0, to_way = 0, via_node = 0;
+    int have_from = 0, have_to = 0, have_via = 0;
+    while (rr.pos < rr.len) {
+        uint64_t role = pb_varint(&rr);
+        uint64_t dm = pb_varint(&mr);
+        uint64_t ty = pb_varint(&tr);
+        if (rr.err || mr.err || tr.err) break;
+        cur += (int64_t)((dm >> 1) ^ (0 - (dm & 1U)));
+        if (role >= b->strings.n) continue;
+        const PbStr *rs = b->strings.v + role;
+        if (ty == 1) {
+            if (pb_str_is(rs, "from")) { from_way = cur; have_from = 1; }
+            else if (pb_str_is(rs, "to")) { to_way = cur; have_to = 1; }
+        } else if (ty == 0) {
+            if (pb_str_is(rs, "via")) { via_node = cur; have_via = 1; }
+        }
+    }
+    if (!have_from || !have_to || !have_via) {
+        return;
+    }
+    if (c->turn_res_n == c->turn_res_cap) {
+        size_t ncap = c->turn_res_cap ? c->turn_res_cap * 2U : 256U;
+        PbfTurnRes *nr = (PbfTurnRes *)xrealloc(c->turn_res, ncap * sizeof(PbfTurnRes));
+        if (!nr) {
+            return;
+        }
+        c->turn_res = nr;
+        c->turn_res_cap = ncap;
+    }
+    PbfTurnRes *out = c->turn_res + c->turn_res_n++;
+    out->from_way = from_way;
+    out->to_way = to_way;
+    out->via_node = via_node;
+    out->type = (uint8_t)rtype;
+}
+
+static int pbf_read_way_refs(PbfCtx *c, uint32_t idx, PbfWayRec *out_rec,
+                             int64_t **out_refs, size_t *out_n) {
+    if (idx >= c->way_off_n) {
+        return -1;
+    }
+    if (fseek(c->way_tmp, (long)*(c->way_off + idx), SEEK_SET) != 0) {
+        return -1;
+    }
+    PbfWayRec rec;
+    if (fread(&rec, sizeof rec, 1, c->way_tmp) != 1) {
+        return -1;
+    }
+    int64_t *refs = NULL;
+    if (rec.ref_cnt > 0) {
+        refs = (int64_t *)xmalloc((size_t)rec.ref_cnt * sizeof(int64_t));
+        if (!refs || fread(refs, sizeof(int64_t), rec.ref_cnt, c->way_tmp) != rec.ref_cnt) {
+            xfree(refs);
+            return -1;
+        }
+    }
+    if (rec.oneway == -1) {
+        for (uint32_t i = 0; i < rec.ref_cnt / 2U; i++) {
+            int64_t tmp = *(refs + i);
+            *(refs + i) = *(refs + (rec.ref_cnt - 1U - i));
+            *(refs + (rec.ref_cnt - 1U - i)) = tmp;
+        }
+    }
+    *out_rec = rec;
+    *out_refs = refs;
+    *out_n = rec.ref_cnt;
+    return 0;
+}
+
+static int pbf_apply_restrictions(PbfCtx *c) {
+    if (c->turn_res_n == 0) {
+        LOG_INFO("PBF: no turn restrictions found");
+        return 0;
+    }
+    sqlite3_stmt *st = NULL;
+    const char *sql = "INSERT OR REPLACE INTO turn_restrictions(via_node,from_node,to_node,mode) VALUES(?,?,?,?);";
+    if (sqlite3_prepare_v2(c->db, sql, -1, &st, NULL) != SQLITE_OK) {
+        LOG_ERR("Turn restriction prepare: %s", sqlite3_errmsg(c->db));
+        return -1;
+    }
+    if (sql_exec(c->db, "BEGIN") != 0) {
+        sqlite3_finalize(st);
+        return -1;
+    }
+    uint64_t applied = 0;
+    uint64_t skipped = 0;
+    for (size_t i = 0; i < c->turn_res_n; i++) {
+        PbfTurnRes *rr = c->turn_res + i;
+        uint32_t fi = idmap_get(&c->way_map, rr->from_way);
+        uint32_t ti = idmap_get(&c->way_map, rr->to_way);
+        if (fi == VMR_INVALID || ti == VMR_INVALID) {
+            skipped++;
+            continue;
+        }
+        PbfWayRec fr, tr;
+        int64_t *frefs = NULL, *trefs = NULL;
+        size_t fn = 0, tn = 0;
+        if (pbf_read_way_refs(c, fi, &fr, &frefs, &fn) != 0 ||
+            pbf_read_way_refs(c, ti, &tr, &trefs, &tn) != 0) {
+            xfree(frefs);
+            xfree(trefs);
+            skipped++;
+            continue;
+        }
+        size_t kf = SIZE_MAX, kt = SIZE_MAX;
+        for (size_t k = 0; k < fn; k++) {
+            if (*(frefs + k) == rr->via_node) { kf = k; break; }
+        }
+        for (size_t k = 0; k < tn; k++) {
+            if (*(trefs + k) == rr->via_node) { kt = k; break; }
+        }
+        if (kf == SIZE_MAX || kf == 0 || kt == SIZE_MAX || kt + 1 >= tn) {
+            xfree(frefs);
+            xfree(trefs);
+            skipped++;
+            continue;
+        }
+        sqlite3_reset(st);
+        sqlite3_bind_int64(st, 1, rr->via_node);
+        sqlite3_bind_int64(st, 2, *(frefs + kf - 1));
+        sqlite3_bind_int64(st, 3, *(trefs + kt + 1));
+        sqlite3_bind_int(st, 4, 0);
+        sqlite3_step(st);
+        applied++;
+        xfree(frefs);
+        xfree(trefs);
+    }
+    sql_exec(c->db, "COMMIT");
+    sqlite3_finalize(st);
+    LOG_INFO("PBF: applied %llu turn restrictions (%llu skipped)",
+             (unsigned long long)applied, (unsigned long long)skipped);
+    return 0;
 }
 
 static int pbf_parse_group(PbfCtx *c, PbBlock *b, const uint8_t *p, size_t n) {
@@ -2423,6 +2980,10 @@ static int pbf_parse_group(PbfCtx *c, PbBlock *b, const uint8_t *p, size_t n) {
         } else if (f == 3) {
             if (c->pass == 1) {
                 pbf_handle_way(c, b, q, l);
+            }
+        } else if (f == 4) {
+            if (c->pass == 1) {
+                pbf_handle_relation(c, b, q, l);
             }
         }
     }
@@ -2744,7 +3305,7 @@ static int pbf_insert_edges(sqlite3 *db, FILE *fp) {
     return 0;
 }
 
-static int db_import_osm_pbf(sqlite3 *db, const char *pbf_path) {
+static int db_import_osm_pbf(sqlite3 *db, const char *pbf_path, int restrictions_only) {
     FILE *fp = fopen(pbf_path, "rb");
     if (!fp) {
         LOG_ERR("Cannot open PBF '%s'", pbf_path);
@@ -2811,7 +3372,13 @@ static int db_import_osm_pbf(sqlite3 *db, const char *pbf_path) {
     LOG_INFO("PBF pass 1 complete: %llu routable ways, %llu unique highway nodes",
              (unsigned long long)c.ways_routable, (unsigned long long)c.needed_sorted_n);
 
-    if (rc == 0 && c.needed_sorted_n > 0) {
+    if (rc == 0) {
+        if (pbf_apply_restrictions(&c) != 0) {
+            rc = -1;
+        }
+    }
+
+    if (rc == 0 && !restrictions_only && c.needed_sorted_n > 0) {
         c.pass = 2;
         clearerr(fp);
         if (fseek(fp, 0, SEEK_SET) != 0) {
@@ -2831,7 +3398,7 @@ static int db_import_osm_pbf(sqlite3 *db, const char *pbf_path) {
         }
     }
 
-    if (rc == 0) {
+    if (rc == 0 && !restrictions_only) {
         fflush(c.way_tmp);
         rewind(c.way_tmp);
         if (pbf_insert_edges(db, c.way_tmp) != 0) {
@@ -2848,16 +3415,24 @@ static int db_import_osm_pbf(sqlite3 *db, const char *pbf_path) {
         remove(tmp_path);
         xfree(tmp_path);
     }
+    idmap_free(&c.way_map);
+    xfree(c.way_off);
+    xfree(c.turn_res);
     xfree(c.needed);
 
     if (rc != 0) {
         LOG_ERR("PBF import failed");
         return -1;
     }
-    LOG_INFO("PBF import complete: %llu nodes, %llu ways, %llu data blobs",
-             (unsigned long long)c.nodes_inserted,
-             (unsigned long long)c.ways_routable,
-             (unsigned long long)c.data_blobs);
+    if (restrictions_only) {
+        LOG_INFO("PBF restrictions-only pass complete: %llu ways, %llu data blobs",
+                 (unsigned long long)c.ways_routable, (unsigned long long)c.data_blobs);
+    } else {
+        LOG_INFO("PBF import complete: %llu nodes, %llu ways, %llu data blobs",
+                 (unsigned long long)c.nodes_inserted,
+                 (unsigned long long)c.ways_routable,
+                 (unsigned long long)c.data_blobs);
+    }
     return 0;
 }
 
@@ -3182,7 +3757,47 @@ static int db_load_raw_graph(sqlite3 *db, VmrRawGraph *rg) {
         }
     }
     sqlite3_finalize(estmt);
-    LOG_INFO("Loaded raw SQLite graph: %u nodes, %u directed edges", rg->node_count, rg->edge_count);
+
+    sqlite3_stmt *tstmt = NULL;
+    if (sqlite3_prepare_v2(db, "SELECT via_node,from_node,to_node,mode FROM turn_restrictions;",
+                           -1, &tstmt, NULL) == SQLITE_OK) {
+        while (sqlite3_step(tstmt) == SQLITE_ROW) {
+            int64_t via = sqlite3_column_int64(tstmt, 0);
+            int64_t from = sqlite3_column_int64(tstmt, 1);
+            int64_t to = sqlite3_column_int64(tstmt, 2);
+            int mode = sqlite3_column_int(tstmt, 3);
+            uint32_t vi = idmap_get(&rg->osm_map, via);
+            uint32_t fi = idmap_get(&rg->osm_map, from);
+            uint32_t ti = idmap_get(&rg->osm_map, to);
+            if (vi == VMR_INVALID || fi == VMR_INVALID || ti == VMR_INVALID || vi == fi || vi == ti) {
+                continue;
+            }
+            if (rg->turn_count % 1024U == 0) {
+                uint32_t ncap = rg->turn_count ? rg->turn_count * 2U : 1024U;
+                uint32_t *tv = (uint32_t *)xrealloc(rg->turn_via, (size_t)ncap * sizeof(uint32_t));
+                uint32_t *tf = (uint32_t *)xrealloc(rg->turn_from, (size_t)ncap * sizeof(uint32_t));
+                uint32_t *tt = (uint32_t *)xrealloc(rg->turn_to, (size_t)ncap * sizeof(uint32_t));
+                uint8_t  *tm = (uint8_t *)xrealloc(rg->turn_mode, (size_t)ncap);
+                if (tv) rg->turn_via = tv;
+                if (tf) rg->turn_from = tf;
+                if (tt) rg->turn_to = tt;
+                if (tm) rg->turn_mode = tm;
+                if (!tv || !tf || !tt || !tm) {
+                    sqlite3_finalize(tstmt);
+                    return -1;
+                }
+            }
+            *(rg->turn_via + rg->turn_count) = vi;
+            *(rg->turn_from + rg->turn_count) = fi;
+            *(rg->turn_to + rg->turn_count) = ti;
+            *(rg->turn_mode + rg->turn_count) = (uint8_t)(mode ? 1 : 0);
+            rg->turn_count++;
+        }
+        sqlite3_finalize(tstmt);
+    }
+
+    LOG_INFO("Loaded raw SQLite graph: %u nodes, %u directed edges, %u turn restrictions",
+             rg->node_count, rg->edge_count, rg->turn_count);
     return 0;
 }
 
@@ -3404,6 +4019,46 @@ static inline float compute_8d_step_cost(const VmrGraph *g, uint32_t eid,
     return (cost > 0.01f) ? cost : 0.01f;
 }
 
+static float alt_heuristic(const VmrGraph *g, uint32_t u, int forward,
+                           const float *goal_fwd, const float *goal_bwd,
+                           uint32_t L) {
+    (void)forward;
+    size_t n = g->node_count;
+    const float *df = g->landmark_dist_fwd;
+    const float *db = g->landmark_dist_bwd;
+    float best = 0.0f;
+    for (uint32_t i = 0; i < L; i++) {
+        float a = *(goal_fwd + i);   /* dist(L, target) */
+        float b = *(goal_bwd + i);   /* dist(target, L) */
+        float x = *(df + (size_t)i * n + u); /* dist(L, u) */
+        float y = *(db + (size_t)i * n + u); /* dist(u, L) */
+        if (a < FLT_MAX * 0.5f && x < FLT_MAX * 0.5f) {
+            float d = a - x; /* dist(target) - dist(L,u) <= dist(u,target) */
+            if (d > best) best = d;
+        }
+        if (b < FLT_MAX * 0.5f && y < FLT_MAX * 0.5f) {
+            float d = y - b; /* dist(u,L) - dist(target,L) <= dist(u,target) */
+            if (d > best) best = d;
+        }
+    }
+    return best;
+}
+
+static inline int turn_forbidden(const VmrGraph *g, uint32_t via,
+                                 uint32_t from, uint32_t to) {
+    if (g->turn_count == 0 || g->turn_offsets == NULL) {
+        return 0;
+    }
+    uint32_t beg = *(g->turn_offsets + via);
+    uint32_t end = *(g->turn_offsets + via + 1U);
+    for (uint32_t i = beg; i < end; i++) {
+        if (*(g->turn_from + i) == from && *(g->turn_to + i) == to) {
+            return (*(g->turn_mode + i) == 0);
+        }
+    }
+    return 0;
+}
+
 static void vmr_compute_result_telemetry(const VmrGraph *g, VmrResult *res,
                                          const VmrPreference *pref) {
     if (!res->found || res->hop_count == 0) {
@@ -3472,6 +4127,84 @@ static void vmr_compute_result_telemetry(const VmrGraph *g, VmrResult *res,
     res->mean_8d_alignment= (tot_dist > 1e-3) ? (sum_8d_w / tot_dist) : 1.0;
 }
 
+/* Reusable search workspace: avoids ~14 allocations and a ~65 MB memset per
+ * query.  Generation stamps make visited/closed tests O(1) without clearing.
+ * The CLI is single-threaded; this is intentionally a process-global pool. */
+typedef struct {
+    size_t cap;
+    int ready;
+    uint32_t epoch;
+    float *g_fwd, *g_bwd;
+    float *mx_fwd, *my_fwd, *mx_bwd, *my_bwd;
+    uint32_t *p_fwd, *p_bwd;
+    uint32_t *pe_fwd, *pe_bwd;
+    uint32_t *st_fwd, *cl_fwd, *st_bwd, *cl_bwd;
+    MinHeap pq_fwd, pq_bwd;
+} VmrSearchWS;
+
+static VmrSearchWS g_ws;
+static int g_ws_atexit = 0;
+
+static void vmr_ws_free(void) {
+    xfree(g_ws.g_fwd); xfree(g_ws.g_bwd);
+    xfree(g_ws.mx_fwd); xfree(g_ws.my_fwd);
+    xfree(g_ws.mx_bwd); xfree(g_ws.my_bwd);
+    xfree(g_ws.p_fwd); xfree(g_ws.p_bwd);
+    xfree(g_ws.pe_fwd); xfree(g_ws.pe_bwd);
+    xfree(g_ws.st_fwd); xfree(g_ws.cl_fwd);
+    xfree(g_ws.st_bwd); xfree(g_ws.cl_bwd);
+    heap_free(&g_ws.pq_fwd);
+    heap_free(&g_ws.pq_bwd);
+    memset(&g_ws, 0, sizeof(g_ws));
+}
+
+static int vmr_ws_reserve(size_t n) {
+    if (!g_ws_atexit) {
+        atexit(vmr_ws_free);
+        g_ws_atexit = 1;
+    }
+    if (g_ws.ready && g_ws.cap >= n) {
+        return 0;
+    }
+    xfree(g_ws.g_fwd); xfree(g_ws.g_bwd);
+    xfree(g_ws.mx_fwd); xfree(g_ws.my_fwd);
+    xfree(g_ws.mx_bwd); xfree(g_ws.my_bwd);
+    xfree(g_ws.p_fwd); xfree(g_ws.p_bwd);
+    xfree(g_ws.pe_fwd); xfree(g_ws.pe_bwd);
+    xfree(g_ws.st_fwd); xfree(g_ws.cl_fwd);
+    xfree(g_ws.st_bwd); xfree(g_ws.cl_bwd);
+    heap_free(&g_ws.pq_fwd);
+    heap_free(&g_ws.pq_bwd);
+    memset(&g_ws, 0, sizeof(g_ws));
+    if (n == 0) {
+        n = 1;
+    }
+    g_ws.cap = n;
+    g_ws.g_fwd  = (float *)xmalloc(n * sizeof(float));
+    g_ws.g_bwd  = (float *)xmalloc(n * sizeof(float));
+    g_ws.mx_fwd = (float *)xcalloc(n, sizeof(float));
+    g_ws.my_fwd = (float *)xcalloc(n, sizeof(float));
+    g_ws.mx_bwd = (float *)xcalloc(n, sizeof(float));
+    g_ws.my_bwd = (float *)xcalloc(n, sizeof(float));
+    g_ws.p_fwd  = (uint32_t *)xmalloc(n * sizeof(uint32_t));
+    g_ws.p_bwd  = (uint32_t *)xmalloc(n * sizeof(uint32_t));
+    g_ws.pe_fwd = (uint32_t *)xmalloc(n * sizeof(uint32_t));
+    g_ws.pe_bwd = (uint32_t *)xmalloc(n * sizeof(uint32_t));
+    g_ws.st_fwd = (uint32_t *)xcalloc(n, sizeof(uint32_t));
+    g_ws.cl_fwd = (uint32_t *)xcalloc(n, sizeof(uint32_t));
+    g_ws.st_bwd = (uint32_t *)xcalloc(n, sizeof(uint32_t));
+    g_ws.cl_bwd = (uint32_t *)xcalloc(n, sizeof(uint32_t));
+    if (!g_ws.g_fwd || !g_ws.g_bwd || !g_ws.mx_fwd || !g_ws.my_fwd ||
+        !g_ws.mx_bwd || !g_ws.my_bwd || !g_ws.p_fwd || !g_ws.p_bwd ||
+        !g_ws.pe_fwd || !g_ws.pe_bwd || !g_ws.st_fwd || !g_ws.cl_fwd ||
+        !g_ws.st_bwd || !g_ws.cl_bwd ||
+        heap_init(&g_ws.pq_fwd, 256) != 0 || heap_init(&g_ws.pq_bwd, 256) != 0) {
+        return -1;
+    }
+    g_ws.ready = 1;
+    return 0;
+}
+
 /*
  * Primary Pathfinding Entrypoint:
  *   MODE_VEC_BIDIR  -> Bidirectional 8D Vector-Corridor Search
@@ -3519,72 +4252,60 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
     float gx = *(g->node_x + goal_idx),  gy = *(g->node_y + goal_idx);
     float chord_dx = gx - sx;
     float chord_dy = gy - sy;
-    float chord_len = sqrtf(chord_dx * chord_dx + chord_dy * chord_dy);
+    float chord_len = vmr_sqrt_fast(chord_dx * chord_dx + chord_dy * chord_dy);
     float inv_chord = (chord_len > 1.0f) ? (1.0f / chord_len) : 1.0f;
 
-    /* Forward search state */
-    float    *g_fwd  = (float *)xmalloc((size_t)n * sizeof(float));
-    uint32_t *p_fwd  = (uint32_t *)xmalloc((size_t)n * sizeof(uint32_t));
-    uint32_t *pe_fwd = (uint32_t *)xmalloc((size_t)n * sizeof(uint32_t));
-    float    *mx_fwd = (float *)xcalloc(n, sizeof(float));
-    float    *my_fwd = (float *)xcalloc(n, sizeof(float));
-    uint8_t  *cl_fwd = (uint8_t *)xcalloc(n, sizeof(uint8_t));
-    MinHeap pq_fwd;
-
-    if (!g_fwd || !p_fwd || !pe_fwd || !mx_fwd || !my_fwd || !cl_fwd ||
-        heap_init(&pq_fwd, 256) != 0) {
-        xfree(g_fwd); xfree(p_fwd); xfree(pe_fwd); xfree(mx_fwd); xfree(my_fwd); xfree(cl_fwd);
-        heap_free(&pq_fwd);
+    if (vmr_ws_reserve(n) != 0) {
+        LOG_ERR("OOM: search workspace");
         return -1;
     }
-    for (uint32_t i = 0; i < n; i++) {
-        *(g_fwd + i)  = FLT_MAX;
-        *(p_fwd + i)  = VMR_INVALID;
-        *(pe_fwd + i) = VMR_INVALID;
+    VmrSearchWS *ws = &g_ws;
+    uint32_t epoch;
+    if (ws->epoch == UINT32_MAX) {
+        memset(ws->st_fwd, 0, (size_t)n * sizeof(uint32_t));
+        memset(ws->cl_fwd, 0, (size_t)n * sizeof(uint32_t));
+        memset(ws->st_bwd, 0, (size_t)n * sizeof(uint32_t));
+        memset(ws->cl_bwd, 0, (size_t)n * sizeof(uint32_t));
+        ws->epoch = 0;
     }
+    epoch = ++ws->epoch;
+    ws->pq_fwd.size = 0;
+    ws->pq_bwd.size = 0;
 
-    /* Backward search state (allocated only for MODE_VEC_BIDIR) */
-    float    *g_bwd  = NULL;
-    uint32_t *p_bwd  = NULL;
-    uint32_t *pe_bwd = NULL;
-    float    *mx_bwd = NULL;
-    float    *my_bwd = NULL;
-    uint8_t  *cl_bwd = NULL;
-    MinHeap pq_bwd;
-    memset(&pq_bwd, 0, sizeof(pq_bwd));
+    float    *g_fwd  = ws->g_fwd;
+    uint32_t *p_fwd  = ws->p_fwd;
+    uint32_t *pe_fwd = ws->pe_fwd;
+    float    *mx_fwd = ws->mx_fwd;
+    float    *my_fwd = ws->my_fwd;
+    uint32_t *st_fwd = ws->st_fwd;
+    uint32_t *cl_fwd = ws->cl_fwd;
+    MinHeap  *pq_fwd = &ws->pq_fwd;
 
-    if (query->mode == MODE_VEC_BIDIR) {
-        g_bwd  = (float *)xmalloc((size_t)n * sizeof(float));
-        p_bwd  = (uint32_t *)xmalloc((size_t)n * sizeof(uint32_t));
-        pe_bwd = (uint32_t *)xmalloc((size_t)n * sizeof(uint32_t));
-        mx_bwd = (float *)xcalloc(n, sizeof(float));
-        my_bwd = (float *)xcalloc(n, sizeof(float));
-        cl_bwd = (uint8_t *)xcalloc(n, sizeof(uint8_t));
-        if (!g_bwd || !p_bwd || !pe_bwd || !mx_bwd || !my_bwd || !cl_bwd ||
-            heap_init(&pq_bwd, 256) != 0) {
-            xfree(g_fwd); xfree(p_fwd); xfree(pe_fwd); xfree(mx_fwd); xfree(my_fwd); xfree(cl_fwd);
-            heap_free(&pq_fwd);
-            xfree(g_bwd); xfree(p_bwd); xfree(pe_bwd); xfree(mx_bwd); xfree(my_bwd); xfree(cl_bwd);
-            heap_free(&pq_bwd);
-            return -1;
-        }
-        for (uint32_t i = 0; i < n; i++) {
-            *(g_bwd + i)  = FLT_MAX;
-            *(p_bwd + i)  = VMR_INVALID;
-            *(pe_bwd + i) = VMR_INVALID;
-        }
-    }
+    float    *g_bwd  = ws->g_bwd;
+    uint32_t *p_bwd  = ws->p_bwd;
+    uint32_t *pe_bwd = ws->pe_bwd;
+    float    *mx_bwd = ws->mx_bwd;
+    float    *my_bwd = ws->my_bwd;
+    uint32_t *st_bwd = ws->st_bwd;
+    uint32_t *cl_bwd = ws->cl_bwd;
+    MinHeap  *pq_bwd = &ws->pq_bwd;
 
+    *(st_fwd + start_idx) = epoch;
     *(g_fwd + start_idx)  = 0.0f;
+    *(p_fwd + start_idx)  = VMR_INVALID;
+    *(pe_fwd + start_idx) = VMR_INVALID;
     *(mx_fwd + start_idx) = chord_dx * inv_chord;
     *(my_fwd + start_idx) = chord_dy * inv_chord;
-    heap_push(&pq_fwd, start_idx, 0.0f);
+    heap_push(pq_fwd, start_idx, 0.0f);
 
     if (query->mode == MODE_VEC_BIDIR) {
+        *(st_bwd + goal_idx) = epoch;
         *(g_bwd + goal_idx)  = 0.0f;
+        *(p_bwd + goal_idx)  = VMR_INVALID;
+        *(pe_bwd + goal_idx) = VMR_INVALID;
         *(mx_bwd + goal_idx) = -chord_dx * inv_chord;
         *(my_bwd + goal_idx) = -chord_dy * inv_chord;
-        heap_push(&pq_bwd, goal_idx, 0.0f);
+        heap_push(pq_bwd, goal_idx, 0.0f);
     }
 
     uint32_t expanded = 0;
@@ -3606,13 +4327,30 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
     const float v_heur = (query->mode == MODE_DIJKSTRA)
                        ? 0.0f : (attr_scale_min / max_speed_mps);
 
+    float alt_gf[16], alt_gb[16], alt_sf[16], alt_sb[16];
+    uint32_t L = g->landmark_count;
+    int has_alt = (L > 0 && g->landmark_dist_fwd && g->landmark_dist_bwd);
+    float alt_scale = (query->mode == MODE_DIJKSTRA) ? 1.0f : attr_scale_min;
+    if (has_alt) {
+        if (L > 16) {
+            L = 16;
+        }
+        size_t nn = g->node_count;
+        for (uint32_t i = 0; i < L; i++) {
+            *(alt_gf + i) = *(g->landmark_dist_fwd + (size_t)i * nn + goal_idx);
+            *(alt_gb + i) = *(g->landmark_dist_bwd + (size_t)i * nn + goal_idx);
+            *(alt_sf + i) = *(g->landmark_dist_fwd + (size_t)i * nn + start_idx);
+            *(alt_sb + i) = *(g->landmark_dist_bwd + (size_t)i * nn + start_idx);
+        }
+    }
+
     if (query->mode != MODE_VEC_BIDIR) {
         /* Unidirectional Vector-Corridor or Dijkstra */
         HeapEntry top;
-        while (heap_pop(&pq_fwd, &top)) {
+        while (heap_pop(pq_fwd, &top)) {
             uint32_t u = top.node;
-            if (*(cl_fwd + u)) continue;
-            *(cl_fwd + u) = 1;
+            if (*(cl_fwd + u) == epoch) continue;
+            *(cl_fwd + u) = epoch;
             expanded++;
             if (u == goal_idx) {
                 meet_node = goal_idx;
@@ -3621,7 +4359,7 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
 
             float ux_pos = *(g->node_x + u), uy_pos = *(g->node_y + u);
             float rx = gx - ux_pos, ry = gy - uy_pos;
-            float rinv = 1.0f / (sqrtf(rx * rx + ry * ry) + EPS_F);
+            float rinv = vmr_inv_sqrt(rx * rx + ry * ry + EPS_F);
             float urx = rx * rinv, ury = ry * rinv;
             float umx = *(mx_fwd + u), umy = *(my_fwd + u);
 
@@ -3629,8 +4367,9 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
             uint32_t end = *(g->fwd_offsets + u + 1U);
             for (uint32_t ei = beg; ei < end; ei++) {
                 uint32_t v = *(g->edge_to + ei);
-                if (*(cl_fwd + v)) continue;
+                if (*(cl_fwd + v) == epoch) continue;
                 if (skip_dead && (*(g->node_flags + v) & NODE_DEAD_TREE)) continue;
+                if (*(p_fwd + u) != VMR_INVALID && turn_forbidden(g, u, *(p_fwd + u), v)) continue;
 
                 float eux = *(g->edge_ux + ei), euy = *(g->edge_uy + ei);
                 float cos1 = eux * urx + euy * ury;
@@ -3650,32 +4389,37 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
                 float sc = compute_8d_step_cost(g, ei, &query->pref, query->mode,
                                                 cos1, cos2, mom, cross_ratio);
                 float ng = *(g_fwd + u) + sc;
-                if (ng < *(g_fwd + v)) {
-                    *(g_fwd + v)  = ng;
-                    *(p_fwd + v)  = u;
-                    *(pe_fwd + v) = ei;
+                if (*(st_fwd + v) != epoch || ng < *(g_fwd + v)) {
+                    *(st_fwd + v)  = epoch;
+                    *(g_fwd + v)   = ng;
+                    *(p_fwd + v)   = u;
+                    *(pe_fwd + v)  = ei;
                     float nmx = 0.65f * umx + 0.35f * eux;
                     float nmy = 0.65f * umy + 0.35f * euy;
-                    float mn = 1.0f / (sqrtf(nmx * nmx + nmy * nmy) + EPS_F);
+                    float mn = vmr_inv_sqrt(nmx * nmx + nmy * nmy + EPS_F);
                     *(mx_fwd + v) = nmx * mn;
                     *(my_fwd + v) = nmy * mn;
 
                     float h = 0.0f;
-                    if (query->mode == MODE_VEC_UNIDIR) {
+                    if (has_alt) {
+                        h = alt_heuristic(g, v, 1, alt_gf, alt_gb, L) * alt_scale;
+                    } else if (query->mode == MODE_VEC_UNIDIR) {
                         float rvx = gx - *(g->node_x + v);
                         float rvy = gy - *(g->node_y + v);
-                        h = sqrtf(rvx * rvx + rvy * rvy) * v_heur;
+                        h = vmr_sqrt_fast(rvx * rvx + rvy * rvy) * v_heur;
                     }
-                    heap_push(&pq_fwd, v, ng + h);
+                    if (ng + h < best_total) {
+                        heap_push(pq_fwd, v, ng + h);
+                    }
                 }
             }
         }
     } else {
         /* Bidirectional 8D Vector-Corridor Search */
         int turn = 0;
-        while (pq_fwd.size > 0 && pq_bwd.size > 0) {
+        while (pq_fwd->size > 0 && pq_bwd->size > 0) {
             if (meet_node != VMR_INVALID) {
-                float top_f = pq_fwd.buf->prio + pq_bwd.buf->prio;
+                float top_f = pq_fwd->buf->prio + pq_bwd->buf->prio;
                 /* With an admissible h, f = g + h never exceeds the true cost,
                  * so this is the safe termination test (no arbitrary factor). */
                 if (top_f >= best_total) {
@@ -3686,13 +4430,13 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
             turn ^= 1;
             if (turn == 1) {
                 HeapEntry top;
-                if (!heap_pop(&pq_fwd, &top)) break;
+                if (!heap_pop(pq_fwd, &top)) break;
                 uint32_t u = top.node;
-                if (*(cl_fwd + u)) continue;
-                *(cl_fwd + u) = 1;
+                if (*(cl_fwd + u) == epoch) continue;
+                *(cl_fwd + u) = epoch;
                 expanded++;
 
-                if (*(g_bwd + u) < FLT_MAX) {
+                if (*(st_bwd + u) == epoch && *(g_bwd + u) < FLT_MAX) {
                     float tot = *(g_fwd + u) + *(g_bwd + u);
                     if (tot < best_total) {
                         best_total = tot;
@@ -3702,7 +4446,7 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
 
                 float ux_pos = *(g->node_x + u), uy_pos = *(g->node_y + u);
                 float rx = gx - ux_pos, ry = gy - uy_pos;
-                float rinv = 1.0f / (sqrtf(rx * rx + ry * ry) + EPS_F);
+                float rinv = vmr_inv_sqrt(rx * rx + ry * ry + EPS_F);
                 float urx = rx * rinv, ury = ry * rinv;
                 float umx = *(mx_fwd + u), umy = *(my_fwd + u);
 
@@ -3710,8 +4454,9 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
                 uint32_t end = *(g->fwd_offsets + u + 1U);
                 for (uint32_t ei = beg; ei < end; ei++) {
                     uint32_t v = *(g->edge_to + ei);
-                    if (*(cl_fwd + v)) continue;
+                    if (*(cl_fwd + v) == epoch) continue;
                     if (skip_dead && (*(g->node_flags + v) & NODE_DEAD_TREE)) continue;
+                if (*(p_fwd + u) != VMR_INVALID && turn_forbidden(g, u, *(p_fwd + u), v)) continue;
 
                     float eux = *(g->edge_ux + ei), euy = *(g->edge_uy + ei);
                     float cos1 = eux * urx + euy * ury;
@@ -3730,17 +4475,18 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
                     float sc = compute_8d_step_cost(g, ei, &query->pref, MODE_VEC_BIDIR,
                                                     cos1, cos2, mom, cross_ratio);
                     float ng = *(g_fwd + u) + sc;
-                    if (ng < *(g_fwd + v)) {
-                        *(g_fwd + v)  = ng;
-                        *(p_fwd + v)  = u;
-                        *(pe_fwd + v) = ei;
+                    if (*(st_fwd + v) != epoch || ng < *(g_fwd + v)) {
+                        *(st_fwd + v)  = epoch;
+                        *(g_fwd + v)   = ng;
+                        *(p_fwd + v)   = u;
+                        *(pe_fwd + v)  = ei;
                         float nmx = 0.65f * umx + 0.35f * eux;
                         float nmy = 0.65f * umy + 0.35f * euy;
-                        float mn = 1.0f / (sqrtf(nmx * nmx + nmy * nmy) + EPS_F);
+                        float mn = vmr_inv_sqrt(nmx * nmx + nmy * nmy + EPS_F);
                         *(mx_fwd + v) = nmx * mn;
                         *(my_fwd + v) = nmy * mn;
 
-                        if (*(g_bwd + v) < FLT_MAX) {
+                        if (*(st_bwd + v) == epoch && *(g_bwd + v) < FLT_MAX) {
                             float tot = ng + *(g_bwd + v);
                             if (tot < best_total) {
                                 best_total = tot;
@@ -3749,19 +4495,23 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
                         }
                         float rvx = gx - *(g->node_x + v);
                         float rvy = gy - *(g->node_y + v);
-                        float h = sqrtf(rvx * rvx + rvy * rvy) * v_heur;
-                        heap_push(&pq_fwd, v, ng + h);
+                        float h = has_alt
+                            ? alt_heuristic(g, v, 1, alt_gf, alt_gb, L) * alt_scale
+                            : vmr_sqrt_fast(rvx * rvx + rvy * rvy) * v_heur;
+                        if (ng + h < best_total) {
+                            heap_push(pq_fwd, v, ng + h);
+                        }
                     }
                 }
             } else {
                 HeapEntry top;
-                if (!heap_pop(&pq_bwd, &top)) break;
+                if (!heap_pop(pq_bwd, &top)) break;
                 uint32_t w = top.node;
-                if (*(cl_bwd + w)) continue;
-                *(cl_bwd + w) = 1;
+                if (*(cl_bwd + w) == epoch) continue;
+                *(cl_bwd + w) = epoch;
                 expanded++;
 
-                if (*(g_fwd + w) < FLT_MAX) {
+                if (*(st_fwd + w) == epoch && *(g_fwd + w) < FLT_MAX) {
                     float tot = *(g_fwd + w) + *(g_bwd + w);
                     if (tot < best_total) {
                         best_total = tot;
@@ -3771,7 +4521,7 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
 
                 float wx_pos = *(g->node_x + w), wy_pos = *(g->node_y + w);
                 float rx = sx - wx_pos, ry = sy - wy_pos;
-                float rinv = 1.0f / (sqrtf(rx * rx + ry * ry) + EPS_F);
+                float rinv = vmr_inv_sqrt(rx * rx + ry * ry + EPS_F);
                 float urx = rx * rinv, ury = ry * rinv;
                 float wmx = *(mx_bwd + w), wmy = *(my_bwd + w);
 
@@ -3779,8 +4529,10 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
                 uint32_t end = *(g->rev_offsets + w + 1U);
                 for (uint32_t ri = beg; ri < end; ri++) {
                     uint32_t u = *(g->rev_src_node + ri);
-                    if (*(cl_bwd + u)) continue;
+                    if (*(cl_bwd + u) == epoch) continue;
                     if (skip_dead && (*(g->node_flags + u) & NODE_DEAD_TREE)) continue;
+                    uint32_t next_w = *(p_bwd + w);
+                    if (next_w != VMR_INVALID && turn_forbidden(g, w, u, next_w)) continue;
 
                     uint32_t eid = *(g->rev_fwd_eid + ri);
                     /* Moving backward w -> u reverses the edge's unit vector */
@@ -3802,17 +4554,18 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
                     float sc = compute_8d_step_cost(g, eid, &query->pref, MODE_VEC_BIDIR,
                                                     cos1, cos2, mom, cross_ratio);
                     float ng = *(g_bwd + w) + sc;
-                    if (ng < *(g_bwd + u)) {
-                        *(g_bwd + u)  = ng;
-                        *(p_bwd + u)  = w;
-                        *(pe_bwd + u) = eid;
+                    if (*(st_bwd + u) != epoch || ng < *(g_bwd + u)) {
+                        *(st_bwd + u)  = epoch;
+                        *(g_bwd + u)   = ng;
+                        *(p_bwd + u)   = w;
+                        *(pe_bwd + u)  = eid;
                         float nmx = 0.65f * wmx + 0.35f * eux;
                         float nmy = 0.65f * wmy + 0.35f * euy;
-                        float mn = 1.0f / (sqrtf(nmx * nmx + nmy * nmy) + EPS_F);
+                        float mn = vmr_inv_sqrt(nmx * nmx + nmy * nmy + EPS_F);
                         *(mx_bwd + u) = nmx * mn;
                         *(my_bwd + u) = nmy * mn;
 
-                        if (*(g_fwd + u) < FLT_MAX) {
+                        if (*(st_fwd + u) == epoch && *(g_fwd + u) < FLT_MAX) {
                             float tot = *(g_fwd + u) + ng;
                             if (tot < best_total) {
                                 best_total = tot;
@@ -3821,8 +4574,12 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
                         }
                         float rux = sx - *(g->node_x + u);
                         float ruy = sy - *(g->node_y + u);
-                        float h = sqrtf(rux * rux + ruy * ruy) * v_heur;
-                        heap_push(&pq_bwd, u, ng + h);
+                        float h = has_alt
+                            ? alt_heuristic(g, u, 0, alt_sf, alt_sb, L) * alt_scale
+                            : vmr_sqrt_fast(rux * rux + ruy * ruy) * v_heur;
+                        if (ng + h < best_total) {
+                            heap_push(pq_bwd, u, ng + h);
+                        }
                     }
                 }
             }
@@ -3884,10 +4641,6 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
         vmr_compute_result_telemetry(g, res, &query->pref);
     }
 
-    xfree(g_fwd); xfree(p_fwd); xfree(pe_fwd); xfree(mx_fwd); xfree(my_fwd); xfree(cl_fwd);
-    heap_free(&pq_fwd);
-    xfree(g_bwd); xfree(p_bwd); xfree(pe_bwd); xfree(mx_bwd); xfree(my_bwd); xfree(cl_bwd);
-    heap_free(&pq_bwd);
     return 0;
 }
 
@@ -4174,6 +4927,7 @@ static int run_self_tests(void) {
 
     vmr_graph_free(&g);
     sqlite3_close(db);
+    vmr_ws_free();
     LOG_INFO("All self-tests PASSED.");
     return 0;
 }
@@ -4187,6 +4941,7 @@ static void print_usage(const char *prog) {
         "  --init-uk-demo                Seed built-in UK inter-city demo map\n"
         "  --import-osm <file>           Import Geofabrik UK OSM XML (.osm) highway network\n"
         "  --import-pbf <file>           Import Geofabrik UK OSM PBF (.osm.pbf) highway network\n"
+        "  --apply-turn-restrictions <file>  Add PBF turn restrictions to an existing DB\n"
         "  --import-csv <nodes> <edges>  Import CSV (id,lat,lon / u,v,class,kmh,smooth,flags)\n"
         "  --preprocess                  Run TM projection, contraction, 1-core peel, SoA pack\n"
         "  --save-bin <file.vgraph>      Save preprocessed SoA binary cache\n"
@@ -4213,6 +4968,7 @@ int main(int argc, char **argv) {
     const char *db_path    = "uk_roadmap.db";
     const char *osm_path   = NULL;
     const char *pbf_path   = NULL;
+    int pbf_restrictions_only = 0;
     const char *csv_nodes  = NULL;
     const char *csv_edges  = NULL;
     const char *save_bin   = NULL;
@@ -4252,6 +5008,9 @@ int main(int argc, char **argv) {
             }
         } else if (strcmp(a, "--import-pbf") == 0 && i + 1 < argc) {
             pbf_path = *(argv + (++i));
+        } else if (strcmp(a, "--apply-turn-restrictions") == 0 && i + 1 < argc) {
+            pbf_path = *(argv + (++i));
+            pbf_restrictions_only = 1;
         } else if (strcmp(a, "--import-csv") == 0 && i + 2 < argc) {
             csv_nodes = *(argv + (++i));
             csv_edges = *(argv + (++i));
@@ -4316,7 +5075,7 @@ int main(int argc, char **argv) {
         if (do_demo && db_seed_uk_demo(db) != 0) {
             sqlite3_close(db); return 1;
         }
-        if (pbf_path && db_import_osm_pbf(db, pbf_path) != 0) {
+        if (pbf_path && db_import_osm_pbf(db, pbf_path, pbf_restrictions_only) != 0) {
             sqlite3_close(db); return 1;
         }
         if (osm_path && db_import_osm_xml(db, osm_path) != 0) {
@@ -4372,6 +5131,7 @@ int main(int argc, char **argv) {
         run_interactive_shell(&graph);
     }
 
+    vmr_ws_free();
     vmr_graph_free(&graph);
     if (g_mem.active != 0) {
         LOG_WARN("Unfreed allocations: %zu (%zu bytes)", g_mem.active, g_mem.cur_bytes);

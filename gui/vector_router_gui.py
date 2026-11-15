@@ -40,7 +40,7 @@ import zlib
 APP_TITLE = "UK Vector Router - Performance Lab"
 APP_VERSION = "1.0"
 
-VGRAPH_MAGIC = 0x564D5232  # "VMR2"
+VGRAPH_MAGIC = 0x564D5234  # "VMR4"
 VGRAPH_HEADER = struct.Struct("=9I4f")
 
 ROOT = Path(__file__).resolve().parent.parent
