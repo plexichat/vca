@@ -2524,7 +2524,33 @@ static void vmr_reorder_graph(VmrGraph *g) {
         uint32_t hy = (uint32_t)((*(g->node_y + i) - miny) * scy);
         hn[i].d = vmr_hilbert_xy2d(hx, hy, 16);
     }
-    qsort(hn, n, sizeof(VmrHNode), vmr_hnode_cmp);
+    /* O(n) LSD radix sort by the 32-bit Hilbert key (faster than qsort's O(n log n)). */
+    {
+        VmrHNode *tmp = (VmrHNode *)xmalloc((size_t)n * sizeof(VmrHNode));
+        uint32_t *cnt = (uint32_t *)xmalloc(65536 * sizeof(uint32_t));
+        if (tmp && cnt) {
+            for (int pass = 0; pass < 2; pass++) {
+                memset(cnt, 0, 65536 * sizeof(uint32_t));
+                int shift = pass * 16;
+                for (uint32_t i = 0; i < n; i++) {
+                    (*(cnt + ((hn[i].d >> shift) & 0xFFFFu)))++;
+                }
+                uint32_t sum = 0;
+                for (uint32_t j = 0; j < 65536; j++) {
+                    uint32_t c = *(cnt + j);
+                    *(cnt + j) = sum;
+                    sum += c;
+                }
+                for (uint32_t i = 0; i < n; i++) {
+                    uint32_t k = (hn[i].d >> shift) & 0xFFFFu;
+                    *(tmp + (*(cnt + k))++) = hn[i];
+                }
+                VmrHNode *sw = hn; hn = tmp; tmp = sw;
+            }
+        }
+        xfree(tmp);
+        xfree(cnt);
+    }
     for (uint32_t i = 0; i < n; i++) {
         uint32_t old = hn[i].id;
         perm[old] = i;
