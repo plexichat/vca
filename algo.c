@@ -484,6 +484,64 @@ static void heap_free(MinHeap *h) {
     h->cap = 0;
 }
 
+/* Drop stale (superceded) entries, keeping only the minimum-priority entry per
+ * node, then re-heapify.  Prevents unbounded growth from lazy deletion. */
+static void heap_compact_min(MinHeap *h, uint32_t n) {
+    size_t sz = h->size;
+    if (sz <= (size_t)n * 2U || sz == 0) {
+        return;
+    }
+    float *bp = (float *)xmalloc((size_t)n * sizeof(float));
+    uint8_t *seen = (uint8_t *)xcalloc(n, 1);
+    if (!bp || !seen) {
+        xfree(bp); xfree(seen);
+        return;
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        bp[i] = FLT_MAX;
+    }
+    HeapEntry *b = h->buf;
+    for (size_t i = 0; i < sz; i++) {
+        uint32_t nd = b[i].node;
+        if (nd < n && b[i].prio < bp[nd]) {
+            bp[nd] = b[i].prio;
+        }
+    }
+    size_t w = 0;
+    for (size_t i = 0; i < sz; i++) {
+        uint32_t nd = b[i].node;
+        if (nd < n && !seen[nd] && b[i].prio == bp[nd]) {
+            seen[nd] = 1;
+            b[w++] = b[i];
+        }
+    }
+    h->size = w;
+    xfree(bp);
+    xfree(seen);
+    /* re-heapify (bottom-up) */
+    for (size_t i = h->size / 2; i-- > 0;) {
+        size_t idx = i;
+        while (1) {
+            size_t child = idx * 4 + 1;
+            if (child >= h->size) {
+                break;
+            }
+            size_t end = child + 4;
+            if (end > h->size) end = h->size;
+            size_t best = child;
+            for (size_t c = child + 1; c < end; c++) {
+                if (b[c].prio < b[best].prio) best = c;
+            }
+            if (b[best].prio < b[idx].prio) {
+                HeapEntry tmp = b[idx]; b[idx] = b[best]; b[best] = tmp;
+                idx = best;
+            } else {
+                break;
+            }
+        }
+    }
+}
+
 static int heap_push(MinHeap *h, uint32_t node, float prio) {
     if (h->size >= h->cap) {
         size_t ncap = h->cap * 2;
@@ -868,6 +926,7 @@ typedef struct {
 
     /* Vector-aware contraction hierarchy (shortcuts carry the same 8D features) */
     uint32_t  ch_built;
+    uint32_t  cch_built;
     uint32_t *ch_level;
     uint32_t  ch_edge_count;
     uint32_t *ch_from;
@@ -1075,17 +1134,19 @@ static void vmr_graph_free(VmrGraph *g) {
     xfree(g->turn_from);
     xfree(g->turn_to);
     xfree(g->turn_mode);
-    xfree(g->ch_level);
-    xfree(g->ch_from);
-    xfree(g->ch_to);
-    xfree(g->ch_time);
-    xfree(g->ch_fwd_off);
-    xfree(g->ch_rev_off);
-    xfree(g->ch_rev_src);
-    xfree(g->ch_rev_eid);
-    xfree(g->ch_via);
-    xfree(g->ch_child1);
-    xfree(g->ch_child2);
+    if (!g->map) {
+        xfree(g->ch_level);
+        xfree(g->ch_from);
+        xfree(g->ch_to);
+        xfree(g->ch_time);
+        xfree(g->ch_fwd_off);
+        xfree(g->ch_rev_off);
+        xfree(g->ch_rev_src);
+        xfree(g->ch_rev_eid);
+        xfree(g->ch_via);
+        xfree(g->ch_child1);
+        xfree(g->ch_child2);
+    }
     for (int i = 0; i < 5; i++) {
         xfree(g->edge_attr_scale[i]);
     }
@@ -1507,7 +1568,12 @@ static int ch_contract_node(ChAdj *a, uint32_t u, uint8_t *contracted,
                     ex->dx = dx;
                     ex->dy = dy;
                     ex->flags = (uint8_t)(x->flags | y->flags);
-                    /* Keep the original child DAG: updating children can create cycles. */
+                    /* Rebind the shortcut to the shorter path's children (e1,e2
+                     * are strict sub-edges of r->u and u->t, so this cannot form
+                     * a cycle).  Keeping stale children made unpack explode. */
+                    ex->via = u;
+                    ex->child1 = e1;
+                    ex->child2 = e2;
                 }
             } else {
                 uint32_t sid = ch_adj_add(a, uu, vv, len, t, fs, fc, fm, dx, dy,
@@ -1540,6 +1606,17 @@ static int ch_contract_node(ChAdj *a, uint32_t u, uint8_t *contracted,
 static int cmp_ch_packed(const void *pa, const void *pb) {
     const ChPacked *a = (const ChPacked *)pa;
     const ChPacked *b = (const ChPacked *)pb;
+    if (a->from < b->from) return -1;
+    if (a->from > b->from) return 1;
+    if (a->to < b->to) return -1;
+    if (a->to > b->to) return 1;
+    return 0;
+}
+
+typedef struct { uint32_t from, to, old; } CchSortIdx;
+static int cmp_cchsort(const void *pa, const void *pb) {
+    const CchSortIdx *a = (const CchSortIdx *)pa;
+    const CchSortIdx *b = (const CchSortIdx *)pb;
     if (a->from < b->from) return -1;
     if (a->from > b->from) return 1;
     if (a->to < b->to) return -1;
@@ -1804,6 +1881,7 @@ static __attribute__((unused)) int vmr_build_ch(VmrGraph *g) {
     uint32_t counter = 0;
     HeapEntry top;
     while (heap_pop(&pq, &top)) {
+        heap_compact_min(&pq, n);
         uint32_t u = top.node;
         if (*(contracted + u) || top.prio != *(cur + u)) {
             continue;
@@ -1839,18 +1917,24 @@ static __attribute__((unused)) int vmr_build_ch(VmrGraph *g) {
         if (total == 0) {
             goto fail;
         }
-        ChPacked *packed = (ChPacked *)xmalloc(total * sizeof(ChPacked));
-        if (!packed) {
+        /* Sort edges by (from,to) so the forward CSR groups each node's out-edges
+         * contiguously, and REMAP every shortcut's child1/child2 through the same
+         * permutation (otherwise children point at the wrong edge -> cycles). */
+        CchSortIdx *sarr = (CchSortIdx *)xmalloc(total * sizeof(CchSortIdx));
+        uint32_t *newpos = (uint32_t *)xmalloc(total * sizeof(uint32_t));
+        if (!sarr || !newpos) {
+            xfree(sarr); xfree(newpos);
             goto fail;
         }
         for (size_t e = 0; e < total; e++) {
-            ChEdge *ce = a.edges + e;
-            *(packed + e) = (ChPacked){
-                ce->from, ce->to, 0.0f, ce->time_s, 0.0f, 0.0f, 0.0f, 0,
-                ce->via, ce->child1, ce->child2
-            };
+            sarr[e].from = a.edges[e].from;
+            sarr[e].to   = a.edges[e].to;
+            sarr[e].old  = (uint32_t)e;
         }
-        qsort(packed, total, sizeof(ChPacked), cmp_ch_packed);
+        qsort(sarr, total, sizeof(CchSortIdx), cmp_cchsort);
+        for (size_t j = 0; j < total; j++) {
+            *(newpos + sarr[j].old) = (uint32_t)j;
+        }
 
         uint32_t *cfrom = (uint32_t *)xmalloc(total * sizeof(uint32_t));
         uint32_t *cto = (uint32_t *)xmalloc(total * sizeof(uint32_t));
@@ -1860,20 +1944,23 @@ static __attribute__((unused)) int vmr_build_ch(VmrGraph *g) {
         uint32_t *cc2 = (uint32_t *)xmalloc(total * sizeof(uint32_t));
         uint32_t *coff = (uint32_t *)xcalloc((size_t)n + 1U, sizeof(uint32_t));
         if (!cfrom || !cto || !ctime || !cvia || !cc1 || !cc2 || !coff) {
-            xfree(packed); xfree(cfrom); xfree(cto); xfree(ctime); xfree(coff);
+            xfree(sarr); xfree(newpos);
+            xfree(cfrom); xfree(cto); xfree(ctime); xfree(coff);
             xfree(cvia); xfree(cc1); xfree(cc2);
             goto fail;
         }
-        for (size_t i = 0; i < total; i++) {
-            ChPacked *p = packed + i;
-            *(cfrom + i) = p->from;
-            *(cto + i) = p->to;
-            *(ctime + i) = p->time_s;
-            *(cvia + i) = p->via;
-            *(cc1 + i) = p->child1;
-            *(cc2 + i) = p->child2;
-            (*(coff + p->from + 1U))++;
+        for (size_t j = 0; j < total; j++) {
+            ChEdge *ce = a.edges + sarr[j].old;
+            *(cfrom + j) = ce->from;
+            *(cto + j)   = ce->to;
+            *(ctime + j) = ce->time_s;
+            *(cvia + j)  = ce->via;
+            *(cc1 + j)   = (ce->child1 == VMR_INVALID) ? VMR_INVALID : *(newpos + ce->child1);
+            *(cc2 + j)   = (ce->child2 == VMR_INVALID) ? VMR_INVALID : *(newpos + ce->child2);
+            (*(coff + ce->from + 1U))++;
         }
+        xfree(sarr);
+        xfree(newpos);
         for (uint32_t i = 0; i < n; i++) {
             *(coff + i + 1U) += *(coff + i);
         }
@@ -1883,7 +1970,7 @@ static __attribute__((unused)) int vmr_build_ch(VmrGraph *g) {
         uint32_t *reid = (uint32_t *)xmalloc(total * sizeof(uint32_t));
         uint32_t *rpos = (uint32_t *)xmalloc((size_t)n * sizeof(uint32_t));
         if (!roff || !rsrc || !reid || !rpos) {
-            xfree(packed); xfree(cfrom); xfree(cto); xfree(ctime); xfree(coff);
+            xfree(cfrom); xfree(cto); xfree(ctime); xfree(coff);
             xfree(cvia); xfree(cc1); xfree(cc2);
             xfree(roff); xfree(rsrc); xfree(reid); xfree(rpos);
             goto fail;
@@ -1919,8 +2006,7 @@ static __attribute__((unused)) int vmr_build_ch(VmrGraph *g) {
         g->ch_child1 = cc1;
         g->ch_child2 = cc2;
         g->ch_level = level;
-        g->ch_built = 1;
-        xfree(packed);
+        g->cch_built = 1;
     }
 
     xfree(contracted); xfree(cur); xfree(delay);
@@ -3341,7 +3427,7 @@ static int vmr_save_binary(const VmrGraph *g, const char *path) {
         ok &= (fwrite(g->turn_mode,    sizeof(uint8_t),  tc, fp) == tc);
     }
 
-    uint32_t cb = g->ch_built ? 1U : 0U;
+    uint32_t cb = g->cch_built ? 1U : 0U;
     ok &= (fwrite(&cb, sizeof(uint32_t), 1, fp) == 1);
     if (cb && n > 0) {
         uint32_t ce = g->ch_edge_count;
@@ -3542,34 +3628,22 @@ static int vmr_load_binary(VmrGraph *g, const char *path) {
         if (off + 4 <= (size_t)fsz.QuadPart) { cb = *(const uint32_t *)(p + off); off += 4U; }
         if (cb && n > 0 && off + 4 <= (size_t)fsz.QuadPart) {
             uint32_t ce = *(const uint32_t *)(p + off); off += 4U;
-            g->ch_edge_count = ce;
-            g->ch_level = (uint32_t *)xmalloc((size_t)n * sizeof(uint32_t));
-            g->ch_from = (uint32_t *)xmalloc((size_t)(ce ? ce : 1) * sizeof(uint32_t));
-            g->ch_to = (uint32_t *)xmalloc((size_t)(ce ? ce : 1) * sizeof(uint32_t));
-            g->ch_time = (float *)xmalloc((size_t)(ce ? ce : 1) * sizeof(float));
-            g->ch_fwd_off = (uint32_t *)xcalloc((size_t)n + 1U, sizeof(uint32_t));
-            g->ch_rev_off = (uint32_t *)xcalloc((size_t)n + 1U, sizeof(uint32_t));
-            g->ch_rev_src = (uint32_t *)xmalloc((size_t)(ce ? ce : 1) * sizeof(uint32_t));
-            g->ch_rev_eid = (uint32_t *)xmalloc((size_t)(ce ? ce : 1) * sizeof(uint32_t));
-            g->ch_via = (uint32_t *)xmalloc((size_t)(ce ? ce : 1) * sizeof(uint32_t));
-            g->ch_child1 = (uint32_t *)xmalloc((size_t)(ce ? ce : 1) * sizeof(uint32_t));
-            g->ch_child2 = (uint32_t *)xmalloc((size_t)(ce ? ce : 1) * sizeof(uint32_t));
             size_t need = (size_t)n * 4 + ((size_t)ce * 4) * 3 + ((size_t)n + 1U) * 4 * 2 + ((size_t)ce * 4) * 5;
-            if (g->ch_level && g->ch_from && g->ch_to && g->ch_time &&
-                g->ch_fwd_off && g->ch_rev_off && g->ch_rev_src && g->ch_rev_eid &&
-                g->ch_via && g->ch_child1 && g->ch_child2 && off + need <= (size_t)fsz.QuadPart) {
-                memcpy(g->ch_level, p + off, (size_t)n * sizeof(uint32_t)); off += (size_t)n * sizeof(uint32_t);
-                memcpy(g->ch_from, p + off, (size_t)ce * sizeof(uint32_t)); off += (size_t)ce * sizeof(uint32_t);
-                memcpy(g->ch_to, p + off, (size_t)ce * sizeof(uint32_t)); off += (size_t)ce * sizeof(uint32_t);
-                memcpy(g->ch_time, p + off, (size_t)ce * sizeof(float)); off += (size_t)ce * sizeof(float);
-                memcpy(g->ch_fwd_off, p + off, (size_t)(n + 1U) * sizeof(uint32_t)); off += (size_t)(n + 1U) * sizeof(uint32_t);
-                memcpy(g->ch_rev_off, p + off, (size_t)(n + 1U) * sizeof(uint32_t)); off += (size_t)(n + 1U) * sizeof(uint32_t);
-                memcpy(g->ch_rev_src, p + off, (size_t)ce * sizeof(uint32_t)); off += (size_t)ce * sizeof(uint32_t);
-                memcpy(g->ch_rev_eid, p + off, (size_t)ce * sizeof(uint32_t)); off += (size_t)ce * sizeof(uint32_t);
-                memcpy(g->ch_via, p + off, (size_t)ce * sizeof(uint32_t)); off += (size_t)ce * sizeof(uint32_t);
-                memcpy(g->ch_child1, p + off, (size_t)ce * sizeof(uint32_t)); off += (size_t)ce * sizeof(uint32_t);
-                memcpy(g->ch_child2, p + off, (size_t)ce * sizeof(uint32_t)); off += (size_t)ce * sizeof(uint32_t);
-                g->ch_built = 1U;
+            if (off + need <= (size_t)fsz.QuadPart) {
+                g->ch_edge_count = ce;
+                /* mmap the CH arrays in place (owned by the mapping, paged on demand) */
+                g->ch_level   = (uint32_t *)(p + off); off += (size_t)n * sizeof(uint32_t);
+                g->ch_from    = (uint32_t *)(p + off); off += (size_t)ce * sizeof(uint32_t);
+                g->ch_to      = (uint32_t *)(p + off); off += (size_t)ce * sizeof(uint32_t);
+                g->ch_time    = (float   *)(p + off); off += (size_t)ce * sizeof(float);
+                g->ch_fwd_off = (uint32_t *)(p + off); off += ((size_t)n + 1U) * sizeof(uint32_t);
+                g->ch_rev_off = (uint32_t *)(p + off); off += ((size_t)n + 1U) * sizeof(uint32_t);
+                g->ch_rev_src = (uint32_t *)(p + off); off += (size_t)ce * sizeof(uint32_t);
+                g->ch_rev_eid = (uint32_t *)(p + off); off += (size_t)ce * sizeof(uint32_t);
+                g->ch_via     = (uint32_t *)(p + off); off += (size_t)ce * sizeof(uint32_t);
+                g->ch_child1  = (uint32_t *)(p + off); off += (size_t)ce * sizeof(uint32_t);
+                g->ch_child2  = (uint32_t *)(p + off); off += (size_t)ce * sizeof(uint32_t);
+                g->cch_built = 1U;
             }
         }
 
@@ -6779,16 +6853,29 @@ static uint32_t cch_lookup_orig(const VmrGraph *g, uint32_t from, uint32_t to) {
 }
 
 static void cch_unpack(const VmrGraph *g, uint32_t eid, CchVec *out) {
-    if (eid == VMR_INVALID) {
-        return;
+    /* Iterative DFS over the shortcut DAG (recursion depth can be huge). */
+    CchVec st;
+    memset(&st, 0, sizeof(st));
+    cch_vec_push(&st, eid);
+    while (st.n > 0) {
+        if (st.n > 2000000U || out->n > 3000000U) { /* cycle / runaway guard */
+            xfree(st.d);
+            return;
+        }
+        uint32_t e = st.d[--st.n];
+        if (e == VMR_INVALID || e >= g->ch_edge_count) {
+            continue;
+        }
+        if (*(g->ch_via + e) != VMR_INVALID) {
+            uint32_t c1 = *(g->ch_child1 + e), c2 = *(g->ch_child2 + e);
+            cch_vec_push(&st, c2); /* push reverse so c1 is processed first */
+            cch_vec_push(&st, c1);
+        } else {
+            uint32_t f = *(g->ch_from + e), t = *(g->ch_to + e);
+            cch_vec_push(out, cch_lookup_orig(g, f, t));
+        }
     }
-    if (*(g->ch_via + eid) != VMR_INVALID) {
-        cch_unpack(g, *(g->ch_child1 + eid), out);
-        cch_unpack(g, *(g->ch_child2 + eid), out);
-    } else {
-        uint32_t f = *(g->ch_from + eid), t = *(g->ch_to + eid);
-        cch_vec_push(out, cch_lookup_orig(g, f, t));
-    }
+    xfree(st.d);
 }
 
 static int vmr_cch_query(const VmrGraph *g, uint32_t start, uint32_t goal,
@@ -6822,13 +6909,18 @@ static int vmr_cch_query(const VmrGraph *g, uint32_t start, uint32_t goal,
     uint32_t expanded = 0;
     float best = FLT_MAX;
     uint32_t meet = VMR_INVALID;
+    uint64_t guard = 0;
 
-    while (pf->size > 0 && pb->size > 0) {
-        if (meet != VMR_INVALID && pf->buf->prio + pb->buf->prio >= best) {
-            break;
+    while ((pf->size > 0 || pb->size > 0) && guard++ < 60000000ULL) {
+        if (meet != VMR_INVALID) {
+            float tf = (pf->size > 0) ? pf->buf->prio : FLT_MAX;
+            float tb = (pb->size > 0) ? pb->buf->prio : FLT_MAX;
+            if (tf + tb >= best) {
+                break;
+            }
         }
         HeapEntry top;
-        if (heap_pop(pf, &top)) {
+        if (pf->size > 0 && heap_pop(pf, &top)) {
             uint32_t u = top.node;
             if (ws->sf[u].st != epoch + 1) {
                 ws->sf[u].st = epoch + 1;
@@ -6841,6 +6933,7 @@ static int vmr_cch_query(const VmrGraph *g, uint32_t start, uint32_t goal,
                 for (uint32_t e = *(g->ch_fwd_off + u); e < be; e++) {
                     uint32_t w = *(g->ch_to + e);
                     if (*(lvl + w) <= *(lvl + u)) continue; /* up-edge only */
+                    if (ws->sf[w].st == epoch + 1) continue; /* settled: final */
                     float ng = ws->sf[u].g + *(g->ch_time + e);
                     if (ws->sf[w].st != epoch || ng < ws->sf[w].g) {
                         ws->sf[w].st = epoch; ws->sf[w].g = ng;
@@ -6850,7 +6943,7 @@ static int vmr_cch_query(const VmrGraph *g, uint32_t start, uint32_t goal,
                 }
             }
         }
-        if (heap_pop(pb, &top)) {
+        if (pb->size > 0 && heap_pop(pb, &top)) {
             uint32_t w = top.node;
             if (ws->sb[w].st != epoch + 1) {
                 ws->sb[w].st = epoch + 1;
@@ -6862,7 +6955,8 @@ static int vmr_cch_query(const VmrGraph *g, uint32_t start, uint32_t goal,
                 uint32_t re = *(g->ch_rev_off + w + 1U);
                 for (uint32_t r = *(g->ch_rev_off + w); r < re; r++) {
                     uint32_t u = *(g->ch_rev_src + r);
-                    if (*(lvl + u) >= *(lvl + w)) continue; /* up-edge (u,w) */
+                    if (*(lvl + u) <= *(lvl + w)) continue; /* down-edge (u,w): lvl[u] > lvl[w] */
+                    if (ws->sb[u].st == epoch + 1) continue; /* settled: final */
                     uint32_t eid = *(g->ch_rev_eid + r);
                     float ng = ws->sb[w].g + *(g->ch_time + eid);
                     if (ws->sb[u].st != epoch || ng < ws->sb[u].g) {
@@ -6883,15 +6977,30 @@ static int vmr_cch_query(const VmrGraph *g, uint32_t start, uint32_t goal,
     CchVec fwd, bwd, all, orig;
     memset(&fwd, 0, sizeof(fwd)); memset(&bwd, 0, sizeof(bwd));
     memset(&all, 0, sizeof(all)); memset(&orig, 0, sizeof(orig));
-    for (uint32_t u = meet; u != start;) {
+    uint32_t u = meet, w = meet;
+    for (uint32_t steps = 0; u != start && steps <= n; steps++) {
         uint32_t p = ws->sf[u].p;
+        if (p >= n) { meet = VMR_INVALID; break; }
         cch_vec_push(&fwd, ws->sf[u].pe);
         u = p;
     }
-    for (uint32_t w = meet; w != goal;) {
+    if (meet != VMR_INVALID && u != start) {
+        meet = VMR_INVALID;
+    }
+    for (uint32_t steps = 0; meet != VMR_INVALID && w != goal && steps <= n; steps++) {
         uint32_t p = ws->sb[w].p;
+        if (p >= n) { meet = VMR_INVALID; break; }
         cch_vec_push(&bwd, ws->sb[w].pe);
         w = p;
+    }
+    if (meet != VMR_INVALID && w != goal) {
+        meet = VMR_INVALID;
+    }
+    if (meet == VMR_INVALID) {
+        xfree(fwd.d);
+        xfree(bwd.d);
+        res->elapsed_ms = 1000.0 * (double)(clock() - t0) / (double)CLOCKS_PER_SEC;
+        return 0;
     }
     for (size_t i = fwd.n; i-- > 0;) {
         cch_vec_push(&all, fwd.d[i]);
@@ -6902,11 +7011,23 @@ static int vmr_cch_query(const VmrGraph *g, uint32_t start, uint32_t goal,
     xfree(fwd.d);
     xfree(bwd.d);
     for (size_t i = 0; i < all.n; i++) {
-        cch_unpack(g, all.d[i], &orig);
+        uint32_t ce = all.d[i];
+        cch_unpack(g, ce, &orig);
+        if (orig.n > 3000000U) { /* corrupt run-away shortcut */
+            LOG_WARN("CCH runaway at top[%zu] eid=%u", i, ce);
+            orig.n = 0;
+            break;
+        }
     }
     xfree(all.d);
 
     uint32_t ohop = (uint32_t)orig.n;
+    if (ohop == 0 || ohop > 2000000U) { /* corrupt/empty hierarchy path */
+        res->elapsed_ms = 1000.0 * (double)(clock() - t0) / (double)CLOCKS_PER_SEC;
+        xfree(orig.d);
+        LOG_WARN("CCH: hierarchy path unusable (ohop=%u)", ohop);
+        return 0;
+    }
     res->nodes = (uint32_t *)xmalloc((size_t)(ohop + 1U) * sizeof(uint32_t));
     res->edges = (uint32_t *)xmalloc((size_t)(ohop ? ohop : 1U) * sizeof(uint32_t));
     uint32_t at = 0;
@@ -6983,7 +7104,7 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
     }
 
     if (query->mode == MODE_CCH) {
-        if (!g->ch_built) {
+        if (!g->cch_built) {
             LOG_WARN("CCH requested but no contraction hierarchy was built");
             return -1;
         }
