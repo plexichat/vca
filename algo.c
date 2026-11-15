@@ -2307,9 +2307,9 @@ static int vmr_preprocess_graph(VmrRawGraph *rg, VmrGraph *g) {
 
     vmr_build_landmarks(g);
 
-    /* Vector-aware CH is not used: the vector cost is non-additive at shortcut
-     * level, so a scalar/aggregated CH either distorts the path or does not
-     * reduce the exact vector A* expansions enough to justify the cache. */
+    /* CH cannot provide a full distance heuristic: a level-restricted CH search
+     * only reaches the upward closure, so dist(start/goal) is INF; full CH
+     * Dijkstras cost 1-2 s, which is worse than the vector A*. */
 
     clock_t t1 = clock();
     double ms = 1000.0 * (double)(t1 - t0) / (double)CLOCKS_PER_SEC;
@@ -5306,6 +5306,64 @@ static __attribute__((unused)) uint32_t *vmr_ch_path(const VmrGraph *g, uint32_t
     return nodes;
 }
 
+/* Exact travel-time distances in the scalar CH graph.  These are lower bounds
+ * for the 8D vector cost (cost >= time * attr_scale_min) and make the vector A*
+ * goal-directed without changing its cost model. */
+static void ch_distance_all(const VmrGraph *g, uint32_t source, float *dist, int reverse) {
+    uint32_t n = g->node_count;
+    if (!g->ch_built || !dist || source >= n) {
+        return;
+    }
+    uint8_t *closed = (uint8_t *)xcalloc(n, 1);
+    MinHeap pq;
+    if (!closed || heap_init(&pq, 1024) != 0) {
+        xfree(closed);
+        return;
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        *(dist + i) = FLT_MAX;
+    }
+    *(dist + source) = 0.0f;
+    heap_push(&pq, source, 0.0f);
+    HeapEntry top;
+    while (heap_pop(&pq, &top)) {
+        uint32_t u = top.node;
+        if (*(closed + u)) {
+            continue;
+        }
+        *(closed + u) = 1;
+        float du = *(dist + u);
+        if (!reverse) {
+            uint32_t b = *(g->ch_fwd_off + u), e = *(g->ch_fwd_off + u + 1U);
+            for (; b < e; b++) {
+                uint32_t v = *(g->ch_to + b);
+                if (*(closed + v)) continue;
+                if (!(*(g->ch_level + u) < *(g->ch_level + v))) continue;
+                float nd = du + *(g->ch_time + b);
+                if (nd < *(dist + v)) {
+                    *(dist + v) = nd;
+                    heap_push(&pq, v, nd);
+                }
+            }
+        } else {
+            uint32_t b = *(g->ch_rev_off + u), e = *(g->ch_rev_off + u + 1U);
+            for (; b < e; b++) {
+                uint32_t v = *(g->ch_rev_src + b);
+                uint32_t eid = *(g->ch_rev_eid + b);
+                if (*(closed + v)) continue;
+                if (!(*(g->ch_level + v) < *(g->ch_level + u))) continue;
+                float nd = du + *(g->ch_time + eid);
+                if (nd < *(dist + v)) {
+                    *(dist + v) = nd;
+                    heap_push(&pq, v, nd);
+                }
+            }
+        }
+    }
+    xfree(closed);
+    heap_free(&pq);
+}
+
 /*
  * Primary Pathfinding Entrypoint:
  *   MODE_VEC_BIDIR  -> Bidirectional 8D Vector-Corridor Search
@@ -5358,9 +5416,32 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
     float chord_len = vmr_sqrt_fast(chord_dx * chord_dx + chord_dy * chord_dy);
     float inv_chord = (chord_len > 1.0f) ? (1.0f / chord_len) : 1.0f;
 
+    float *dist_start = NULL;
+    float *dist_goal = NULL;
+    if (g->ch_built) {
+        dist_start = (float *)xmalloc((size_t)n * sizeof(float));
+        dist_goal = (float *)xmalloc((size_t)n * sizeof(float));
+        if (dist_start && dist_goal) {
+            clock_t c0 = clock();
+            ch_distance_all(g, start_idx, dist_start, 0);
+            ch_distance_all(g, goal_idx, dist_goal, 1);
+            clock_t c1 = clock();
+            LOG_INFO("CH heuristic: %.1f ms", 1000.0 * (double)(c1 - c0) / (double)CLOCKS_PER_SEC);
+            LOG_INFO("CH dist check: goal->start=%.1f start->goal=%.1f",
+                     *(dist_goal + start_idx), *(dist_start + goal_idx));
+        } else {
+            xfree(dist_start);
+            xfree(dist_goal);
+            dist_start = NULL;
+            dist_goal = NULL;
+        }
+    }
+
     if (vmr_ws_reserve(n) != 0) {
         LOG_ERR("OOM: search workspace");
         vmr_corridor_free();
+        xfree(dist_start);
+        xfree(dist_goal);
         return -1;
     }
     VmrSearchWS *ws = &g_ws;
@@ -5427,6 +5508,7 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
         attr_dot_max = 0.0f;
     }
     float attr_scale_min = 1.0f / (1.0f + 0.22f * attr_dot_max);
+    float ch_scale = (query->mode == MODE_DIJKSTRA) ? 1.0f : attr_scale_min;
     const float max_speed_mps = 140.0f / 3.6f; /* parser clamps at 140 km/h */
     const float v_heur = (query->mode == MODE_DIJKSTRA)
                        ? 0.0f : (attr_scale_min / max_speed_mps);
@@ -5506,7 +5588,9 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
                     *(my_fwd + v) = nmy * mn;
 
                     float h = 0.0f;
-                    if (has_alt) {
+                    if (dist_goal && *(dist_goal + v) < FLT_MAX * 0.5f) {
+                        h = *(dist_goal + v) * ch_scale;
+                    } else if (has_alt) {
                         h = alt_heuristic(g, v, 1, alt_gf, alt_gb, L) * alt_scale;
                     } else if (query->mode == MODE_VEC_UNIDIR) {
                         float rvx = gx - *(g->node_x + v);
@@ -5601,9 +5685,11 @@ if (skip_dead && (*(g->node_flags + v) & NODE_DEAD_TREE)) continue;
                         }
                         float rvx = gx - *(g->node_x + v);
                         float rvy = gy - *(g->node_y + v);
-                        float h = has_alt
-                            ? alt_heuristic(g, v, 1, alt_gf, alt_gb, L) * alt_scale
-                            : vmr_sqrt_fast(rvx * rvx + rvy * rvy) * v_heur;
+                        float h = (dist_goal && *(dist_goal + v) < FLT_MAX * 0.5f)
+                            ? (*(dist_goal + v) * ch_scale)
+                            : (has_alt
+                                ? alt_heuristic(g, v, 1, alt_gf, alt_gb, L) * alt_scale
+                                : vmr_sqrt_fast(rvx * rvx + rvy * rvy) * v_heur);
                         if (ng + h < best_total) {
                             heap_push(pq_fwd, v, ng + h);
                         }
@@ -5681,9 +5767,11 @@ if (skip_dead && (*(g->node_flags + v) & NODE_DEAD_TREE)) continue;
                         }
                         float rux = sx - *(g->node_x + u);
                         float ruy = sy - *(g->node_y + u);
-                        float h = has_alt
-                            ? alt_heuristic(g, u, 0, alt_sf, alt_sb, L) * alt_scale
-                            : vmr_sqrt_fast(rux * rux + ruy * ruy) * v_heur;
+                        float h = (dist_start && *(dist_start + u) < FLT_MAX * 0.5f)
+                            ? (*(dist_start + u) * ch_scale)
+                            : (has_alt
+                                ? alt_heuristic(g, u, 0, alt_sf, alt_sb, L) * alt_scale
+                                : vmr_sqrt_fast(rux * rux + ruy * ruy) * v_heur);
                         if (ng + h < best_total) {
                             heap_push(pq_bwd, u, ng + h);
                         }
@@ -5748,6 +5836,8 @@ if (skip_dead && (*(g->node_flags + v) & NODE_DEAD_TREE)) continue;
         vmr_compute_result_telemetry(g, res, &query->pref);
     }
     vmr_corridor_free();
+    xfree(dist_start);
+    xfree(dist_goal);
 
     return 0;
 }
