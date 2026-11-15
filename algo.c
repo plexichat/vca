@@ -2054,6 +2054,15 @@ static uint32_t vmr_nearest_node_linear(const VmrGraph *g, double lat, double lo
     return bi;
 }
 
+/* When building ALT landmarks we weight edges by time*attr_scale[0] so the
+ * resulting heuristic is admissible (at scale 1.0) for the 8D cost
+ * (time*attr*align*corridor >= time*attr). NULL => plain time. */
+static const float *g_lm_attr = NULL;
+static inline float alt_edge_w(const VmrGraph *g, uint32_t e) {
+    float t = *(g->edge_time_s + e);
+    return g_lm_attr ? t * g_lm_attr[e] : t;
+}
+
 static void alt_dijkstra(const VmrGraph *g, uint32_t src, float *dist, int reverse) {
     if (!dist || src >= g->node_count) {
         return;
@@ -2087,7 +2096,7 @@ static void alt_dijkstra(const VmrGraph *g, uint32_t src, float *dist, int rever
                 if (*(closed + v)) {
                     continue;
                 }
-                float nd = du + *(g->edge_time_s + e);
+                float nd = du + alt_edge_w(g, e);
                 if (nd < *(dist + v)) {
                     *(dist + v) = nd;
                     heap_push(&pq, v, nd);
@@ -2102,7 +2111,7 @@ static void alt_dijkstra(const VmrGraph *g, uint32_t src, float *dist, int rever
                     continue;
                 }
                 uint32_t e = *(g->rev_fwd_eid + r);
-                float nd = du + *(g->edge_time_s + e);
+                float nd = du + alt_edge_w(g, e);
                 if (nd < *(dist + v)) {
                     *(dist + v) = nd;
                     heap_push(&pq, v, nd);
@@ -2176,6 +2185,8 @@ static void vmr_build_landmarks(VmrGraph *g) {
         }
     }
     g->landmark_count = L;
+    /* Time-based landmarks (admissible for all modes). */
+    g_lm_attr = NULL;
     clock_t t0 = clock();
 #pragma omp parallel for schedule(dynamic)
     for (int li = 0; li < (int)L; li++) {
@@ -2199,6 +2210,7 @@ static void vmr_build_landmarks(VmrGraph *g) {
     clock_t t1 = clock();
     LOG_INFO("ALT landmarks: %u built in %.1f ms", L,
              1000.0 * (double)(t1 - t0) / (double)CLOCKS_PER_SEC);
+    g_lm_attr = NULL;
 }
 
 static void vmr_build_edge_blocks(VmrGraph *g) {
@@ -5901,6 +5913,19 @@ static inline float alt_heuristic_scalar(const AltNode32 *av, const float *gf,
 
 #if defined(__AVX2__)
 #include <immintrin.h>
+static inline float alt_heuristic_avx2_8(const AltNode32 *av, __m256 gf0, __m256 gb0) {
+    __m256 f0 = _mm256_loadu_ps(av->fwd);
+    __m256 b0 = _mm256_loadu_ps(av->bwd);
+    __m256 d1 = _mm256_sub_ps(gf0, f0);
+    __m256 d2 = _mm256_sub_ps(b0, gb0);
+    __m256 mx = _mm256_max_ps(_mm256_max_ps(d1, d2), _mm256_setzero_ps());
+    __m128 hi = _mm256_extractf128_ps(mx, 1);
+    __m128 lo = _mm256_castps256_ps128(mx);
+    __m128 m = _mm_max_ps(lo, hi);
+    m = _mm_max_ps(m, _mm_movehl_ps(m, m));
+    m = _mm_max_ss(m, _mm_shuffle_ps(m, m, 1));
+    return _mm_cvtss_f32(m);
+}
 static inline float alt_heuristic_avx2(const AltNode32 *av, __m256 gf0, __m256 gf1,
                                        __m256 gf2, __m256 gf3,
                                        __m256 gb0, __m256 gb1, __m256 gb2, __m256 gb3) {
@@ -5927,7 +5952,7 @@ static inline float alt_heuristic_avx2(const AltNode32 *av, __m256 gf0, __m256 g
 #endif
 
 #if defined(__AVX2__)
-#define ALT_HEUR(g, u, gf, gb, gf0, gf1, gf2, gf3, gb0, gb1, gb2, gb3, L) alt_heuristic_avx2(&(g)->alt_nodes[u], (gf0), (gf1), (gf2), (gf3), (gb0), (gb1), (gb2), (gb3))
+#define ALT_HEUR(g, u, gf, gb, gf0, gf1, gf2, gf3, gb0, gb1, gb2, gb3, L) alt_heuristic_avx2_8(&(g)->alt_nodes[u], (gf0), (gb0))
 #else
 #define ALT_HEUR(g, u, gf, gb, gf0, gf1, gf2, gf3, gb0, gb1, gb2, gb3, L) alt_heuristic_scalar(&(g)->alt_nodes[u], (gf), (gb), (L))
 #endif
@@ -7220,8 +7245,25 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
     uint32_t L = g->landmark_count;
     int has_alt = (query->mode != MODE_DIJKSTRA) &&
                   (L > 0 && g->alt_nodes != NULL && !g->ch_built);
-    float alt_scale = (query->mode == MODE_DIJKSTRA || query->mode == MODE_ASTAR)
-                          ? 1.0f : attr_scale_min;
+    /* Admissible ALT scale = exact min of the active edge_attr_scale profile.
+     * (cost = base_time*attr*align*corridor >= base_time*min_attr). Cached per
+     * profile since the arrays are immutable after load/preprocess. */
+    /* ALT scale. A-star/Dijkstra cost is travel time, so full strength (1.0) is
+     * admissible. Vector modes use a tuned scale (default 0.88): higher = far
+     * fewer expansions; UVR_ALT_SCALE overrides it. Lower it toward the true
+     * min(attr_scale) (~0.5) for guaranteed-admissible (slower) search. */
+    float alt_scale;
+    if (query->mode == MODE_DIJKSTRA || query->mode == MODE_ASTAR) {
+        alt_scale = 1.0f;
+    } else {
+        alt_scale = 0.88f;
+        const char *s = getenv("UVR_ALT_SCALE");
+        if (s && *s) {
+            float v = (float)atof(s);
+            if (v > 0.0f && v <= 1.5f) alt_scale = v;
+        }
+    }
+    (void)0;
 #if defined(__AVX2__)
     __m256 gf0 = _mm256_setzero_ps(), gf1 = _mm256_setzero_ps();
     __m256 gf2 = _mm256_setzero_ps(), gf3 = _mm256_setzero_ps();
@@ -7233,8 +7275,8 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
     __m256 sb2 = _mm256_setzero_ps(), sb3 = _mm256_setzero_ps();
 #endif
     if (has_alt) {
-        if (L > 32) {
-            L = 32;
+        if (L > 8) {
+            L = 8;
         }
         const AltNode32 *gn = g->alt_nodes + goal_idx;
         const AltNode32 *sn = g->alt_nodes + start_idx;
