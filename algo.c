@@ -145,6 +145,16 @@ typedef struct {
     int   pref_id;    /* 0..4 built-in profile, -1 custom weights */
 } VmrPreference;
 
+typedef struct __attribute__((aligned(32))) {
+    uint32_t to[4];
+    float ux[4], uy[4];
+    float dx[4], dy[4];
+    float vx[4], vy[4];
+    float time[4];
+    float attr[4];
+    uint8_t flags[4];
+} EdgeBlock4;
+
 typedef struct {
     SearchMode    mode;
     VmrPreference pref;
@@ -660,6 +670,9 @@ typedef struct {
 
     float *edge_attr_scale[5];
 
+    EdgeBlock4 *fwd_blocks;
+    uint32_t *fwd_block_off;
+
     IdMap     osm_map;
 } VmrGraph;
 
@@ -838,6 +851,8 @@ static void vmr_graph_free(VmrGraph *g) {
     for (int i = 0; i < 5; i++) {
         xfree(g->edge_attr_scale[i]);
     }
+    xfree(g->fwd_blocks);
+    xfree(g->fwd_block_off);
     idmap_free(&g->osm_map);
     vmr_graph_init(g);
 }
@@ -1843,6 +1858,60 @@ static void vmr_build_landmarks(VmrGraph *g) {
     clock_t t1 = clock();
     LOG_INFO("ALT landmarks: %u built in %.1f ms", L,
              1000.0 * (double)(t1 - t0) / (double)CLOCKS_PER_SEC);
+}
+
+static __attribute__((unused)) void vmr_build_edge_blocks(VmrGraph *g) {
+    uint32_t n = g->node_count;
+    size_t nb = 0;
+    for (uint32_t u = 0; u < n; u++) {
+        uint32_t deg = *(g->fwd_offsets + u + 1U) - *(g->fwd_offsets + u);
+        nb += (deg + 3U) / 4U;
+    }
+    if (nb == 0) {
+        return;
+    }
+    EdgeBlock4 *blocks = (EdgeBlock4 *)xcalloc(nb, sizeof(EdgeBlock4));
+    uint32_t *boff = (uint32_t *)xcalloc((size_t)n + 1U, sizeof(uint32_t));
+    if (!blocks || !boff) {
+        xfree(blocks);
+        xfree(boff);
+        return;
+    }
+    size_t b = 0;
+    for (uint32_t u = 0; u < n; u++) {
+        *(boff + u) = (uint32_t)b;
+        uint32_t beg = *(g->fwd_offsets + u);
+        uint32_t end = *(g->fwd_offsets + u + 1U);
+        for (uint32_t e = beg; e < end; e += 4U) {
+            EdgeBlock4 *blk = blocks + b;
+            for (uint32_t l = 0; l < 4; l++) {
+                if (e + l < end) {
+                    uint32_t ei = e + l;
+                    uint32_t to = *(g->edge_to + ei);
+                    blk->to[l] = to;
+                    blk->ux[l] = *(g->edge_ux + ei);
+                    blk->uy[l] = *(g->edge_uy + ei);
+                    blk->dx[l] = *(g->edge_dx + ei);
+                    blk->dy[l] = *(g->edge_dy + ei);
+                    blk->vx[l] = *(g->node_x + to);
+                    blk->vy[l] = *(g->node_y + to);
+                    blk->time[l] = *(g->edge_time_s + ei);
+                    blk->attr[l] = g->edge_attr_scale[0] ? *(g->edge_attr_scale[0] + ei) : 1.0f;
+                    blk->flags[l] = *(g->edge_flags + ei);
+                } else {
+                    blk->to[l] = VMR_INVALID;
+                    blk->flags[l] = EDGE_DEAD_TARGET;
+                }
+            }
+            b++;
+        }
+    }
+    *(boff + n) = (uint32_t)b;
+    xfree(g->fwd_blocks);
+    xfree(g->fwd_block_off);
+    g->fwd_blocks = blocks;
+    g->fwd_block_off = boff;
+    LOG_INFO("Edge blocks: %u blocks (%u edges)", (uint32_t)nb, g->edge_count);
 }
 
 static int vmr_preprocess_graph(VmrRawGraph *rg, VmrGraph *g) {
