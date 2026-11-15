@@ -1222,9 +1222,9 @@ static int ch_contract_node(ChAdj *a, uint32_t u, uint8_t *contracted,
             ChEdge *y = a->edges + e2;
             float len = x->length_m + y->length_m;
             float t = x->time_s + y->time_s;
-            float fs = (len > EPS_F) ? ((x->f_speed * x->length_m + y->f_speed * y->length_m) / len) : x->f_speed;
-            float fc = (len > EPS_F) ? ((x->f_class * x->length_m + y->f_class * y->length_m) / len) : x->f_class;
-            float fm = (len > EPS_F) ? ((x->f_smooth * x->length_m + y->f_smooth * y->length_m) / len) : x->f_smooth;
+            float fs = (x->f_speed < y->f_speed) ? x->f_speed : y->f_speed;
+            float fc = (x->f_class < y->f_class) ? x->f_class : y->f_class;
+            float fm = (x->f_smooth < y->f_smooth) ? x->f_smooth : y->f_smooth;
             float dx = x->dx + y->dx;
             float dy = x->dy + y->dy;
             if (added == 0) {
@@ -1279,8 +1279,8 @@ static int cmp_ch_packed(const void *pa, const void *pb) {
     return 0;
 }
 
-#if 0
-static int vmr_build_ch(VmrGraph *g) {
+/* Vector-aware contraction hierarchy: shortcuts carry the same 8D features. */
+static int vmr_build_ch_vector(VmrGraph *g) {
     uint32_t n = g->node_count;
     uint32_t m0 = g->edge_count;
     if (n == 0 || m0 == 0) {
@@ -1297,7 +1297,7 @@ static int vmr_build_ch(VmrGraph *g) {
         if (ch_adj_add(&a, from, to, *(g->edge_length_m + e), *(g->edge_time_s + e),
                        *(g->edge_f_speed + e), *(g->edge_f_class + e),
                        *(g->edge_f_smooth + e), *(g->edge_dx + e), *(g->edge_dy + e),
-                       0, *(g->edge_flags + e), VMR_INVALID) == VMR_INVALID) {
+                       0, *(g->edge_flags + e), VMR_INVALID, VMR_INVALID, VMR_INVALID) == VMR_INVALID) {
             ch_adj_free(&a);
             return -1;
         }
@@ -1381,7 +1381,8 @@ if ((uint64_t)od * (uint64_t)id > 32U && *(delay + u) < 8U) {
             ChEdge *ce = a.edges + e;
             *(packed + w) = (ChPacked){
                 ce->from, ce->to, ce->length_m, ce->time_s,
-                ce->f_speed, ce->f_class, ce->f_smooth, ce->flags
+                ce->f_speed, ce->f_class, ce->f_smooth, ce->flags,
+                ce->via, ce->child1, ce->child2
             };
             w++;
         }
@@ -1488,7 +1489,6 @@ fail:
     ch_adj_free(&a);
     return -1;
 }
-#endif
 
 /* Scalar (travel-time) CH used only to build a coarse corridor.  The original
  * 8D vector graph is left untouched so the exact vector A* can refine inside
@@ -2363,9 +2363,9 @@ static int vmr_preprocess_graph(VmrRawGraph *rg, VmrGraph *g) {
 
     vmr_build_landmarks(g);
 
-    /* CH corridor was measured: 58.7k expansions but 49 ms and a different
-     * 607.59 km / 400.7 min route.  The scalar CH path is not a safe corridor
-     * for the 8D vector cost, so CH is not built for the vector graph. */
+    if (vmr_build_ch_vector(g) != 0) {
+        LOG_WARN("Vector CH build failed; falling back to full A*");
+    }
 
     clock_t t1 = clock();
     double ms = 1000.0 * (double)(t1 - t0) / (double)CLOCKS_PER_SEC;
@@ -2396,6 +2396,21 @@ typedef struct {
     float    grid_min_y;
     float    grid_max_y;
 } VgraphHeader;
+
+static int vmr_fwrite_chunk(const void *ptr, size_t sz, size_t n, FILE *fp) {
+    size_t off = 0;
+    while (off < n) {
+        size_t cnt = n - off;
+        if (cnt > 262144U) {
+            cnt = 262144U;
+        }
+        if (fwrite((const uint8_t *)ptr + off * sz, sz, cnt, fp) != cnt) {
+            return 0;
+        }
+        off += cnt;
+    }
+    return 1;
+}
 
 static int vmr_save_binary(const VmrGraph *g, const char *path) {
     FILE *fp = fopen(path, "wb");
@@ -2462,7 +2477,7 @@ static int vmr_save_binary(const VmrGraph *g, const char *path) {
     ok &= (fwrite(&l, sizeof(uint32_t), 1, fp) == 1);
     if (l > 0 && n > 0) {
         ok &= (fwrite(g->landmark_node, sizeof(uint32_t), l, fp) == l);
-        ok &= (fwrite(g->alt_nodes, sizeof(AltNode16), n, fp) == n);
+        ok &= vmr_fwrite_chunk(g->alt_nodes, sizeof(AltNode16), n, fp);
     }
 
     uint32_t tc = g->turn_count;
@@ -5421,7 +5436,8 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
 
     clock_t t0 = clock();
     uint32_t n = g->node_count;
-    int skip_dead = !(*(g->node_flags + start_idx) & NODE_DEAD_TREE) &&
+    int skip_dead = !g->ch_built &&
+                    !(*(g->node_flags + start_idx) & NODE_DEAD_TREE) &&
                     !(*(g->node_flags + goal_idx)  & NODE_DEAD_TREE);
 
     float sx = *(g->node_x + start_idx), sy = *(g->node_y + start_idx);
@@ -5438,7 +5454,7 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
     }
 
     vmr_corridor_free();
-    if (g->ch_built && !query->pref.avoid_tolls && !g_corr_disabled && start_idx != goal_idx) {
+    if (0 && g->ch_built && !query->pref.avoid_tolls && !g_corr_disabled && start_idx != goal_idx) {
         uint32_t cn = 0;
         uint32_t *cnodes = vmr_ch_path(g, start_idx, goal_idx, &cn);
         if (cnodes && cn >= 2) {
@@ -5520,7 +5536,7 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
 
     float alt_gf[16], alt_gb[16], alt_sf[16], alt_sb[16];
     uint32_t L = g->landmark_count;
-    int has_alt = (L > 0 && g->alt_nodes != NULL);
+    int has_alt = (L > 0 && g->alt_nodes != NULL && !g->ch_built);
     float alt_scale = (query->mode == MODE_DIJKSTRA) ? 1.0f : attr_scale_min;
 #if defined(__AVX2__)
     __m256 gf0 = _mm256_setzero_ps(), gf1 = _mm256_setzero_ps();
@@ -5582,6 +5598,7 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
                 if (ws->state[v].st_fwd == epoch + 1) continue;
                 if (skip_dead && (*(g->edge_flags + ei) & EDGE_DEAD_TARGET)) continue;
                 if (g->ch_built && !(*(g->ch_level + u) < *(g->ch_level + v))) continue;
+                if (g->ch_built && !(*(g->ch_level + u) < *(g->ch_level + v))) continue;
                 if ((*(g->node_flags + u) & NODE_HAS_TURN_RES) && ws->state[u].p_fwd != VMR_INVALID &&
                     turn_forbidden(g, u, ws->state[u].p_fwd, v)) continue;
 
@@ -5597,7 +5614,9 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
                 }
 
                 float h_v = 0.0f;
-                if (has_alt) {
+                if (g->ch_built) {
+                    h_v = 0.0f;
+                } else if (has_alt) {
                     h_v = ALT_HEUR(g, v, alt_gf, alt_gb, gf0, gf1, gb0, gb1, L) * alt_scale;
                 } else if (query->mode == MODE_VEC_UNIDIR) {
                     float rvx = gx - *(g->node_x + v);
@@ -5679,6 +5698,7 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
                     uint32_t v = *(g->edge_to + ei);
                     if (ws->state[v].st_fwd == epoch + 1) continue;
 if (skip_dead && (*(g->edge_flags + ei) & EDGE_DEAD_TARGET)) continue;
+                if (g->ch_built && !(*(g->ch_level + u) < *(g->ch_level + v))) continue;
                 if (!in_corridor(g, v)) continue;
                 if ((*(g->node_flags + u) & NODE_HAS_TURN_RES) && ws->state[u].p_fwd != VMR_INVALID &&
                     turn_forbidden(g, u, ws->state[u].p_fwd, v)) continue;
@@ -5694,10 +5714,12 @@ if (skip_dead && (*(g->edge_flags + ei) & EDGE_DEAD_TARGET)) continue;
                         cross_ratio = (cross_abs * inv_chord) * inv_chord;
                     }
 
-                    float h_v = has_alt
-                        ? (ALT_HEUR(g, v, alt_gf, alt_gb, gf0, gf1, gb0, gb1, L) * alt_scale)
-                        : vmr_sqrt_fast((gx - *(g->node_x + v)) * (gx - *(g->node_x + v)) +
-                                        (gy - *(g->node_y + v)) * (gy - *(g->node_y + v))) * v_heur;
+                    float h_v = g->ch_built
+                        ? 0.0f
+                        : (has_alt
+                            ? (ALT_HEUR(g, v, alt_gf, alt_gb, gf0, gf1, gb0, gb1, L) * alt_scale)
+                            : vmr_sqrt_fast((gx - *(g->node_x + v)) * (gx - *(g->node_x + v)) +
+                                            (gy - *(g->node_y + v)) * (gy - *(g->node_y + v))) * v_heur);
 
                     float sc_min = compute_8d_step_cost(g, ei, &query->pref, MODE_VEC_BIDIR,
                                                         cos1, 1.0f, mom, cross_ratio);
@@ -5764,6 +5786,7 @@ uint32_t u = *(g->rev_src_node + ri);
                     uint32_t eid = *(g->rev_fwd_eid + ri);
                     if (ws->state[u].st_bwd == epoch + 1) continue;
                     if (skip_dead && (*(g->edge_flags + eid) & EDGE_DEAD_SOURCE)) continue;
+                    if (g->ch_built && !(*(g->ch_level + w) < *(g->ch_level + u))) continue;
                     uint32_t next_w = ws->state[w].p_bwd;
                     if ((*(g->node_flags + w) & NODE_HAS_TURN_RES) &&
                         next_w != VMR_INVALID && turn_forbidden(g, w, u, next_w)) continue;
@@ -5781,10 +5804,12 @@ uint32_t u = *(g->rev_src_node + ri);
                         cross_ratio = (cross_abs * inv_chord) * inv_chord;
                     }
 
-                    float h_v = has_alt
-                        ? (ALT_HEUR(g, u, alt_sf, alt_sb, sf0, sf1, sb0, sb1, L) * alt_scale)
-                        : vmr_sqrt_fast((sx - *(g->node_x + u)) * (sx - *(g->node_x + u)) +
-                                        (sy - *(g->node_y + u)) * (sy - *(g->node_y + u))) * v_heur;
+                    float h_v = g->ch_built
+                        ? 0.0f
+                        : (has_alt
+                            ? (ALT_HEUR(g, u, alt_sf, alt_sb, sf0, sf1, sb0, sb1, L) * alt_scale)
+                            : vmr_sqrt_fast((sx - *(g->node_x + u)) * (sx - *(g->node_x + u)) +
+                                            (sy - *(g->node_y + u)) * (sy - *(g->node_y + u))) * v_heur);
 
                     float sc_min = compute_8d_step_cost(g, eid, &query->pref, MODE_VEC_BIDIR,
                                                         cos1, 1.0f, mom, cross_ratio);
