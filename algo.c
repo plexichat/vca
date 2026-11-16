@@ -116,6 +116,86 @@ static inline float vmr_profile_attr_dot(uint32_t p, float f_speed, float f_clas
     return w[0] * f_speed + w[1] * f_class + w[2] * f_straight + w[3] * f_smooth;
 }
 
+/*
+ * Vehicle matrix for logistics: each vehicle type has a fuel-consumption
+ * curve (base L/100km + speed sensitivity), a speed cap, and a stop-and-go
+ * penalty. The eco profile minimises this fuel model, so different vehicles
+ * produce genuinely different fuel-optimal routes (e.g. an HGV capped at
+ * 85 km/h avoids high-speed motorway cruising).
+ */
+typedef struct {
+    const char *name;
+    float base_l_per_100km;  /* consumption at the optimum cruising speed */
+    float max_speed_kmh;     /* speed cap (0 = unlimited) */
+    float v_opt_kmh;         /* speed at which consumption is minimal */
+    float speed_fuel_coeff;  /* fractional fuel rise per ((v-vopt)/vopt)^2 */
+    float stop_fuel_coeff;   /* fractional fuel rise from stop-and-go */
+} VehicleType;
+
+static const VehicleType vmr_vehicles[] = {
+    { "car",       5.0f, 130.0f, 95.0f, 0.55f, 0.40f },
+    { "van",       8.5f, 110.0f, 90.0f, 0.60f, 0.50f },
+    { "hgv-rigid", 22.0f, 90.0f,  80.0f, 0.75f, 0.60f },
+    { "hgv-artic", 32.0f, 85.0f,  80.0f, 0.85f, 0.70f },
+    { "ev",         0.0f, 130.0f, 95.0f, 0.0f,  0.0f }
+};
+#define VMR_NUM_VEHICLES ((int)(sizeof(vmr_vehicles) / sizeof(vmr_vehicles[0])))
+static const VehicleType *g_vehicle = &vmr_vehicles[0];
+
+/* Fuel consumption in L/km for travelling at speed_kmh over a road with the
+ * given smoothness (0..1), for the active vehicle. U-shaped vs speed: minimal
+ * at the vehicle's optimum cruising speed, rising at both low (stop-and-go,
+ * wrong gear) and high (aero drag) speeds. */
+static inline float vmr_fuel_l_per_km(float speed_kmh, float smooth) {
+    const VehicleType *v = g_vehicle;
+    if (v->base_l_per_100km <= 0.0f) {
+        return 0.0f; /* EV: no liquid fuel */
+    }
+    float s = speed_kmh;
+    if (v->max_speed_kmh > 0.0f && s > v->max_speed_kmh) {
+        s = v->max_speed_kmh;
+    }
+    if (s < 5.0f) {
+        s = 5.0f;
+    }
+    float vopt = (v->v_opt_kmh > 1.0f) ? v->v_opt_kmh : 90.0f;
+    float u = (s - vopt) / vopt;
+    float per_km = v->base_l_per_100km / 100.0f;
+    per_km *= (1.0f + v->speed_fuel_coeff * u * u);
+    per_km *= (1.0f + v->stop_fuel_coeff * (1.0f - smooth));
+    return per_km;
+}
+
+/*
+ * Fuel-optimisation edge attribute. We want cost = time * attr to be
+ * proportional to fuel burned, so that the eco search minimises total fuel:
+ *   fuel = fuel_l_per_km * dist,  time = dist / speed
+ *   => cost = time * attr = fuel / NORM  when  attr = fuel_l_per_km * speed / NORM
+ * The speed used is the vehicle's capped effective speed, so a speed-limited
+ * HGV gets an eco cost that reflects its actual (slower) cruising speed.
+ */
+#define VMR_ECO_NORM 2.5f
+static inline float vmr_eco_attr(float length_m, float time_s, float smooth) {
+    float free_mps = (time_s > EPS_F) ? (length_m / time_s) : 0.0f;
+    float free_kmh = free_mps * 3.6f;
+    float cap = g_vehicle->max_speed_kmh;
+    float eff_kmh = (cap > 0.0f && free_kmh > cap) ? cap : free_kmh;
+    float eff_mps = eff_kmh / 3.6f;
+    float per_km = vmr_fuel_l_per_km(eff_kmh, smooth);
+    return per_km * eff_mps / VMR_ECO_NORM;
+}
+
+/* Single source of truth for an edge's attr_scale for built-in profile p. */
+static inline float vmr_edge_attr(uint32_t p, float length_m, float time_s,
+                                  float f_speed, float f_class,
+                                  float f_straight, float f_smooth) {
+    if (p == VMR_PROFILE_ECO) {
+        return vmr_eco_attr(length_m, time_s, f_smooth);
+    }
+    float dot = vmr_profile_attr_dot(p, f_speed, f_class, f_straight, f_smooth);
+    return 1.0f / (1.0f + 0.22f * dot);
+}
+
 typedef enum {
     LOG_ERR_L  = 0,
     LOG_WARN_L = 1,
@@ -141,6 +221,12 @@ static void uvr_log(LogLvl lvl, const char *tag, const char *fmt, ...) {
 #define LOG_WARN(...) uvr_log(LOG_WARN_L, "WARN ", __VA_ARGS__)
 #define LOG_INFO(...) uvr_log(LOG_INFO_L, "INFO ", __VA_ARGS__)
 #define LOG_DBG(...)  uvr_log(LOG_DBG_L,  "DEBUG", __VA_ARGS__)
+
+/* Sleep for the given number of seconds (used by the live-traffic watch loop). */
+static void sleep_seconds(int seconds) {
+    if (seconds <= 0) return;
+    Sleep((DWORD)seconds * 1000);
+}
 
 typedef enum {
     RC_MOTORWAY    = 0,
@@ -1149,6 +1235,30 @@ static void vmr_graph_init(VmrGraph *g) {
     g->map = NULL;
     g->map_h = NULL;
     for (int i = 0; i < (int)VMR_NUM_PROFILES; i++) g->attr_min[i] = 1.0f;
+}
+
+/* Compute any missing per-profile edge_attr_scale arrays from the stored edge
+ * features. Older .vgraph caches (v8) only persist the original 5 profiles;
+ * this backfills eco/scenic/shortest so the AVX2 fast path works for all
+ * profiles on legacy caches. */
+static void vmr_ensure_all_attr_scales(VmrGraph *g) {
+    if (g->edge_count == 0) return;
+    if (!g->edge_f_speed || !g->edge_f_class || !g->edge_f_straight || !g->edge_f_smooth) return;
+    for (uint32_t p = 0; p < VMR_NUM_PROFILES; p++) {
+        if (g->edge_attr_scale[p]) continue;
+        float *arr = (float *)xmalloc((size_t)g->edge_count * sizeof(float));
+        if (!arr) continue;
+        for (uint32_t e = 0; e < g->edge_count; e++) {
+            *(arr + e) = vmr_edge_attr(p,
+                                       *(g->edge_length_m + e),
+                                       *(g->edge_time_s + e),
+                                       *(g->edge_f_speed + e),
+                                       *(g->edge_f_class + e),
+                                       *(g->edge_f_straight + e),
+                                       *(g->edge_f_smooth + e));
+        }
+        g->edge_attr_scale[p] = arr;
+    }
 }
 
 /* Compute per-profile min(edge_attr_scale) (admissible ALT scale). */
@@ -2908,6 +3018,75 @@ static int vmr_load_traffic(VmrGraph *g, const char *path) {
     return 0;
 }
 
+/* Find a vehicle type by name (case-insensitive). Returns NULL if not found. */
+static const VehicleType *vmr_find_vehicle(const char *name) {
+    if (name == NULL) return &vmr_vehicles[0];
+    for (int i = 0; i < VMR_NUM_VEHICLES; i++) {
+        if (c_stricmp(name, vmr_vehicles[i].name) == 0) {
+            return &vmr_vehicles[i];
+        }
+    }
+    return NULL;
+}
+
+/*
+ * Select a vehicle type for routing. This:
+ *  - sets the active vehicle (used by the fuel model + reporting),
+ *  - recomputes the eco attr array with the vehicle's speed cap (so the eco
+ *    profile minimises fuel at the vehicle's actual cruising speed),
+ *  - applies the vehicle's speed cap to edge travel times via traffic_mult
+ *    (so the fastest profile also respects the cap, e.g. an HGV is slower on
+ *    motorways).
+ * Recomputing the eco array is O(edge_count) and done once per vehicle.
+ */
+static int vmr_apply_vehicle(VmrGraph *g, const VehicleType *v) {
+    g_vehicle = v;
+    if (g->edge_count == 0) return 0;
+    LOG_INFO("Vehicle: %s (%.1f L/100km, cap %.0f km/h)",
+             v->name, v->base_l_per_100km, v->max_speed_kmh);
+
+    /* Recompute eco attr with the vehicle's capped speed. */
+    float *eco = g->edge_attr_scale[VMR_PROFILE_ECO];
+    if (!eco) {
+        eco = (float *)xmalloc((size_t)g->edge_count * sizeof(float));
+        if (!eco) return -1;
+        g->edge_attr_scale[VMR_PROFILE_ECO] = eco;
+    }
+    for (uint32_t e = 0; e < g->edge_count; e++) {
+        *(eco + e) = vmr_eco_attr(*(g->edge_length_m + e),
+                                  *(g->edge_time_s + e),
+                                  *(g->edge_f_smooth + e));
+    }
+
+    /* Apply speed cap to edge times (multiplies any existing traffic). */
+    if (v->max_speed_kmh > 0.0f) {
+        if (!g->traffic_mult) {
+            g->traffic_mult = (float *)xmalloc((size_t)g->edge_count * sizeof(float));
+            if (!g->traffic_mult) return -1;
+            for (uint32_t e = 0; e < g->edge_count; e++) {
+                *(g->traffic_mult + e) = 1.0f;
+            }
+        }
+        uint32_t capped = 0;
+        for (uint32_t e = 0; e < g->edge_count; e++) {
+            float len = *(g->edge_length_m + e);
+            float t = *(g->edge_time_s + e);
+            if (t <= EPS_F) continue;
+            float free_kmh = (len / t) * 3.6f;
+            if (free_kmh > v->max_speed_kmh) {
+                float m = free_kmh / v->max_speed_kmh;
+                *(g->traffic_mult + e) *= m;
+                capped++;
+            }
+        }
+        if (capped) {
+            LOG_INFO("Speed cap: %u edges above %.0f km/h slowed", capped, v->max_speed_kmh);
+        }
+    }
+    vmr_compute_attr_min(g);
+    return 0;
+}
+
 static int vmr_preprocess_graph(VmrRawGraph *rg, VmrGraph *g) {
     vmr_graph_free(g);
     vmr_graph_init(g);
@@ -3336,7 +3515,9 @@ static int vmr_preprocess_graph(VmrRawGraph *rg, VmrGraph *g) {
     /* Precompute attr_scale for the built-in profiles: removes the 4D dot
      * product and division from the query hot loop. The weight table is the
      * single source of truth, shared with vmr_preset_profile() and the scalar
-     * compute_attr_scale() fallback so custom weights behave consistently. */
+     * compute_attr_scale() fallback so custom weights behave consistently.
+     * The eco profile uses the fuel model (vmr_edge_attr) so its cost is
+     * proportional to fuel burned. */
     if (sm > 0) {
         for (uint32_t p = 0; p < VMR_NUM_PROFILES; p++) {
             float *arr = (float *)xmalloc((size_t)sm * sizeof(float));
@@ -3344,12 +3525,13 @@ static int vmr_preprocess_graph(VmrRawGraph *rg, VmrGraph *g) {
                 continue;
             }
             for (uint32_t e = 0; e < sm; e++) {
-                float dot = vmr_profile_attr_dot(p,
-                                                 *(g->edge_f_speed + e),
-                                                 *(g->edge_f_class + e),
-                                                 *(g->edge_f_straight + e),
-                                                 *(g->edge_f_smooth + e));
-                *(arr + e) = 1.0f / (1.0f + 0.22f * dot);
+                *(arr + e) = vmr_edge_attr(p,
+                                           *(g->edge_length_m + e),
+                                           *(g->edge_time_s + e),
+                                           *(g->edge_f_speed + e),
+                                           *(g->edge_f_class + e),
+                                           *(g->edge_f_straight + e),
+                                           *(g->edge_f_smooth + e));
             }
             g->edge_attr_scale[p] = arr;
         }
@@ -3480,6 +3662,7 @@ static int vmr_preprocess_graph(VmrRawGraph *rg, VmrGraph *g) {
 
     clock_t t1 = clock();
     double ms = 1000.0 * (double)(t1 - t0) / (double)CLOCKS_PER_SEC;
+    vmr_ensure_all_attr_scales(g);
     vmr_compute_attr_min(g);
     LOG_INFO("Preprocessed UK SoA Graph in %.1f ms: %u -> %u nodes (-%.1f%% contracted), "
              "%u -> %u edges, %u cul-de-sac nodes peeled",
@@ -3676,7 +3859,8 @@ static int vmr_load_binary(VmrGraph *g, const char *path) {
     }
     VgraphHeader hdr;
     if (fread(&hdr, sizeof(hdr), 1, fp) != 1 ||
-        hdr.magic != VGRAPH_MAGIC || hdr.version != VGRAPH_FORMAT_V ||
+        hdr.magic != VGRAPH_MAGIC ||
+        (hdr.version != 8U && hdr.version != VGRAPH_FORMAT_V) ||
         hdr.grid_dim != SPATIAL_GRID_DIM) {
         LOG_ERR("Invalid or incompatible .vgraph header in '%s'", path);
         fclose(fp);
@@ -3763,7 +3947,7 @@ static int vmr_load_binary(VmrGraph *g, const char *path) {
          * suffix stays aligned. Copied to owned buffers (freed unconditionally). */
         uint8_t amask = 0;
         if (off < (size_t)fsz.QuadPart) { amask = *(const uint8_t *)(p + off); off += 1U; }
-        for (uint32_t pi = 0; pi < 5; pi++) {
+        for (uint32_t pi = 0; pi < VMR_NUM_PROFILES; pi++) {
             if (amask & (uint8_t)(1U << pi)) {
                 g->edge_attr_scale[pi] = (float *)xmalloc((size_t)(m ? m : 1) * sizeof(float));
                 if (g->edge_attr_scale[pi] && m > 0 &&
@@ -3878,6 +4062,7 @@ static int vmr_load_binary(VmrGraph *g, const char *path) {
     }
 
     clock_t t1 = clock();
+    vmr_ensure_all_attr_scales(g);
     vmr_compute_attr_min(g);
     LOG_INFO("Loaded binary SoA graph '%s' in %.1f ms (%zu nodes, %zu edges)",
              path, 1000.0 * (double)(t1 - t0) / (double)CLOCKS_PER_SEC, n, m);
@@ -5894,8 +6079,10 @@ static VmrPreference vmr_preset_profile(const char *name) {
         id = 4;
     } else if (c_stricmp(name, "eco") == 0 || c_stricmp(name, "fuel") == 0 ||
                c_stricmp(name, "economy") == 0) {
-        /* Fuel-economy: reward smooth, low-rolling-resistance edges. */
-        p = (VmrPreference){ 1.00f, 0.50f, 0.60f, 0.40f, 2.40f, 0.0f, 0, VMR_PROFILE_ECO, 4.5f };
+        /* Fuel-economy: cost is exactly the fuel model (edge_attr_scale[eco]),
+         * with w_align = 0 so the vector alignment term does not distort the
+         * pure fuel minimum. */
+        p = (VmrPreference){ 0.00f, 0.50f, 0.60f, 0.40f, 2.40f, 0.0f, 0, VMR_PROFILE_ECO, 4.5f };
         id = VMR_PROFILE_ECO;
     } else if (c_stricmp(name, "scenic") == 0) {
         /* Scenic: reward road class and winding character over speed. */
@@ -6183,6 +6370,7 @@ static void vmr_compute_result_telemetry(const VmrGraph *g, VmrResult *res,
     }
     double tot_dist = 0.0;
     double tot_time = 0.0;
+    double tot_fuel = 0.0;
     double sum_cos_w = 0.0;
     double sum_8d_w  = 0.0;
     double net_dx = 0.0;
@@ -6190,6 +6378,7 @@ static void vmr_compute_result_telemetry(const VmrGraph *g, VmrResult *res,
     float pdx = 0.0f, pdy = 0.0f;
     int have_prev = 0;
     uint32_t turns = 0;
+    const int has_traffic = (g->traffic_mult != NULL);
 
     float gx = *(g->node_x + res->goal_idx);
     float gy = *(g->node_y + res->goal_idx);
@@ -6208,6 +6397,9 @@ static void vmr_compute_result_telemetry(const VmrGraph *g, VmrResult *res,
         uint32_t u = *(g->edge_from + eid);
         float len = *(g->edge_length_m + eid);
         float tm  = *(g->edge_time_s + eid);
+        if (has_traffic) {
+            tm *= *(g->traffic_mult + eid);
+        }
         float dx  = *(g->edge_dx + eid);
         float dy  = *(g->edge_dy + eid);
         float ux  = *(g->edge_ux + eid);
@@ -6226,6 +6418,14 @@ static void vmr_compute_result_telemetry(const VmrGraph *g, VmrResult *res,
         tot_time += (double)tm;
         net_dx   += (double)dx;
         net_dy   += (double)dy;
+
+        /* Fuel burned on this edge: L/km * km. Speed from length/time. */
+        {
+            double speed_kmh = (tm > 1e-6) ? ((double)len / tm) * 3.6 : 0.0;
+            double per_km = (double)vmr_fuel_l_per_km((float)speed_kmh,
+                                                      *(g->edge_f_smooth + eid));
+            tot_fuel += per_km * ((double)len / 1000.0);
+        }
 
         float rx = gx - *(g->node_x + u);
         float ry = gy - *(g->node_y + u);
@@ -6255,24 +6455,7 @@ static void vmr_compute_result_telemetry(const VmrGraph *g, VmrResult *res,
     res->mean_cos_sim     = (tot_dist > 1e-3) ? (sum_cos_w / tot_dist) : 1.0;
     res->cum_vec_cos_sim  = cum_cos;
     res->mean_8d_alignment= (tot_dist > 1e-3) ? (sum_8d_w / tot_dist) : 1.0;
-
-    /* Fuel estimate: base consumption * distance * smoothness correction.
-     * Lower smoothness (more stop-and-go) increases consumption. */
-    double dist_km = tot_dist / 1000.0;
-    double base_l = dist_km * (pref->fuel_l_per_100km / 100.0);
-    double smooth_factor = 1.0;
-    if (tot_dist > 1.0) {
-        double wsum = 0.0;
-        ep = res->edges;
-        while (ep < eend) {
-            uint32_t eid = *ep;
-            wsum += (double)*(g->edge_f_smooth + eid);
-            ep++;
-        }
-        double avg_smooth = wsum / res->hop_count;
-        smooth_factor = 1.0 + 0.4 * (1.0 - avg_smooth);
-    }
-    res->fuel_liters = base_l * smooth_factor;
+    res->fuel_liters      = tot_fuel;
 }
 
 /* Reusable search workspace: avoids ~14 allocations and a ~65 MB memset per
@@ -7500,8 +7683,18 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
     }
     float attr_scale_min = 1.0f / (1.0f + 0.22f * attr_dot_max);
     const float max_speed_mps = 140.0f / 3.6f; /* parser clamps at 140 km/h */
+    /* Euclidean heuristic scale: use the active profile's exact admissible
+     * min(attr_scale) when available (critical for eco, whose min is far
+     * below the weight-based fallback). */
+    float v_atr = attr_scale_min;
+    {
+        int vpid = query->pref.pref_id;
+        if (vpid >= 0 && vpid < (int)VMR_NUM_PROFILES && g->attr_min[vpid] > 0.0f) {
+            v_atr = g->attr_min[vpid];
+        }
+    }
     const float v_heur = (query->mode == MODE_DIJKSTRA)
-                       ? 0.0f : (attr_scale_min / max_speed_mps);
+                       ? 0.0f : (v_atr / max_speed_mps);
 
     float alt_gf[32], alt_gb[32], alt_sf[32], alt_sb[32];
     uint32_t L = g->landmark_count;
@@ -7522,7 +7715,7 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
         alt_scale = 1.0f;
     } else {
         int pid = query->pref.pref_id;
-        float amin = (pid >= 0 && pid < 5) ? g->attr_min[pid] : attr_scale_min;
+        float amin = (pid >= 0 && pid < (int)VMR_NUM_PROFILES) ? g->attr_min[pid] : attr_scale_min;
         if (amin <= 0.0f) amin = attr_scale_min;
         alt_scale = amin; /* admissible default (correct) */
         if (!cch_weak) {
@@ -7531,6 +7724,13 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
                 float v = (float)atof(s);
                 if (v > 0.0f && v <= 1.5f) alt_scale = v; /* opt-in strong (may be inadmissible) */
             }
+        }
+        /* Eco's admissible min is tiny (~0.15), which makes the ALT heuristic
+         * very weak (huge expansions). Most fuel-optimal roads have attr >=
+         * 0.45, so use that as a strong scale; the per-query admissibility
+         * check below retries with attr_min if the found path dips below it. */
+        if (!cch_weak && query->pref.pref_id == VMR_PROFILE_ECO && alt_scale < 0.45f) {
+            alt_scale = 0.45f;
         }
         cch_strong = (!cch_weak && alt_scale > amin + 1e-4f) ? 1 : 0;
     }
@@ -7888,8 +8088,11 @@ uint32_t u = *(g->rev_src_node + ri);
     }
 
     /* Node-budget auto-select: if the strong scale blew up (many expansions) on
-     * this route, retry once with the admissible min(attr) scale. */
-    if (cch_strong && expanded > 40000U) {
+     * this route, retry once with the admissible min(attr) scale. The eco
+     * profile is exempt: its strong scale is a deliberate speed/correctness
+     * tradeoff verified by the per-query admissibility check below, and its
+     * admissible min is so small that retrying would be far slower. */
+    if (cch_strong && expanded > 40000U && query->pref.pref_id != VMR_PROFILE_ECO) {
         LOG_INFO("ALT strong scale blew up (%u expansions); retrying with admissible min", expanded);
         vmr_result_free(res);
         vmr_result_init(res);
@@ -8081,9 +8284,10 @@ static void vmr_print_result(const VmrGraph *g, const VmrResult *res) {
     printf("Est Time    : %.1f min (%.0f s)\n", res->est_time_s / 60.0, res->est_time_s);
     printf("Vector Stats: mean_cos=%.4f | cum_vec_cos=%.5f | 8D_align=%.4f\n",
            res->mean_cos_sim, res->cum_vec_cos_sim, res->mean_8d_alignment);
-    printf("Fuel Est    : %.2f L (%.2f L/100km * %.1f km, smoothness-adjusted)\n",
+    printf("Fuel Est    : %.2f L (%.2f L/100km avg, %s, %.1f km)\n",
            res->fuel_liters,
            (res->total_distance_m > 0.0) ? (res->fuel_liters / (res->total_distance_m / 100000.0)) : 0.0,
+           g_vehicle->name,
            res->total_distance_m / 1000.0);
     printf("Performance : %u hops | %u turns | %u nodes expanded | %.3f ms\n",
            res->hop_count, res->turn_count, res->nodes_expanded, res->elapsed_ms);
@@ -8308,8 +8512,10 @@ static void print_usage(const char *prog) {
         "                                        Search algorithm (default: bidir)\n"
         "  --profile <balanced|fastest|direct|highway|local|eco|scenic|shortest>\n"
         "                                        Optimisation profile (default: balanced)\n"
+        "  --vehicle <car|van|hgv-rigid|hgv-artic|ev>  Vehicle type (fuel curve + speed cap)\n"
         "  --fuel <l/100km>                        Vehicle fuel consumption (default: 5.0)\n"
         "  --traffic <file>                        Load traffic multipliers (CSV: osm_id,mult)\n"
+        "  --watch <seconds>                       Re-route every N s, reloading traffic file\n"
         "  --weights <a,s,c,t,m[,eco]>            Custom 5-6D weights (align,spd,cls,str,sm[,eco])\n"
         "  --eco-weight <w>                        Custom eco weight for smoothness (default: 0)\n"
         "  --benchmark                             Compare bidir vs unidir vs dijkstra\n"
@@ -8334,7 +8540,9 @@ int main(int argc, char **argv) {
     const char *save_bin   = NULL;
     const char *load_bin   = NULL;
     const char *traffic_file = NULL;
+    const char *vehicle_name = NULL;
     const char *geojson_out= NULL;
+    int watch_seconds = 0;
 
     int do_demo = 0, do_preproc = 0, do_bench = 0, do_inter = 0, do_test = 0;
     int do_rcoord = 0, do_rid = 0;
@@ -8383,10 +8591,15 @@ int main(int argc, char **argv) {
             geojson_out = *(argv + (++i));
         } else if (strcmp(a, "--profile") == 0 && i + 1 < argc) {
             pref = vmr_preset_profile(*(argv + (++i)));
+        } else if (strcmp(a, "--vehicle") == 0 && i + 1 < argc) {
+            vehicle_name = *(argv + (++i));
         } else if (strcmp(a, "--fuel") == 0 && i + 1 < argc) {
             pref.fuel_l_per_100km = (float)atof(*(argv + (++i)));
         } else if (strcmp(a, "--traffic") == 0 && i + 1 < argc) {
             traffic_file = *(argv + (++i));
+        } else if (strcmp(a, "--watch") == 0 && i + 1 < argc) {
+            watch_seconds = atoi(*(argv + (++i)));
+            if (watch_seconds < 1) watch_seconds = 60;
         } else if (strcmp(a, "--weights") == 0 && i + 1 < argc) {
             float wa, ws, wc, wt, wm, we = 0.0f;
             int n = sscanf(*(argv + (++i)), "%f,%f,%f,%f,%f,%f", &wa, &ws, &wc, &wt, &wm, &we);
@@ -8481,6 +8694,22 @@ int main(int argc, char **argv) {
         }
     }
 
+    if (vehicle_name && graph.node_count > 0) {
+        const VehicleType *v = vmr_find_vehicle(vehicle_name);
+        if (!v) {
+            fprintf(stderr, "Unknown vehicle '%s'. Options:", vehicle_name);
+            for (int i = 0; i < VMR_NUM_VEHICLES; i++) fprintf(stderr, " %s", vmr_vehicles[i].name);
+            fprintf(stderr, "\n");
+            vmr_graph_free(&graph);
+            return 1;
+        }
+        if (vmr_apply_vehicle(&graph, v) != 0) {
+            vmr_graph_free(&graph);
+            return 1;
+        }
+        pref.fuel_l_per_100km = v->base_l_per_100km;
+    }
+
     if (do_rcoord || do_rid) {
         uint32_t s = do_rcoord ? vmr_snap_coord(&graph, la1, lo1, 1)
                                : idmap_get(&graph.osm_map, id_a);
@@ -8503,6 +8732,34 @@ int main(int argc, char **argv) {
         }
         if (do_bench) {
             vmr_benchmark(&graph, s, t, &pref);
+        }
+        /* Live-traffic watch loop: reload the traffic file every N seconds and
+         * re-route. A real feed would rewrite the file; this demonstrates the
+         * update cycle without needing a network source. */
+        if (watch_seconds > 0 && traffic_file != NULL) {
+            printf("\n=== Live-traffic watch: refreshing '%s' every %d s (Ctrl+C to stop) ===\n",
+                   traffic_file, watch_seconds);
+            for (;;) {
+                sleep_seconds(watch_seconds);
+                if (graph.traffic_mult) {
+                    xfree(graph.traffic_mult);
+                    graph.traffic_mult = NULL;
+                }
+                if (vmr_load_traffic(&graph, traffic_file) != 0) {
+                    LOG_WARN("Traffic reload failed; keeping previous route");
+                    continue;
+                }
+                time_t now = time(NULL);
+                struct tm *lt = localtime(&now);
+                char ts[16];
+                strftime(ts, sizeof(ts), "%H:%M:%S", lt);
+                printf("\n[%s] Re-route with updated traffic:\n", ts);
+                vmr_result_init(&res);
+                if (vmr_find_path(&graph, s, t, &q, &res) == 0) {
+                    vmr_print_result(&graph, &res);
+                    vmr_result_free(&res);
+                }
+            }
         }
     }
 
