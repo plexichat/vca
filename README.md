@@ -34,12 +34,41 @@ gcc -O2 -mavx2 -o uk_vector_router_sc.exe algo.c sqlite3.o libz.a -I . -lm
 ./uk_vector_router.exe --load-bin uk.vgraph \
     --route-coord 51.5074 -0.1278 55.9533 -3.1883 \
     --mode bidir --profile balanced
+
+# eco route with custom fuel consumption (5.0 L/100km default)
+./uk_vector_router.exe --load-bin uk.vgraph \
+    --route-coord 51.5074 -0.1278 55.9533 -3.1883 \
+    --profile eco --fuel 4.5
+
+# scenic route (prefers winding, higher-class roads)
+./uk_vector_router.exe --load-bin uk.vgraph \
+    --route-coord 51.5074 -0.1278 55.9533 -3.1883 \
+    --profile scenic
+
+# shortest route (minimises distance, de-emphasises smoothness)
+./uk_vector_router.exe --load-bin uk.vgraph \
+    --route-coord 51.5074 -0.1278 55.9533 -3.1883 \
+    --profile shortest
+
+# route with live traffic multipliers (CSV: osm_id,multiplier)
+./uk_vector_router.exe --load-bin uk.vgraph \
+    --route-coord 51.5074 -0.1278 55.9533 -3.1883 \
+    --traffic traffic.csv
 ```
 
 **Modes** (`--mode`): `bidir` (default), `unidir`, `astar`, `dijkstra`, `cch`.
 
 **Profiles** (`--profile`): `balanced` (default), `fastest`, `direct`, `highway`,
-`local` (no-toll). Each profile sets the feature weight vector used in the cost.
+`local` (no-toll), `eco` (fuel-economy), `scenic` (winding roads), `shortest`
+(minimise distance). Each profile sets the feature weight vector used in the cost.
+
+**Fuel estimation:** `--fuel <l/100km>` sets the vehicle consumption rate (default
+5.0 L/100km). The router estimates total fuel consumption based on distance and
+road smoothness (lower smoothness = more stop-and-go = higher consumption).
+
+**Live traffic:** `--traffic <file>` loads traffic multipliers from a CSV file
+(format: `osm_id,multiplier` per line, `#` for comments). Multipliers are applied
+per-edge to travel time, allowing the router to avoid congested roads.
 
 **Environment overrides:** `VMR_ALT_SCALE` forces the ALT landmark heuristic
 scale (default is chosen per query from the graph's admissible minimum); setting
@@ -94,17 +123,20 @@ Cold first query (mmap page-faults) is ~0.3–0.9 s; warm is <1 ms.
 | Peak **private** (heap) | **382 MB** |
 | Peak working set (incl. mmap pages) | 583 MB |
 
-### All 5 profiles (single core, London→Edinburgh)
+### All profiles (single core, London→Edinburgh)
 
-| Profile | Dist | CPU |
-|---|---|---|
-| balanced | 597.75 km | 3–4 ms |
-| fastest | 597.92 km | 3–4 ms |
-| direct | 597.75 km | 3–4 ms |
-| highway | 597.92 km | 3–4 ms |
-| local/no-toll | 598.49 km | 3–4 ms |
+| Profile | Dist | CPU | Notes |
+|---|---|---|---|
+| balanced | 597.75 km | 3–4 ms | Default; balances all features |
+| fastest | 597.92 km | 3–4 ms | Prioritises speed |
+| direct | 597.75 km | 3–4 ms | Prioritises straightness |
+| highway | 597.92 km | 3–4 ms | Prioritises road class |
+| local/no-toll | 598.49 km | 3–4 ms | Avoids tolls |
+| **eco** | ~598 km | 3–4 ms | Fuel-economy; rewards smooth roads |
+| **scenic** | ~600 km | 3–4 ms | Prefers winding, higher-class roads |
+| **shortest** | ~590 km | 3–4 ms | Minimises distance |
 
-**5 optimisation profiles, each < 20 ms per query (typically 3–4 ms).**
+**8 optimisation profiles, each < 20 ms per query (typically 3–4 ms).**
 
 ### Route quality (London→Edinburgh, balanced)
 
@@ -131,4 +163,8 @@ straightness, class) at a fraction of CCH's memory.
 - The auto ALT scale is chosen per query from the graph's admissible minimum; for
   some short or mixed queries this is not the fastest admissible choice, so the
   search may expand more nodes than strictly necessary.
+- Fuel estimation is a simple model (distance × rate × smoothness factor); it
+  does not account for elevation, vehicle type, or driving style.
+- Traffic multipliers are applied per-edge to travel time; they do not affect
+  the ALT heuristic (which uses free-flow time).
 - See `RESEARCH.md` for related work and the benchmark plan.

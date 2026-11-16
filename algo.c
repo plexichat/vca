@@ -60,9 +60,21 @@ static inline float vmr_sqrt_fast(float x) {
 /* SECTION 1: CONSTANTS, TYPES & LOGGING                                     */
 /* ========================================================================= */
 
-#define UVR_VERSION      "2.0.0"
+#define UVR_VERSION      "2.1.0"
 #define VGRAPH_MAGIC     0x564D5235U /* "VMR5" */
-#define VGRAPH_FORMAT_V  8U
+#define VGRAPH_FORMAT_V  9U
+
+/* Number of built-in optimisation profiles. Precomputed edge_attr_scale
+ * arrays and per-profile admissible ALT scales are sized to this. */
+#define VMR_NUM_PROFILES 8U
+#define VMR_PROFILE_BALANCED 0
+#define VMR_PROFILE_FASTEST  1
+#define VMR_PROFILE_DIRECT   2
+#define VMR_PROFILE_HIGHWAY  3
+#define VMR_PROFILE_LOCAL    4
+#define VMR_PROFILE_ECO      5
+#define VMR_PROFILE_SCENIC   6
+#define VMR_PROFILE_SHORTEST 7
 
 #define VMR_INVALID      UINT32_MAX
 #define EARTH_RADIUS_M   6371008.8
@@ -76,6 +88,33 @@ static inline float vmr_sqrt_fast(float x) {
 
 #define SPATIAL_GRID_DIM 128
 #define EPS_F            1e-6f
+
+/*
+ * Built-in profile feature-weight table: {speed, class, straight, smooth}.
+ * The edge_attr_scale for a profile is 1/(1 + 0.22 * dot(w, f_edge)), so a
+ * larger weight on a feature that the edge scores high on yields a smaller
+ * (cheaper) cost. The eco profile rewards high-smoothness (low rolling
+ * resistance) edges via a heavy smooth weight, approximating fuel economy.
+ * This table is the single source of truth shared by the preprocessor and the
+ * scalar compute_attr_scale() fallback.
+ */
+static const float vmr_profile_w[VMR_NUM_PROFILES][4] = {
+    /* balanced */  {1.20f, 1.00f, 0.60f, 0.50f},
+    /* fastest  */  {2.20f, 1.50f, 0.30f, 0.40f},
+    /* direct   */  {0.50f, 0.30f, 1.20f, 0.30f},
+    /* highway  */  {1.80f, 2.20f, 0.50f, 0.60f},
+    /* local    */  {0.70f, 0.20f, 0.80f, 1.40f},
+    /* eco      */  {0.50f, 0.70f, 0.40f, 2.60f},
+    /* scenic   */  {0.30f, 0.40f, 1.80f, 1.00f},
+    /* shortest */  {0.80f, 0.80f, 1.40f, 0.20f}
+};
+
+/* Weighted feature dot product for a built-in profile. */
+static inline float vmr_profile_attr_dot(uint32_t p, float f_speed, float f_class,
+                                         float f_straight, float f_smooth) {
+    const float *w = vmr_profile_w[p];
+    return w[0] * f_speed + w[1] * f_class + w[2] * f_straight + w[3] * f_smooth;
+}
 
 typedef enum {
     LOG_ERR_L  = 0,
@@ -144,8 +183,10 @@ typedef struct {
     float w_class;    /* Road hierarchy (motorway/trunk/primary) weight  */
     float w_straight; /* Macro-vector straightness (tortuosity) weight   */
     float w_smooth;   /* Smoothness / toll-free preference weight        */
+    float w_eco;      /* Fuel-economy (low-consumption) weight           */
     int   avoid_tolls;
-    int   pref_id;    /* 0..4 built-in profile, -1 custom weights */
+    int   pref_id;    /* 0..VMR_NUM_PROFILES-1 built-in, -1 custom weights */
+    float fuel_l_per_100km; /* vehicle consumption used for the fuel estimate */
 } VmrPreference;
 
 typedef struct __attribute__((aligned(32))) {
@@ -154,7 +195,7 @@ typedef struct __attribute__((aligned(32))) {
     float dx[4], dy[4];
     float vx[4], vy[4];
     float time[4];
-    float attr[5][4];   /* per built-in profile, lane-contiguous */
+    float attr[VMR_NUM_PROFILES][4]; /* per built-in profile, lane-contiguous */
     uint8_t flags[4];
     uint8_t pad[12];
 } EdgeBlock4;
@@ -940,8 +981,13 @@ typedef struct {
     uint32_t *ch_child1;
     uint32_t *ch_child2;
 
-    float *edge_attr_scale[5];
-    float  attr_min[5]; /* per-profile min(edge_attr_scale) (admissible ALT scale) */
+    float *edge_attr_scale[VMR_NUM_PROFILES];
+    float  attr_min[VMR_NUM_PROFILES]; /* per-profile min(edge_attr_scale) (admissible ALT scale) */
+
+    /* Live-traffic travel-time multipliers (1.0 = free-flow). NULL until a
+     * traffic feed is loaded; when non-NULL, edge_time_s is scaled by this
+     * per-edge factor at query time. */
+    float *traffic_mult;
 
     EdgeBlock4 *rev_blocks;
     uint32_t *rev_block_off;
@@ -981,6 +1027,7 @@ typedef struct {
     double     mean_cos_sim;
     double     cum_vec_cos_sim;
     double     mean_8d_alignment;
+    double     fuel_liters;       /* estimated fuel consumption (litres) */
     uint32_t   nodes_expanded;
     double     elapsed_ms;
 } VmrResult;
@@ -1101,12 +1148,12 @@ static void vmr_graph_init(VmrGraph *g) {
     memset(g, 0, sizeof(*g));
     g->map = NULL;
     g->map_h = NULL;
-    for (int i = 0; i < 5; i++) g->attr_min[i] = 1.0f;
+    for (int i = 0; i < (int)VMR_NUM_PROFILES; i++) g->attr_min[i] = 1.0f;
 }
 
 /* Compute per-profile min(edge_attr_scale) (admissible ALT scale). */
 static void vmr_compute_attr_min(VmrGraph *g) {
-    for (uint32_t p = 0; p < 5; p++) {
+    for (uint32_t p = 0; p < VMR_NUM_PROFILES; p++) {
         const float *a = g->edge_attr_scale[p];
         if (!a) { g->attr_min[p] = 1.0f; continue; }
         float mn = 1.0f;
@@ -1163,9 +1210,10 @@ static void vmr_graph_free(VmrGraph *g) {
         xfree(g->ch_child1);
         xfree(g->ch_child2);
     }
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < (int)VMR_NUM_PROFILES; i++) {
         xfree(g->edge_attr_scale[i]);
     }
+    xfree(g->traffic_mult);
     xfree_aligned(g->rev_blocks);
     xfree(g->rev_block_off);
     if (!g->map) {
@@ -2259,7 +2307,7 @@ static void vmr_build_edge_blocks(VmrGraph *g) {
                         blk->vx[l] = *(g->node_x + to);
                         blk->vy[l] = *(g->node_y + to);
                         blk->time[l] = *(g->edge_time_s + eid);
-                        for (uint32_t p = 0; p < 5; p++) {
+                        for (uint32_t p = 0; p < VMR_NUM_PROFILES; p++) {
                             blk->attr[p][l] = g->edge_attr_scale[p]
                                                   ? *(g->edge_attr_scale[p] + eid) : 1.0f;
                         }
@@ -2612,8 +2660,8 @@ static void vmr_reorder_graph(VmrGraph *g) {
     float *n_len = (float *)xmalloc(m * sizeof(float));
     float *n_time = (float *)xmalloc(m * sizeof(float));
     uint8_t *n_eflags = (uint8_t *)xmalloc(m);
-    float *n_attr[5];
-    for (uint32_t p = 0; p < 5; p++) {
+    float *n_attr[VMR_NUM_PROFILES];
+    for (uint32_t p = 0; p < VMR_NUM_PROFILES; p++) {
         n_attr[p] = (float *)xmalloc(m * sizeof(float));
     }
     if (!n_from || !n_to || !n_dx || !n_dy || !n_ux || !n_uy || !n_fs || !n_fc ||
@@ -2626,7 +2674,7 @@ static void vmr_reorder_graph(VmrGraph *g) {
         xfree(perm); xfree(iperm); xfree(nfill); xfree(rfill);
         return;
     }
-    for (uint32_t p = 0; p < 5; p++) {
+    for (uint32_t p = 0; p < VMR_NUM_PROFILES; p++) {
         if (n_attr[p]) {
             continue;
         }
@@ -2658,7 +2706,7 @@ static void vmr_reorder_graph(VmrGraph *g) {
             *(n_len + pos) = *(g->edge_length_m + e);
             *(n_time + pos) = *(g->edge_time_s + e);
             *(n_eflags + pos) = *(g->edge_flags + e);
-            for (uint32_t p = 0; p < 5; p++) {
+            for (uint32_t p = 0; p < VMR_NUM_PROFILES; p++) {
                 *(n_attr[p] + pos) = g->edge_attr_scale[p]
                                          ? *(g->edge_attr_scale[p] + e) : 1.0f;
             }
@@ -2779,7 +2827,7 @@ static void vmr_reorder_graph(VmrGraph *g) {
     g->edge_length_m = n_len;
     g->edge_time_s = n_time;
     g->edge_flags = n_eflags;
-    for (uint32_t p = 0; p < 5; p++) {
+    for (uint32_t p = 0; p < VMR_NUM_PROFILES; p++) {
         g->edge_attr_scale[p] = n_attr[p];
     }
     g->rev_offsets = roff;
@@ -2813,6 +2861,51 @@ static int vmr_rev_enabled(void) {
                    strcmp(s, "full") == 0)) ? 1 : 0;
     }
     return v;
+}
+
+/*
+ * Load traffic multipliers from a CSV file (osm_id, multiplier).
+ * Lines starting with '#' are ignored. Creates a per-edge multiplier array
+ * (default 1.0) and applies the multiplier to edges whose from-node matches
+ * the given osm_id.
+ */
+static int vmr_load_traffic(VmrGraph *g, const char *path) {
+    FILE *fp = fopen(path, "r");
+    if (!fp) {
+        LOG_ERR("Cannot open traffic file '%s'", path);
+        return -1;
+    }
+    g->traffic_mult = (float *)xmalloc(g->edge_count * sizeof(float));
+    if (!g->traffic_mult) {
+        fclose(fp);
+        return -1;
+    }
+    for (uint32_t e = 0; e < g->edge_count; e++) {
+        *(g->traffic_mult + e) = 1.0f;
+    }
+    char line[256];
+    uint32_t loaded = 0;
+    while (fgets(line, sizeof(line), fp)) {
+        if (line[0] == '#' || line[0] == '\n' || line[0] == '\r') continue;
+        int64_t osm_id;
+        float mult;
+        if (sscanf(line, "%lld,%f", &osm_id, &mult) == 2 && mult > 0.0f) {
+            /* Find edges from nodes with this osm_id */
+            for (uint32_t i = 0; i < g->node_count; i++) {
+                if (*(g->node_osm_id + i) == osm_id) {
+                    uint32_t beg = *(g->fwd_offsets + i);
+                    uint32_t end = *(g->fwd_offsets + i + 1U);
+                    for (uint32_t e = beg; e < end; e++) {
+                        *(g->traffic_mult + e) = mult;
+                    }
+                    loaded++;
+                }
+            }
+        }
+    }
+    fclose(fp);
+    LOG_INFO("Loaded traffic multipliers: %u nodes matched", loaded);
+    return 0;
 }
 
 static int vmr_preprocess_graph(VmrRawGraph *rg, VmrGraph *g) {
@@ -3240,26 +3333,22 @@ static int vmr_preprocess_graph(VmrRawGraph *rg, VmrGraph *g) {
         (*(g->fwd_offsets + u + 1U))++;
     }
 
-    /* Precompute attr_scale for the five built-in profiles: removes the 4D dot
-     * product and division from the query hot loop. */
-    static const float pw[5][4] = {
-        {1.20f, 1.00f, 0.60f, 0.50f},
-        {2.20f, 1.50f, 0.30f, 0.40f},
-        {0.50f, 0.30f, 1.20f, 0.30f},
-        {1.80f, 2.20f, 0.50f, 0.60f},
-        {0.70f, 0.20f, 0.80f, 1.40f}
-    };
+    /* Precompute attr_scale for the built-in profiles: removes the 4D dot
+     * product and division from the query hot loop. The weight table is the
+     * single source of truth, shared with vmr_preset_profile() and the scalar
+     * compute_attr_scale() fallback so custom weights behave consistently. */
     if (sm > 0) {
-        for (uint32_t p = 0; p < 5; p++) {
+        for (uint32_t p = 0; p < VMR_NUM_PROFILES; p++) {
             float *arr = (float *)xmalloc((size_t)sm * sizeof(float));
             if (!arr) {
                 continue;
             }
             for (uint32_t e = 0; e < sm; e++) {
-                float dot = pw[p][0] * *(g->edge_f_speed + e) +
-                            pw[p][1] * *(g->edge_f_class + e) +
-                            pw[p][2] * *(g->edge_f_straight + e) +
-                            pw[p][3] * *(g->edge_f_smooth + e);
+                float dot = vmr_profile_attr_dot(p,
+                                                 *(g->edge_f_speed + e),
+                                                 *(g->edge_f_class + e),
+                                                 *(g->edge_f_straight + e),
+                                                 *(g->edge_f_smooth + e));
                 *(arr + e) = 1.0f / (1.0f + 0.22f * dot);
             }
             g->edge_attr_scale[p] = arr;
@@ -5789,25 +5878,39 @@ static VmrPreference vmr_preset_profile(const char *name) {
     VmrPreference p;
     int id = 0;
     if (name == NULL || c_stricmp(name, "balanced") == 0) {
-        p = (VmrPreference){ 1.40f, 1.20f, 1.00f, 0.60f, 0.50f, 0, 0 };
+        p = (VmrPreference){ 1.40f, 1.20f, 1.00f, 0.60f, 0.50f, 0.0f, 0, 0, 5.0f };
         id = 0;
     } else if (c_stricmp(name, "fastest") == 0) {
-        p = (VmrPreference){ 0.80f, 2.20f, 1.50f, 0.30f, 0.40f, 0, 0 };
+        p = (VmrPreference){ 0.80f, 2.20f, 1.50f, 0.30f, 0.40f, 0.0f, 0, 1, 5.0f };
         id = 1;
     } else if (c_stricmp(name, "direct") == 0) {
-        p = (VmrPreference){ 2.60f, 0.50f, 0.30f, 1.20f, 0.30f, 0, 0 };
+        p = (VmrPreference){ 2.60f, 0.50f, 0.30f, 1.20f, 0.30f, 0.0f, 0, 2, 5.0f };
         id = 2;
     } else if (c_stricmp(name, "highway") == 0) {
-        p = (VmrPreference){ 1.10f, 1.80f, 2.20f, 0.50f, 0.60f, 0, 0 };
+        p = (VmrPreference){ 1.10f, 1.80f, 2.20f, 0.50f, 0.60f, 0.0f, 0, 3, 5.0f };
         id = 3;
     } else if (c_stricmp(name, "local") == 0 || c_stricmp(name, "no-toll") == 0) {
-        p = (VmrPreference){ 1.30f, 0.70f, 0.20f, 0.80f, 1.40f, 1, 0 };
+        p = (VmrPreference){ 1.30f, 0.70f, 0.20f, 0.80f, 1.40f, 0.0f, 1, 4, 5.0f };
         id = 4;
+    } else if (c_stricmp(name, "eco") == 0 || c_stricmp(name, "fuel") == 0 ||
+               c_stricmp(name, "economy") == 0) {
+        /* Fuel-economy: reward smooth, low-rolling-resistance edges. */
+        p = (VmrPreference){ 1.00f, 0.50f, 0.60f, 0.40f, 2.40f, 0.0f, 0, VMR_PROFILE_ECO, 4.5f };
+        id = VMR_PROFILE_ECO;
+    } else if (c_stricmp(name, "scenic") == 0) {
+        /* Scenic: reward road class and winding character over speed. */
+        p = (VmrPreference){ 1.20f, 0.40f, 0.40f, 1.80f, 1.00f, 0.0f, 0, VMR_PROFILE_SCENIC, 6.5f };
+        id = VMR_PROFILE_SCENIC;
+    } else if (c_stricmp(name, "shortest") == 0) {
+        /* Shortest: prefer straightness, de-emphasise smoothness. */
+        p = (VmrPreference){ 0.80f, 0.80f, 0.80f, 1.60f, 0.20f, 0.0f, 0, VMR_PROFILE_SHORTEST, 5.5f };
+        id = VMR_PROFILE_SHORTEST;
     } else {
-        p = (VmrPreference){ 1.40f, 1.20f, 1.00f, 0.60f, 0.50f, 0, 0 };
+        p = (VmrPreference){ 1.40f, 1.20f, 1.00f, 0.60f, 0.50f, 0.0f, 0, 0, 5.0f };
         id = 0;
     }
     p.pref_id = id;
+    p.fuel_l_per_100km = 5.0f;
     return p;
 }
 
@@ -5942,7 +6045,8 @@ static inline float compute_attr_scale(const VmrGraph *g, uint32_t eid,
     float dot = (p->w_speed    * *(g->edge_f_speed + eid)) +
                 (p->w_class    * *(g->edge_f_class + eid)) +
                 (p->w_straight * *(g->edge_f_straight + eid)) +
-                (p->w_smooth   * *(g->edge_f_smooth + eid));
+                (p->w_smooth   * *(g->edge_f_smooth + eid)) +
+                (p->w_eco      * *(g->edge_f_smooth + eid));
     return 1.0f / (1.0f + 0.22f * dot);
 }
 
@@ -5952,6 +6056,9 @@ static inline float compute_8d_step_cost(const VmrGraph *g, uint32_t eid,
                                          float cos1, float cos2, float mom_dot,
                                          float cross_ratio) {
     float base_time = *(g->edge_time_s + eid);
+    if (g->traffic_mult) {
+        base_time *= *(g->traffic_mult + eid);
+    }
     if (p->avoid_tolls && (*(g->edge_flags + eid) & EDGE_TOLL)) {
         base_time *= 3.8f;
     }
@@ -5976,9 +6083,12 @@ static inline float compute_8d_step_cost(const VmrGraph *g, uint32_t eid,
 
 /* Cheaper admissible lower bound: full cost with cos2=1 and corridor term = 1. */
 static inline float compute_8d_cost_min(const VmrGraph *g, uint32_t eid,
-                                         const VmrPreference *p, SearchMode mode,
-                                         float attr_scale, float cos1, float mom_dot) {
+                                        const VmrPreference *p, SearchMode mode,
+                                        float attr_scale, float cos1, float mom_dot) {
     float base_time = *(g->edge_time_s + eid);
+    if (g->traffic_mult) {
+        base_time *= *(g->traffic_mult + eid);
+    }
     if (p->avoid_tolls && (*(g->edge_flags + eid) & EDGE_TOLL)) {
         base_time *= 3.8f;
     }
@@ -6145,6 +6255,24 @@ static void vmr_compute_result_telemetry(const VmrGraph *g, VmrResult *res,
     res->mean_cos_sim     = (tot_dist > 1e-3) ? (sum_cos_w / tot_dist) : 1.0;
     res->cum_vec_cos_sim  = cum_cos;
     res->mean_8d_alignment= (tot_dist > 1e-3) ? (sum_8d_w / tot_dist) : 1.0;
+
+    /* Fuel estimate: base consumption * distance * smoothness correction.
+     * Lower smoothness (more stop-and-go) increases consumption. */
+    double dist_km = tot_dist / 1000.0;
+    double base_l = dist_km * (pref->fuel_l_per_100km / 100.0);
+    double smooth_factor = 1.0;
+    if (tot_dist > 1.0) {
+        double wsum = 0.0;
+        ep = res->edges;
+        while (ep < eend) {
+            uint32_t eid = *ep;
+            wsum += (double)*(g->edge_f_smooth + eid);
+            ep++;
+        }
+        double avg_smooth = wsum / res->hop_count;
+        smooth_factor = 1.0 + 0.4 * (1.0 - avg_smooth);
+    }
+    res->fuel_liters = base_l * smooth_factor;
 }
 
 /* Reusable search workspace: avoids ~14 allocations and a ~65 MB memset per
@@ -6698,6 +6826,9 @@ static inline uint32_t vmr_expand_fwd_block(
         } else {
             base = tim;
         }
+        if (g->traffic_mult) {
+            base = _mm_mul_ps(base, _mm_loadu_ps(g->traffic_mult + e));
+        }
 
         __m128 cost = _mm_max_ps(_mm_mul_ps(_mm_mul_ps(base, attr),
                                             _mm_mul_ps(align, corr)), mincost);
@@ -6876,6 +7007,15 @@ static inline uint32_t vmr_expand_bwd_block(
             base = _mm_blendv_ps(tim, _mm_mul_ps(tim, tollv), mask);
         } else {
             base = tim;
+        }
+        if (g->traffic_mult) {
+            /* Reverse-block lane l maps to forward edge id g->rev_fwd_eid[rbase + 4*bb + l] */
+            float tmul[4];
+            for (int l = 0; l < 4; l++) {
+                uint32_t fe = *(g->rev_fwd_eid + (rbase + (bb - bb0) * 4U + (uint32_t)l));
+                tmul[l] = *(g->traffic_mult + fe);
+            }
+            base = _mm_mul_ps(base, _mm_loadu_ps(tmul));
         }
 
         __m128 cost = _mm_max_ps(_mm_mul_ps(_mm_mul_ps(base, attr),
@@ -7203,6 +7343,18 @@ static int vmr_cch_query(const VmrGraph *g, uint32_t start, uint32_t goal,
  *   MODE_DIJKSTRA   -> True uninformed Dijkstra (travel time)
  *   MODE_CCH        -> Contraction-Hierarchy query
  */
+static uint32_t vmr_expand_fwd_block(
+    const VmrGraph *g, VmrSearchWS *ws, MinHeap *pq,
+    uint32_t epoch, uint32_t u, uint32_t goal_idx,
+    float gu, float umx, float umy, float urx, float ury,
+    float gx, float gy, float sx, float sy,
+    float chord_dx, float chord_dy, float inv_chord,
+    const VmrPreference *pref, uint32_t pref_id,
+    int use_cross, int use_alt, const float *alt_gf, const float *alt_gb,
+    float alt_scale, uint32_t L, float v_heur,
+    float *best_total, uint32_t *meet_node,
+    int track_meet, int skip_dead);
+
 static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_idx,
                          const VmrQuery *query, VmrResult *res) {
     vmr_result_free(res);
@@ -7247,7 +7399,7 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
 
     clock_t t0 = clock();
     uint32_t n = g->node_count;
-    const float *as_arr = (query->pref.pref_id >= 0 && query->pref.pref_id < 5)
+    const float *as_arr = (query->pref.pref_id >= 0 && query->pref.pref_id < (int)VMR_NUM_PROFILES)
                         ? g->edge_attr_scale[query->pref.pref_id] : NULL;
     int skip_dead = !g->ch_built &&
                     !(*(g->node_flags + start_idx) & NODE_DEAD_TREE) &&
@@ -7449,7 +7601,7 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
             float umx = ws->sf[u].mx, umy = ws->sf[u].my;
 
             uint32_t ei = *(g->fwd_offsets + u);
-            if (vmr_blocks_enabled() && g->th_off && query->pref.pref_id >= 0 && query->pref.pref_id < 5) {
+            if (vmr_blocks_enabled() && g->th_off && query->pref.pref_id >= 0 && query->pref.pref_id < (int)VMR_NUM_PROFILES) {
                 ei = vmr_expand_fwd_block(g, ws, pq_fwd, epoch, u, goal_idx,
                     ws->sf[u].g, umx, umy, urx, ury, gx, gy, sx, sy,
                     chord_dx, chord_dy, inv_chord, &query->pref,
@@ -7559,7 +7711,7 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
                 float umx = ws->sf[u].mx, umy = ws->sf[u].my;
 
                 uint32_t ei = *(g->fwd_offsets + u);
-                if (vmr_blocks_enabled() && g->th_off && query->pref.pref_id >= 0 && query->pref.pref_id < 5) {
+                if (vmr_blocks_enabled() && g->th_off && query->pref.pref_id >= 0 && query->pref.pref_id < (int)VMR_NUM_PROFILES) {
                     ei = vmr_expand_fwd_block(g, ws, pq_fwd, epoch, u, goal_idx,
                         ws->sf[u].g, umx, umy, urx, ury, gx, gy, sx, sy,
                         chord_dx, chord_dy, inv_chord, &query->pref,
@@ -7655,7 +7807,7 @@ if (skip_dead && (*(g->edge_flags + ei) & EDGE_DEAD_TARGET)) continue;
                 float wmx = ws->sb[w].mx, wmy = ws->sb[w].my;
 
                 uint32_t ri = *(g->rev_offsets + w);
-                if (vmr_rev_enabled() && g->rev_blocks && query->pref.pref_id >= 0 && query->pref.pref_id < 5) {
+                if (vmr_rev_enabled() && g->rev_blocks && query->pref.pref_id >= 0 && query->pref.pref_id < (int)VMR_NUM_PROFILES) {
                     ri = vmr_expand_bwd_block(g, ws, pq_bwd, epoch, w, start_idx,
                         ws->sb[w].g, wmx, wmy, urx, ury, sx, sy,
                         chord_dx, chord_dy, inv_chord, &query->pref,
@@ -7802,7 +7954,7 @@ uint32_t u = *(g->rev_src_node + ri);
     /* Per-query admissibility check: if the strong scale over-estimated on an edge
      * of the found path (its attr < scale), the result may be sub-optimal -> retry
      * once with the admissible min(attr). */
-    if (res->found && cch_strong && !cch_weak && query->pref.pref_id >= 0 && query->pref.pref_id < 5) {
+    if (res->found && cch_strong && !cch_weak && query->pref.pref_id >= 0 && query->pref.pref_id < (int)VMR_NUM_PROFILES) {
         const float *as2 = g->edge_attr_scale[query->pref.pref_id];
         if (as2 != NULL && alt_scale > 0.0f && res->hop_count > 0) {
             float mn = FLT_MAX;
@@ -7929,6 +8081,10 @@ static void vmr_print_result(const VmrGraph *g, const VmrResult *res) {
     printf("Est Time    : %.1f min (%.0f s)\n", res->est_time_s / 60.0, res->est_time_s);
     printf("Vector Stats: mean_cos=%.4f | cum_vec_cos=%.5f | 8D_align=%.4f\n",
            res->mean_cos_sim, res->cum_vec_cos_sim, res->mean_8d_alignment);
+    printf("Fuel Est    : %.2f L (%.2f L/100km * %.1f km, smoothness-adjusted)\n",
+           res->fuel_liters,
+           (res->total_distance_m > 0.0) ? (res->fuel_liters / (res->total_distance_m / 100000.0)) : 0.0,
+           res->total_distance_m / 1000.0);
     printf("Performance : %u hops | %u turns | %u nodes expanded | %.3f ms\n",
            res->hop_count, res->turn_count, res->nodes_expanded, res->elapsed_ms);
 
@@ -8150,8 +8306,12 @@ static void print_usage(const char *prog) {
         "  --route-id <osmA> <osmB>                Route between OSM intersection IDs\n"
         "  --mode <bidir|unidir|astar|dijkstra|cch>\n"
         "                                        Search algorithm (default: bidir)\n"
-        "  --profile <balanced|fastest|direct|highway|local>\n"
-        "  --weights <a,s,c,t,m>                   Custom 5D weights (align,spd,cls,str,sm)\n"
+        "  --profile <balanced|fastest|direct|highway|local|eco|scenic|shortest>\n"
+        "                                        Optimisation profile (default: balanced)\n"
+        "  --fuel <l/100km>                        Vehicle fuel consumption (default: 5.0)\n"
+        "  --traffic <file>                        Load traffic multipliers (CSV: osm_id,mult)\n"
+        "  --weights <a,s,c,t,m[,eco]>            Custom 5-6D weights (align,spd,cls,str,sm[,eco])\n"
+        "  --eco-weight <w>                        Custom eco weight for smoothness (default: 0)\n"
         "  --benchmark                             Compare bidir vs unidir vs dijkstra\n"
         "  --geojson <out.geojson>                 Export computed route as GeoJSON\n"
         "  --interactive                           Start interactive UK routing shell\n"
@@ -8173,6 +8333,7 @@ int main(int argc, char **argv) {
     const char *csv_edges  = NULL;
     const char *save_bin   = NULL;
     const char *load_bin   = NULL;
+    const char *traffic_file = NULL;
     const char *geojson_out= NULL;
 
     int do_demo = 0, do_preproc = 0, do_bench = 0, do_inter = 0, do_test = 0;
@@ -8222,13 +8383,21 @@ int main(int argc, char **argv) {
             geojson_out = *(argv + (++i));
         } else if (strcmp(a, "--profile") == 0 && i + 1 < argc) {
             pref = vmr_preset_profile(*(argv + (++i)));
+        } else if (strcmp(a, "--fuel") == 0 && i + 1 < argc) {
+            pref.fuel_l_per_100km = (float)atof(*(argv + (++i)));
+        } else if (strcmp(a, "--traffic") == 0 && i + 1 < argc) {
+            traffic_file = *(argv + (++i));
         } else if (strcmp(a, "--weights") == 0 && i + 1 < argc) {
-            float wa, ws, wc, wt, wm;
-            if (sscanf(*(argv + (++i)), "%f,%f,%f,%f,%f", &wa, &ws, &wc, &wt, &wm) == 5) {
+            float wa, ws, wc, wt, wm, we = 0.0f;
+            int n = sscanf(*(argv + (++i)), "%f,%f,%f,%f,%f,%f", &wa, &ws, &wc, &wt, &wm, &we);
+            if (n >= 5) {
                 pref.w_align = wa; pref.w_speed = ws; pref.w_class = wc;
                 pref.w_straight = wt; pref.w_smooth = wm;
+                pref.w_eco = we;
                 pref.pref_id = -1;
             }
+        } else if (strcmp(a, "--eco-weight") == 0 && i + 1 < argc) {
+            pref.w_eco = (float)atof(*(argv + (++i)));
         } else if (strcmp(a, "--mode") == 0 && i + 1 < argc) {
             const char *m = *(argv + (++i));
         if (c_stricmp(m, "bidir") == 0) mode = MODE_VEC_BIDIR;
@@ -8303,6 +8472,13 @@ int main(int argc, char **argv) {
 
     if (save_bin != NULL && graph.node_count > 0) {
         vmr_save_binary(&graph, save_bin);
+    }
+
+    if (traffic_file && graph.node_count > 0) {
+        if (vmr_load_traffic(&graph, traffic_file) != 0) {
+            vmr_graph_free(&graph);
+            return 1;
+        }
     }
 
     if (do_rcoord || do_rid) {
