@@ -71,7 +71,32 @@ extract with a slightly different road set than OSRM's live planet data.
 
 The eco profile minimises a per-edge fuel model (U-shaped vs speed, smoothness
 penalty) and genuinely finds a lower-fuel route (−1.5% vs fastest). It is slower to
-compute (~0.8 s vs ~0.03 s) because the fuel-optimal path uses unavoidable slow
-city edges, which weaken the admissible ALT heuristic. Vehicle type (speed cap +
-fuel curve) shifts both the route and the fuel figure — e.g. `hgv-artic` (cap 85 km/h,
-32 L/100km) yields a different path and ~210 L for the same trip.
+compute (~0.32 s vs ~0.03 s) because the fuel-optimal path uses unavoidable slow
+city edges; a fuel-Euclidean heuristic (`h = euclidean_km × min_fuel_per_km`) keeps
+it admissible and cuts the expansions ~3.4× versus a time-only heuristic. Vehicle
+type (speed cap + fuel curve) shifts both the route and the fuel figure — e.g.
+`hgv-artic` (cap 85 km/h, 32 L/100km) yields a different path and ~210 L for the
+same trip.
+
+## Regeneration & live-update latency (single core unless noted)
+
+The key point for live traffic: **traffic updates need no graph regeneration.**
+Traffic is a query-time overlay (`traffic_mult`), so an update is just "reload the
+file + re-route".
+
+| Operation | Time | Notes |
+|---|---|---|
+| Load `.vgraph` cache (2.3 GB, mmap) | **194 ms** | cold; warm ~150 ms |
+| Traffic file reload (10k lines) | **< 5 ms** | O(lines) via osm_id index; 24 MB array reused |
+| Re-route, vca-bidir | **~27 ms** | warm |
+| Re-route, astar | **~5 ms** | warm |
+| **Live traffic update cycle** (reload + re-route) | **~30–50 ms** | no regeneration |
+| Full graph regen: SQLite DB load (1.8 GB, 17 M nodes) | ~38 s | I/O-bound |
+| Full graph regen: preprocess (OpenMP 6 threads) | ~10 s | contraction + reorder + two-hop + ALT |
+| Full graph regen: save `.vgraph` (1.66 GB) | ~1–2 s | |
+| **Full graph regen total** (DB → .vgraph) | **~50 s** | ~110 s single-core |
+
+So a live-traffic update lands in **~30–50 ms** (file reload + re-route), versus
+**~50 s** if the road network itself changes and the graph must be rebuilt. The
+one-time graph build is dominated by reading the 17 M-node SQLite DB; the actual
+routing preprocess is only ~10 s with OpenMP.

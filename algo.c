@@ -1069,6 +1069,7 @@ typedef struct {
 
     float *edge_attr_scale[VMR_NUM_PROFILES];
     float  attr_min[VMR_NUM_PROFILES]; /* per-profile min(edge_attr_scale) (admissible ALT scale) */
+    float  eco_min_fuel;               /* min L/km over edges (active vehicle) for eco heuristic */
 
     /* Live-traffic travel-time multipliers (1.0 = free-flow). NULL until a
      * traffic feed is loaded; when non-NULL, edge_time_s is scaled by this
@@ -1271,6 +1272,21 @@ static void vmr_compute_attr_min(VmrGraph *g) {
             if (a[e] < mn) mn = a[e];
         }
         g->attr_min[p] = mn;
+    }
+    /* Minimum fuel per km over all edges, for the active vehicle. Used by the
+     * eco profile's Euclidean fuel heuristic (h = euclidean_km * eco_min_fuel). */
+    {
+        float mn = 1.0f;
+        if (g->edge_count > 0 && g->edge_length_m && g->edge_time_s && g->edge_f_smooth) {
+            for (uint32_t e = 0; e < g->edge_count; e++) {
+                float t = *(g->edge_time_s + e);
+                if (t <= EPS_F) continue;
+                float speed_kmh = (*(g->edge_length_m + e) / t) * 3.6f;
+                float per_km = vmr_fuel_l_per_km(speed_kmh, *(g->edge_f_smooth + e));
+                if (per_km < mn) mn = per_km;
+            }
+        }
+        g->eco_min_fuel = (mn < 1.0f) ? mn : 0.05f;
     }
 }
 
@@ -2985,32 +3001,37 @@ static int vmr_load_traffic(VmrGraph *g, const char *path) {
         LOG_ERR("Cannot open traffic file '%s'", path);
         return -1;
     }
-    g->traffic_mult = (float *)xmalloc(g->edge_count * sizeof(float));
+    /* Reuse the multiplier array across reloads (watch mode) instead of
+     * reallocating a 24 MB buffer every cycle. */
     if (!g->traffic_mult) {
-        fclose(fp);
-        return -1;
+        g->traffic_mult = (float *)xmalloc((size_t)g->edge_count * sizeof(float));
+        if (!g->traffic_mult) {
+            fclose(fp);
+            return -1;
+        }
     }
     for (uint32_t e = 0; e < g->edge_count; e++) {
         *(g->traffic_mult + e) = 1.0f;
     }
     char line[256];
     uint32_t loaded = 0;
+    /* Each line is resolved through the O(1) osm_id -> node index, so loading
+     * scales with the number of lines, not nodes x lines. */
     while (fgets(line, sizeof(line), fp)) {
         if (line[0] == '#' || line[0] == '\n' || line[0] == '\r') continue;
         int64_t osm_id;
         float mult;
         if (sscanf(line, "%lld,%f", &osm_id, &mult) == 2 && mult > 0.0f) {
-            /* Find edges from nodes with this osm_id */
-            for (uint32_t i = 0; i < g->node_count; i++) {
-                if (*(g->node_osm_id + i) == osm_id) {
-                    uint32_t beg = *(g->fwd_offsets + i);
-                    uint32_t end = *(g->fwd_offsets + i + 1U);
-                    for (uint32_t e = beg; e < end; e++) {
-                        *(g->traffic_mult + e) = mult;
-                    }
-                    loaded++;
-                }
+            uint32_t u = idmap_get(&g->osm_map, osm_id);
+            if (u == VMR_INVALID) {
+                continue;
             }
+            uint32_t beg = *(g->fwd_offsets + u);
+            uint32_t end = *(g->fwd_offsets + u + 1U);
+            for (uint32_t e = beg; e < end; e++) {
+                *(g->traffic_mult + e) = mult;
+            }
+            loaded++;
         }
     }
     fclose(fp);
@@ -7725,13 +7746,9 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
                 if (v > 0.0f && v <= 1.5f) alt_scale = v; /* opt-in strong (may be inadmissible) */
             }
         }
-        /* Eco's admissible min is tiny (~0.15), which makes the ALT heuristic
-         * very weak (huge expansions). Most fuel-optimal roads have attr >=
-         * 0.45, so use that as a strong scale; the per-query admissibility
-         * check below retries with attr_min if the found path dips below it. */
-        if (!cch_weak && query->pref.pref_id == VMR_PROFILE_ECO && alt_scale < 0.45f) {
-            alt_scale = 0.45f;
-        }
+        /* Eco uses the fuel-Euclidean heuristic (added below) which is
+         * admissible and much tighter than the time-based ALT, so it keeps the
+         * exact admissible min scale (no strong-scale retry needed). */
         cch_strong = (!cch_weak && alt_scale > amin + 1e-4f) ? 1 : 0;
     }
     (void)0;
@@ -7948,6 +7965,13 @@ if (skip_dead && (*(g->edge_flags + ei) & EDGE_DEAD_TARGET)) continue;
                             ? (ALT_HEUR(g, v, alt_gf, alt_gb, gf0, gf1, gf2, gf3, gb0, gb1, gb2, gb3, L) * alt_scale)
                             : vmr_sqrt_fast((gx - *(g->node_x + v)) * (gx - *(g->node_x + v)) +
                                             (gy - *(g->node_y + v)) * (gy - *(g->node_y + v))) * v_heur);
+                    /* Eco fuel-Euclidean lower bound: fuel >= min_fuel_per_km *
+                     * euclidean_km, in cost units (cost = fuel * 1000/NORM). */
+                    if (query->pref.pref_id == VMR_PROFILE_ECO && g->eco_min_fuel > 0.0f && !g->ch_built) {
+                        float ex = gx - *(g->node_x + v), ey = gy - *(g->node_y + v);
+                        float hf = vmr_sqrt_fast(ex * ex + ey * ey) * g->eco_min_fuel * 0.4f;
+                        if (hf > h_v) h_v = hf;
+                    }
 
                     float sc_min = compute_8d_cost_min(g, ei, &query->pref, MODE_VEC_BIDIR, as,
                                                         cos1, mom);
@@ -8047,6 +8071,11 @@ uint32_t u = *(g->rev_src_node + ri);
                             ? (ALT_HEUR(g, u, alt_sf, alt_sb, sf0, sf1, sf2, sf3, sb0, sb1, sb2, sb3, L) * alt_scale)
                             : vmr_sqrt_fast((sx - *(g->node_x + u)) * (sx - *(g->node_x + u)) +
                                             (sy - *(g->node_y + u)) * (sy - *(g->node_y + u))) * v_heur);
+                    if (query->pref.pref_id == VMR_PROFILE_ECO && g->eco_min_fuel > 0.0f && !g->ch_built) {
+                        float ex = sx - *(g->node_x + u), ey = sy - *(g->node_y + u);
+                        float hf = vmr_sqrt_fast(ex * ex + ey * ey) * g->eco_min_fuel * 0.4f;
+                        if (hf > h_v) h_v = hf;
+                    }
 
                     float sc_min = compute_8d_cost_min(g, eid, &query->pref, MODE_VEC_BIDIR, as,
                                                         cos1, mom);
@@ -8741,10 +8770,9 @@ int main(int argc, char **argv) {
                    traffic_file, watch_seconds);
             for (;;) {
                 sleep_seconds(watch_seconds);
-                if (graph.traffic_mult) {
-                    xfree(graph.traffic_mult);
-                    graph.traffic_mult = NULL;
-                }
+                /* vmr_load_traffic reuses the existing multiplier array and
+                 * resets it to free-flow, so no free/realloc here. If the file
+                 * is missing the previous multipliers are preserved. */
                 if (vmr_load_traffic(&graph, traffic_file) != 0) {
                     LOG_WARN("Traffic reload failed; keeping previous route");
                     continue;

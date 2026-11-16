@@ -70,10 +70,14 @@ stop-and-go and at high speed from drag). `--fuel <l/100km>` overrides the base 
 **Live traffic** (`--traffic <file>` + `--watch <seconds>`): `--traffic` loads
 per-edge travel-time multipliers from a CSV (`osm_id,multiplier` per line, `#` for
 comments). `--watch` re-loads the file and re-routes every N seconds, printing a
-timestamped result — a simple demonstration of a live-update cycle. This is a
-file-based hook, **not** a live network feed: a production system would have a feed
-reader (e.g. National Highways WebTRIS for England, or a commercial TomTom/HERE/
-Google feed) rewrite the file every 1–5 minutes.
+timestamped result. **Traffic updates need no graph regeneration** — the multiplier
+array is a query-time overlay, so an update is just "reload the CSV + re-route",
+which lands in ~30–50 ms (file reload is O(lines) via the OSM-id index, and the
+24 MB multiplier array is reused). A full graph rebuild (only needed when the road
+network itself changes) takes ~50 s with OpenMP. This is a file-based hook, **not** a
+live network feed: a production system would have a feed reader (e.g. National
+Highways WebTRIS for England, or a commercial TomTom/HERE/Google feed) rewrite the
+file every 1–5 minutes.
 
 **Environment overrides:** `UVR_ALT_SCALE` forces the ALT landmark heuristic scale
 (default is the graph's admissible per-profile minimum); `VMR_CCH=1` builds the CCH
@@ -124,8 +128,9 @@ hierarchy at preprocess time.
 
 vca-bidir lands within ~0.3% of the time-optimal distance while following a
 vector-optimal (straighter, class-aware) path. The eco profile is slower to compute
-(~0.8 s on London→Edinburgh) because its fuel-optimal path uses unavoidable slow city
-edges, which weaken the admissible heuristic.
+(~0.32 s on London→Edinburgh) because its fuel-optimal path uses unavoidable slow
+city edges; a fuel-Euclidean heuristic keeps the search admissible and cuts its
+expansions ~3.4× versus a time-only heuristic.
 
 ### Peak memory (single core)
 
