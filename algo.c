@@ -255,11 +255,8 @@ typedef enum {
 } EdgeFlags;
 
 typedef enum {
-    MODE_VEC_BIDIR   = 0, /* Bidirectional Vector-Corridor A* (VCA*)    */
-    MODE_VEC_UNIDIR  = 1, /* Unidirectional Vector-Corridor A* (VCA*)   */
-    MODE_DIJKSTRA    = 2, /* True uninformed Dijkstra (travel time)    */
-    MODE_ASTAR       = 3, /* ALT-guided A* on travel time (efficient)  */
-    MODE_CCH         = 4  /* Contraction Hierarchy (CCH) query         */
+    MODE_VEC_BIDIR   = 0, /* Bidirectional Vector-Corridor A* (VCA*)  [default] */
+    MODE_VEC_UNIDIR  = 1  /* Unidirectional Vector-Corridor A* (VCA*)         */
 } SearchMode;
 
 /* 5D Preference Query Vector paired with 3D runtime spatial context -> 8D */
@@ -1051,7 +1048,8 @@ typedef struct {
     uint8_t  *turn_mode;       /* 0=forbid */
     uint32_t  turn_count;
 
-    /* Vector-aware contraction hierarchy (shortcuts carry the same 8D features) */
+    /* Legacy CH arrays: never populated (VCA does not use a hierarchy), kept
+     * only so the .vgraph binary layout stays compatible with older caches. */
     uint32_t  ch_built;
     uint32_t  cch_built;
     uint32_t *ch_level;
@@ -1517,697 +1515,6 @@ static int vmr_build_reverse_csr_and_components(VmrGraph *g) {
     xfree(queue);
     LOG_INFO("Connected components labeled: %u component(s) (mainland/islands)", comp);
     return 0;
-}
-
-/* ------------------------------------------------------------------------- */
-/* Vector-aware contraction hierarchy (CH)                                    */
-/* ------------------------------------------------------------------------- */
-
-typedef struct {
-    uint32_t from, to;
-    float length_m, time_s;
-    float f_speed, f_class, f_smooth;
-    float dx, dy;
-    uint8_t road_class, flags, alive;
-    uint32_t via;
-    uint32_t child1;
-    uint32_t child2;
-} ChEdge;
-
-typedef struct {
-    ChEdge *edges;
-    size_t ecount, ecap;
-    uint32_t *out_head, *in_head;
-    uint32_t *out_next, *in_next;
-    uint32_t *out_deg, *in_deg;
-    uint32_t n;
-} ChAdj;
-
-typedef struct {
-    uint64_t *keys;
-    uint8_t *used;
-    uint32_t *vals;
-    size_t cap, count;
-} ChPairSet;
-
-typedef struct {
-    uint32_t from, to;
-    float length_m, time_s;
-    float f_speed, f_class, f_smooth;
-    uint8_t flags;
-    uint32_t via;
-    uint32_t child1;
-    uint32_t child2;
-} ChPacked;
-
-static int ch_adj_init(ChAdj *a, uint32_t n, uint32_t initial) {
-    memset(a, 0, sizeof(*a));
-    a->n = n;
-    size_t cap = initial ? initial : 16;
-    a->edges = (ChEdge *)xmalloc(cap * sizeof(ChEdge));
-    a->out_head = (uint32_t *)xmalloc((size_t)n * sizeof(uint32_t));
-    a->in_head  = (uint32_t *)xmalloc((size_t)n * sizeof(uint32_t));
-    a->out_next = (uint32_t *)xmalloc(cap * sizeof(uint32_t));
-    a->in_next  = (uint32_t *)xmalloc(cap * sizeof(uint32_t));
-    a->out_deg  = (uint32_t *)xcalloc(n, sizeof(uint32_t));
-    a->in_deg   = (uint32_t *)xcalloc(n, sizeof(uint32_t));
-    if (!a->edges || !a->out_head || !a->in_head || !a->out_next ||
-        !a->in_next || !a->out_deg || !a->in_deg) {
-        return -1;
-    }
-    a->ecap = cap;
-    for (uint32_t i = 0; i < n; i++) {
-        *(a->out_head + i) = VMR_INVALID;
-        *(a->in_head + i)  = VMR_INVALID;
-    }
-    return 0;
-}
-
-static void ch_adj_free(ChAdj *a) {
-    xfree(a->edges); xfree(a->out_head); xfree(a->in_head);
-    xfree(a->out_next); xfree(a->in_next);
-    xfree(a->out_deg); xfree(a->in_deg);
-    memset(a, 0, sizeof(*a));
-}
-
-static uint32_t ch_adj_add(ChAdj *a, uint32_t from, uint32_t to,
-                           float length_m, float time_s,
-                           float f_speed, float f_class, float f_smooth,
-                           float dx, float dy, uint8_t road_class,
-                           uint8_t flags, uint32_t via,
-                           uint32_t child1, uint32_t child2) {
-    if (a->ecount == a->ecap) {
-        size_t ncap = a->ecap * 2U;
-        ChEdge *ne = (ChEdge *)xrealloc(a->edges, ncap * sizeof(ChEdge));
-        if (!ne) return VMR_INVALID;
-        a->edges = ne;
-        uint32_t *on = (uint32_t *)xrealloc(a->out_next, ncap * sizeof(uint32_t));
-        if (!on) return VMR_INVALID;
-        a->out_next = on;
-        uint32_t *inn = (uint32_t *)xrealloc(a->in_next, ncap * sizeof(uint32_t));
-        if (!inn) return VMR_INVALID;
-        a->in_next = inn;
-        a->ecap = ncap;
-    }
-    uint32_t id = (uint32_t)a->ecount++;
-    ChEdge *e = a->edges + id;
-    e->from = from; e->to = to;
-    e->length_m = length_m; e->time_s = time_s;
-    e->f_speed = f_speed; e->f_class = f_class; e->f_smooth = f_smooth;
-    e->dx = dx; e->dy = dy;
-    e->road_class = road_class; e->flags = flags; e->alive = 1;
-    e->via = via;
-    e->child1 = child1;
-    e->child2 = child2;
-    *(a->out_next + id) = *(a->out_head + from);
-    *(a->out_head + from) = id;
-    (*(a->out_deg + from))++;
-    *(a->in_next + id) = *(a->in_head + to);
-    *(a->in_head + to) = id;
-    (*(a->in_deg + to))++;
-    return id;
-}
-
-static void ch_adj_kill(ChAdj *a, uint32_t id) {
-    ChEdge *e = a->edges + id;
-    if (e->alive) {
-        e->alive = 0;
-        (*(a->out_deg + e->from))--;
-        (*(a->in_deg + e->to))--;
-    }
-}
-
-static int ch_pair_init(ChPairSet *s, size_t cap) {
-    memset(s, 0, sizeof(*s));
-    s->cap = cap;
-    s->keys = (uint64_t *)xmalloc(cap * sizeof(uint64_t));
-    s->used = (uint8_t *)xcalloc(cap, 1);
-    s->vals = (uint32_t *)xmalloc(cap * sizeof(uint32_t));
-    return (s->keys && s->used && s->vals) ? 0 : -1;
-}
-
-static void ch_pair_free(ChPairSet *s) {
-    xfree(s->keys); xfree(s->used); xfree(s->vals);
-    memset(s, 0, sizeof(*s));
-}
-
-static int ch_pair_add(ChPairSet *s, uint32_t u, uint32_t v) {
-    if ((s->count + 1U) * 2U >= s->cap) {
-        size_t oldcap = s->cap;
-        size_t ncap = oldcap * 2U;
-        uint64_t *nk = (uint64_t *)xmalloc(ncap * sizeof(uint64_t));
-        uint8_t *nu = (uint8_t *)xcalloc(ncap, 1);
-        uint32_t *nv = (uint32_t *)xmalloc(ncap * sizeof(uint32_t));
-        if (!nk || !nu || !nv) {
-            xfree(nk); xfree(nu); xfree(nv);
-            return -1;
-        }
-        size_t nmask = ncap - 1U;
-        for (size_t i = 0; i < oldcap; i++) {
-            if (!*(s->used + i)) continue;
-            uint64_t key = *(s->keys + i);
-            size_t j = (size_t)(mix64((int64_t)key) & nmask);
-            while (*(nu + j)) {
-                j = (j + 1U) & nmask;
-            }
-            *(nu + j) = 1;
-            *(nk + j) = key;
-            *(nv + j) = *(s->vals + i);
-        }
-        xfree(s->keys); xfree(s->used); xfree(s->vals);
-        s->keys = nk; s->used = nu; s->vals = nv;
-        s->cap = ncap;
-    }
-    uint64_t key = ((uint64_t)u << 32) | (uint64_t)v;
-    size_t mask = s->cap - 1U;
-    size_t i = (size_t)(mix64((int64_t)key) & mask);
-    while (*(s->used + i)) {
-        if (*(s->keys + i) == key) {
-            return 0;
-        }
-        i = (i + 1U) & mask;
-    }
-    *(s->used + i) = 1;
-    *(s->keys + i) = key;
-    *(s->vals + i) = VMR_INVALID;
-    s->count++;
-    return 1;
-}
-
-static int ch_pair_get(const ChPairSet *s, uint32_t u, uint32_t v, uint32_t *eid) {
-    if (s->cap == 0) return 0;
-    uint64_t key = ((uint64_t)u << 32) | (uint64_t)v;
-    size_t mask = s->cap - 1U;
-    size_t i = (size_t)(mix64((int64_t)key) & mask);
-    while (*(s->used + i)) {
-        if (*(s->keys + i) == key) {
-            if (eid) *eid = *(s->vals + i);
-            return 1;
-        }
-        i = (i + 1U) & mask;
-    }
-    return 0;
-}
-
-static void ch_pair_set(ChPairSet *s, uint32_t u, uint32_t v, uint32_t eid) {
-    uint64_t key = ((uint64_t)u << 32) | (uint64_t)v;
-    size_t mask = s->cap - 1U;
-    size_t i = (size_t)(mix64((int64_t)key) & mask);
-    while (*(s->used + i)) {
-        if (*(s->keys + i) == key) {
-            *(s->vals + i) = eid;
-            return;
-        }
-        i = (i + 1U) & mask;
-    }
-}
-
-static int ch_contract_node(ChAdj *a, uint32_t u, uint8_t *contracted,
-                            ChPairSet *pairs, uint32_t *level,
-                            uint32_t *counter, uint32_t *cur, MinHeap *pq) {
-    if (u >= a->n || *(contracted + u)) {
-        return 0;
-    }
-    for (uint32_t e1 = *(a->in_head + u); e1 != VMR_INVALID; e1 = *(a->in_next + e1)) {
-        if (!(*(a->edges + e1)).alive) continue;
-        uint32_t uu = (*(a->edges + e1)).from;
-        for (uint32_t e2 = *(a->out_head + u); e2 != VMR_INVALID; e2 = *(a->out_next + e2)) {
-            if (!(*(a->edges + e2)).alive) continue;
-            uint32_t vv = (*(a->edges + e2)).to;
-            if (uu == vv || *(contracted + uu) || *(contracted + vv)) continue;
-            int added = ch_pair_add(pairs, uu, vv);
-            if (added < 0) return -1;
-            ChEdge *x = a->edges + e1;
-            ChEdge *y = a->edges + e2;
-            float len = x->length_m + y->length_m;
-            float t = x->time_s + y->time_s;
-            float fs = (x->f_speed < y->f_speed) ? x->f_speed : y->f_speed;
-            float fc = (x->f_class < y->f_class) ? x->f_class : y->f_class;
-            float fm = (x->f_smooth < y->f_smooth) ? x->f_smooth : y->f_smooth;
-            float dx = x->dx + y->dx;
-            float dy = x->dy + y->dy;
-            if (added == 0) {
-                uint32_t eid;
-                if (ch_pair_get(pairs, uu, vv, &eid) && t < (*(a->edges + eid)).time_s) {
-                    ChEdge *ex = a->edges + eid;
-                    ex->time_s = t;
-                    ex->length_m = len;
-                    ex->f_speed = fs;
-                    ex->f_class = fc;
-                    ex->f_smooth = fm;
-                    ex->dx = dx;
-                    ex->dy = dy;
-                    ex->flags = (uint8_t)(x->flags | y->flags);
-                    /* Rebind the shortcut to the shorter path's children (e1,e2
-                     * are strict sub-edges of r->u and u->t, so this cannot form
-                     * a cycle).  Keeping stale children made unpack explode. */
-                    ex->via = u;
-                    ex->child1 = e1;
-                    ex->child2 = e2;
-                }
-            } else {
-                uint32_t sid = ch_adj_add(a, uu, vv, len, t, fs, fc, fm, dx, dy,
-                                          x->road_class, (uint8_t)(x->flags | y->flags), u,
-                                          e1, e2);
-                if (sid == VMR_INVALID) return -1;
-                ch_pair_set(pairs, uu, vv, sid);
-            }
-            *(cur + uu) = (float)(*(a->out_deg + uu) + *(a->in_deg + uu));
-            *(cur + vv) = (float)(*(a->out_deg + vv) + *(a->in_deg + vv));
-            heap_push(pq, uu, *(cur + uu));
-            heap_push(pq, vv, *(cur + vv));
-        }
-        ch_adj_kill(a, e1);
-        *(cur + uu) = (float)(*(a->out_deg + uu) + *(a->in_deg + uu));
-        heap_push(pq, uu, *(cur + uu));
-    }
-    for (uint32_t e2 = *(a->out_head + u); e2 != VMR_INVALID; e2 = *(a->out_next + e2)) {
-        if (!(*(a->edges + e2)).alive) continue;
-        uint32_t vv = (*(a->edges + e2)).to;
-        ch_adj_kill(a, e2);
-        *(cur + vv) = (float)(*(a->out_deg + vv) + *(a->in_deg + vv));
-        heap_push(pq, vv, *(cur + vv));
-    }
-    *(contracted + u) = 1;
-    *(level + u) = ++(*counter);
-    return 0;
-}
-
-static int cmp_ch_packed(const void *pa, const void *pb) {
-    const ChPacked *a = (const ChPacked *)pa;
-    const ChPacked *b = (const ChPacked *)pb;
-    if (a->from < b->from) return -1;
-    if (a->from > b->from) return 1;
-    if (a->to < b->to) return -1;
-    if (a->to > b->to) return 1;
-    return 0;
-}
-
-typedef struct { uint32_t from, to, old; } CchSortIdx;
-static int cmp_cchsort(const void *pa, const void *pb) {
-    const CchSortIdx *a = (const CchSortIdx *)pa;
-    const CchSortIdx *b = (const CchSortIdx *)pb;
-    if (a->from < b->from) return -1;
-    if (a->from > b->from) return 1;
-    if (a->to < b->to) return -1;
-    if (a->to > b->to) return 1;
-    return 0;
-}
-
-/* Vector-aware contraction hierarchy: shortcuts carry the same 8D features. */
-static __attribute__((unused)) int vmr_build_ch_vector(VmrGraph *g) {
-    uint32_t n = g->node_count;
-    uint32_t m0 = g->edge_count;
-    if (n == 0 || m0 == 0) {
-        return -1;
-    }
-    ChAdj a;
-    if (ch_adj_init(&a, n, m0) != 0) {
-        ch_adj_free(&a);
-        return -1;
-    }
-    for (uint32_t e = 0; e < m0; e++) {
-        uint32_t from = *(g->edge_from + e);
-        uint32_t to = *(g->edge_to + e);
-        if (ch_adj_add(&a, from, to, *(g->edge_length_m + e), *(g->edge_time_s + e),
-                       *(g->edge_f_speed + e), *(g->edge_f_class + e),
-                       *(g->edge_f_smooth + e), *(g->edge_dx + e), *(g->edge_dy + e),
-                       0, *(g->edge_flags + e), VMR_INVALID, VMR_INVALID, VMR_INVALID) == VMR_INVALID) {
-            ch_adj_free(&a);
-            return -1;
-        }
-    }
-
-    uint8_t *contracted = (uint8_t *)xcalloc(n, sizeof(uint8_t));
-    uint32_t *level = (uint32_t *)xmalloc((size_t)n * sizeof(uint32_t));
-    uint32_t *cur = (uint32_t *)xmalloc((size_t)n * sizeof(uint32_t));
-    uint8_t *delay = (uint8_t *)xcalloc(n, sizeof(uint8_t));
-    ChPairSet pairs;
-    MinHeap pq;
-    if (!contracted || !level || !cur || !delay || ch_pair_init(&pairs, 1024) != 0 || heap_init(&pq, 1024) != 0) {
-        xfree(contracted); xfree(level); xfree(cur); xfree(delay);
-        ch_pair_free(&pairs);
-        heap_free(&pq);
-        ch_adj_free(&a);
-        return -1;
-    }
-
-    for (uint32_t i = 0; i < n; i++) {
-        *(cur + i) = (float)(*(a.out_deg + i) + *(a.in_deg + i));
-        heap_push(&pq, i, *(cur + i));
-    }
-    LOG_INFO("CH: start (%u nodes, %u edges)", n, m0);
-
-    uint32_t counter = 0;
-    HeapEntry top;
-    while (heap_pop(&pq, &top)) {
-        uint32_t u = top.node;
-        if (*(contracted + u) || top.prio != *(cur + u)) {
-            continue;
-        }
-        uint32_t od = *(a.out_deg + u);
-        uint32_t id = *(a.in_deg + u);
-        if (od == 0 || id == 0) {
-            if (ch_contract_node(&a, u, contracted, &pairs, level, &counter, cur, &pq) != 0) {
-                goto fail;
-            }
-            continue;
-        }
-if ((uint64_t)od * (uint64_t)id > 32U && *(delay + u) < 8U) {
-            (*(delay + u))++;
-            *(cur + u) = (float)(od + id) * 1.5f;
-            heap_push(&pq, u, *(cur + u));
-            continue;
-        }
-        if (ch_contract_node(&a, u, contracted, &pairs, level, &counter, cur, &pq) != 0) {
-            goto fail;
-        }
-            if ((counter & 65535U) == 0) {
-                LOG_INFO("CH: %u contracted, %u edges", counter, (uint32_t)a.ecount);
-            }
-    }
-    LOG_INFO("CH: queue empty, forcing remaining");
-    for (uint32_t u = 0; u < n; u++) {
-        if (!*(contracted + u)) {
-            if (ch_contract_node(&a, u, contracted, &pairs, level, &counter, cur, &pq) != 0) {
-                goto fail;
-            }
-            if ((counter & 65535U) == 0) {
-                LOG_INFO("CH: forced %u contracted, %u edges", counter, (uint32_t)a.ecount);
-            }
-        }
-    }
-    LOG_INFO("CH: packing %u edges", (uint32_t)a.ecount);
-
-    {
-        size_t live = a.ecount; /* CH keeps every original edge and every shortcut */
-        if (live == 0) {
-            LOG_ERR("CH: no edges after contraction");
-            goto fail;
-        }
-        LOG_INFO("CH: edges %u", (uint32_t)live);
-        ChPacked *packed = (ChPacked *)xmalloc(live * sizeof(ChPacked));
-        if (!packed) {
-            LOG_ERR("CH: packed allocation failed");
-            goto fail;
-        }
-        size_t w = 0;
-        for (size_t e = 0; e < a.ecount; e++) {
-            ChEdge *ce = a.edges + e;
-            *(packed + w) = (ChPacked){
-                ce->from, ce->to, ce->length_m, ce->time_s,
-                ce->f_speed, ce->f_class, ce->f_smooth, ce->flags,
-                ce->via, ce->child1, ce->child2
-            };
-            w++;
-        }
-        qsort(packed, live, sizeof(ChPacked), cmp_ch_packed);
-
-        float *nlen = (float *)xmalloc(live * sizeof(float));
-        float *ntime = (float *)xmalloc(live * sizeof(float));
-        float *nfs = (float *)xmalloc(live * sizeof(float));
-        float *nfc = (float *)xmalloc(live * sizeof(float));
-        float *nfm = (float *)xmalloc(live * sizeof(float));
-        float *ndx = (float *)xmalloc(live * sizeof(float));
-        float *ndy = (float *)xmalloc(live * sizeof(float));
-        float *nux = (float *)xmalloc(live * sizeof(float));
-        float *nuy = (float *)xmalloc(live * sizeof(float));
-        float *nfsa = (float *)xcalloc(live, sizeof(float));
-        uint8_t *nfl = (uint8_t *)xmalloc(live);
-        uint32_t *nfrom = (uint32_t *)xmalloc(live * sizeof(uint32_t));
-        uint32_t *nto = (uint32_t *)xmalloc(live * sizeof(uint32_t));
-        uint32_t *noff = (uint32_t *)xcalloc((size_t)n + 1U, sizeof(uint32_t));
-        if (!nlen || !ntime || !nfs || !nfc || !nfm || !ndx || !ndy || !nux || !nuy ||
-            !nfsa || !nfl || !nfrom || !nto || !noff) {
-            LOG_ERR("CH: pack allocation failed (live=%u)", (uint32_t)live);
-            xfree(packed); xfree(nlen); xfree(ntime); xfree(nfs); xfree(nfc); xfree(nfm);
-            xfree(ndx); xfree(ndy); xfree(nux); xfree(nuy); xfree(nfsa); xfree(nfl);
-            xfree(nfrom); xfree(nto); xfree(noff);
-            goto fail;
-        }
-        for (size_t i = 0; i < live; i++) {
-            ChPacked *p = packed + i;
-            *(nfrom + i) = p->from;
-            *(nto + i) = p->to;
-            *(nlen + i) = p->length_m;
-            *(ntime + i) = p->time_s;
-            *(nfs + i) = p->f_speed;
-            *(nfc + i) = p->f_class;
-            *(nfm + i) = p->f_smooth;
-            *(nfl + i) = p->flags;
-            float dx = *(g->node_x + p->to) - *(g->node_x + p->from);
-            float dy = *(g->node_y + p->to) - *(g->node_y + p->from);
-            float mag = vmr_sqrt_fast(dx * dx + dy * dy);
-            *(ndx + i) = dx;
-            *(ndy + i) = dy;
-            *(nux + i) = (mag > EPS_F) ? (dx / mag) : 0.0f;
-            *(nuy + i) = (mag > EPS_F) ? (dy / mag) : 0.0f;
-            float s = (*(nlen + i) > EPS_F) ? (mag / *(nlen + i)) : 1.0f;
-            if (s > 1.0f) s = 1.0f;
-            if (s < 0.05f) s = 0.05f;
-            *(nfsa + i) = s;
-            (*(noff + p->from + 1U))++;
-        }
-        for (uint32_t i = 0; i < n; i++) {
-            *(noff + i + 1U) += *(noff + i);
-        }
-
-        if (!g->map) xfree(g->edge_from); xfree(g->edge_to);
-        if (!g->map) xfree(g->edge_dx); xfree(g->edge_dy);
-        if (!g->map) xfree(g->edge_ux); xfree(g->edge_uy);
-        if (!g->map) xfree(g->edge_f_speed); xfree(g->edge_f_class);
-        if (!g->map) xfree(g->edge_f_straight); xfree(g->edge_f_smooth);
-        if (!g->map) xfree(g->edge_length_m); xfree(g->edge_time_s);
-        if (!g->map) xfree(g->edge_flags); xfree(g->fwd_offsets);
-        if (!g->map) xfree(g->rev_offsets); xfree(g->rev_src_node); xfree(g->rev_fwd_eid);
-
-        g->edge_count = (uint32_t)live;
-        g->edge_from = nfrom;
-        g->edge_to = nto;
-        g->edge_dx = ndx;
-        g->edge_dy = ndy;
-        g->edge_ux = nux;
-        g->edge_uy = nuy;
-        g->edge_f_speed = nfs;
-        g->edge_f_class = nfc;
-        g->edge_f_straight = nfsa;
-        g->edge_f_smooth = nfm;
-        g->edge_length_m = nlen;
-        g->edge_time_s = ntime;
-        g->edge_flags = nfl;
-        g->fwd_offsets = noff;
-        xfree(packed);
-    }
-
-    LOG_INFO("CH: packed %u edges, rebuilding reverse CSR", g->edge_count);
-    if (vmr_build_reverse_csr_and_components(g) != 0) {
-        LOG_ERR("CH: reverse CSR failed");
-        goto fail;
-    }
-    LOG_INFO("CH: reverse CSR ok");
-    g->ch_level = level;
-    g->ch_built = 1;
-    xfree(contracted);
-    xfree(cur);
-    xfree(delay);
-    ch_pair_free(&pairs);
-    heap_free(&pq);
-    ch_adj_free(&a);
-    LOG_INFO("CH built: %u nodes, %u edges (%u levels)",
-             g->node_count, g->edge_count, counter);
-    return 0;
-
-fail:
-    xfree(contracted); xfree(level); xfree(cur); xfree(delay);
-    ch_pair_free(&pairs);
-    heap_free(&pq);
-    ch_adj_free(&a);
-    return -1;
-}
-
-/* Scalar (travel-time) CH used only to build a coarse corridor.  The original
- * 8D vector graph is left untouched so the exact vector A* can refine inside
- * the corridor. */
-static __attribute__((unused)) int vmr_build_ch(VmrGraph *g) {
-    uint32_t n = g->node_count;
-    uint32_t m0 = g->edge_count;
-    if (n == 0 || m0 == 0) {
-        return -1;
-    }
-    ChAdj a;
-    if (ch_adj_init(&a, n, m0) != 0) {
-        ch_adj_free(&a);
-        return -1;
-    }
-    for (uint32_t e = 0; e < m0; e++) {
-        uint32_t from = *(g->edge_from + e);
-        uint32_t to = *(g->edge_to + e);
-        if (ch_adj_add(&a, from, to, 0.0f, *(g->edge_time_s + e),
-                       0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0, 0, VMR_INVALID,
-                       VMR_INVALID, VMR_INVALID) == VMR_INVALID) {
-            ch_adj_free(&a);
-            return -1;
-        }
-    }
-
-    uint8_t *contracted = (uint8_t *)xcalloc(n, sizeof(uint8_t));
-    uint32_t *level = (uint32_t *)xmalloc((size_t)n * sizeof(uint32_t));
-    uint32_t *cur = (uint32_t *)xmalloc((size_t)n * sizeof(uint32_t));
-    uint8_t *delay = (uint8_t *)xcalloc(n, sizeof(uint8_t));
-    ChPairSet pairs;
-    MinHeap pq;
-    if (!contracted || !level || !cur || !delay ||
-        ch_pair_init(&pairs, 1024) != 0 || heap_init(&pq, 1024) != 0) {
-        xfree(contracted); xfree(level); xfree(cur); xfree(delay);
-        ch_pair_free(&pairs); heap_free(&pq); ch_adj_free(&a);
-        return -1;
-    }
-
-    for (uint32_t i = 0; i < n; i++) {
-        *(cur + i) = (float)(*(a.out_deg + i) + *(a.in_deg + i));
-        heap_push(&pq, i, *(cur + i));
-    }
-
-    uint32_t counter = 0;
-    HeapEntry top;
-    while (heap_pop(&pq, &top)) {
-        heap_compact_min(&pq, n);
-        uint32_t u = top.node;
-        if (*(contracted + u) || top.prio != *(cur + u)) {
-            continue;
-        }
-        uint32_t od = *(a.out_deg + u);
-        uint32_t id = *(a.in_deg + u);
-        if (od == 0 || id == 0) {
-            if (ch_contract_node(&a, u, contracted, &pairs, level, &counter, cur, &pq) != 0) {
-                goto fail;
-            }
-            continue;
-        }
-        if ((uint64_t)od * (uint64_t)id > 32U && *(delay + u) < 8U) {
-            (*(delay + u))++;
-            *(cur + u) = (float)(od + id) * 1.5f;
-            heap_push(&pq, u, *(cur + u));
-            continue;
-        }
-        if (ch_contract_node(&a, u, contracted, &pairs, level, &counter, cur, &pq) != 0) {
-            goto fail;
-        }
-    }
-    for (uint32_t u = 0; u < n; u++) {
-        if (!*(contracted + u)) {
-            if (ch_contract_node(&a, u, contracted, &pairs, level, &counter, cur, &pq) != 0) {
-                goto fail;
-            }
-        }
-    }
-
-    {
-        size_t total = a.ecount;
-        if (total == 0) {
-            goto fail;
-        }
-        /* Sort edges by (from,to) so the forward CSR groups each node's out-edges
-         * contiguously, and REMAP every shortcut's child1/child2 through the same
-         * permutation (otherwise children point at the wrong edge -> cycles). */
-        CchSortIdx *sarr = (CchSortIdx *)xmalloc(total * sizeof(CchSortIdx));
-        uint32_t *newpos = (uint32_t *)xmalloc(total * sizeof(uint32_t));
-        if (!sarr || !newpos) {
-            xfree(sarr); xfree(newpos);
-            goto fail;
-        }
-        for (size_t e = 0; e < total; e++) {
-            sarr[e].from = a.edges[e].from;
-            sarr[e].to   = a.edges[e].to;
-            sarr[e].old  = (uint32_t)e;
-        }
-        qsort(sarr, total, sizeof(CchSortIdx), cmp_cchsort);
-        for (size_t j = 0; j < total; j++) {
-            *(newpos + sarr[j].old) = (uint32_t)j;
-        }
-
-        uint32_t *cfrom = (uint32_t *)xmalloc(total * sizeof(uint32_t));
-        uint32_t *cto = (uint32_t *)xmalloc(total * sizeof(uint32_t));
-        float *ctime = (float *)xmalloc(total * sizeof(float));
-        uint32_t *cvia = (uint32_t *)xmalloc(total * sizeof(uint32_t));
-        uint32_t *cc1 = (uint32_t *)xmalloc(total * sizeof(uint32_t));
-        uint32_t *cc2 = (uint32_t *)xmalloc(total * sizeof(uint32_t));
-        uint32_t *coff = (uint32_t *)xcalloc((size_t)n + 1U, sizeof(uint32_t));
-        if (!cfrom || !cto || !ctime || !cvia || !cc1 || !cc2 || !coff) {
-            xfree(sarr); xfree(newpos);
-            xfree(cfrom); xfree(cto); xfree(ctime); xfree(coff);
-            xfree(cvia); xfree(cc1); xfree(cc2);
-            goto fail;
-        }
-        for (size_t j = 0; j < total; j++) {
-            ChEdge *ce = a.edges + sarr[j].old;
-            *(cfrom + j) = ce->from;
-            *(cto + j)   = ce->to;
-            *(ctime + j) = ce->time_s;
-            *(cvia + j)  = ce->via;
-            *(cc1 + j)   = (ce->child1 == VMR_INVALID) ? VMR_INVALID : *(newpos + ce->child1);
-            *(cc2 + j)   = (ce->child2 == VMR_INVALID) ? VMR_INVALID : *(newpos + ce->child2);
-            (*(coff + ce->from + 1U))++;
-        }
-        xfree(sarr);
-        xfree(newpos);
-        for (uint32_t i = 0; i < n; i++) {
-            *(coff + i + 1U) += *(coff + i);
-        }
-
-        uint32_t *roff = (uint32_t *)xcalloc((size_t)n + 1U, sizeof(uint32_t));
-        uint32_t *rsrc = (uint32_t *)xmalloc(total * sizeof(uint32_t));
-        uint32_t *reid = (uint32_t *)xmalloc(total * sizeof(uint32_t));
-        uint32_t *rpos = (uint32_t *)xmalloc((size_t)n * sizeof(uint32_t));
-        if (!roff || !rsrc || !reid || !rpos) {
-            xfree(cfrom); xfree(cto); xfree(ctime); xfree(coff);
-            xfree(cvia); xfree(cc1); xfree(cc2);
-            xfree(roff); xfree(rsrc); xfree(reid); xfree(rpos);
-            goto fail;
-        }
-        for (size_t i = 0; i < total; i++) {
-            (*(roff + *(cto + i) + 1U))++;
-        }
-        for (uint32_t i = 0; i < n; i++) {
-            *(roff + i + 1U) += *(roff + i);
-        }
-        memcpy(rpos, roff, (size_t)n * sizeof(uint32_t));
-        for (size_t i = 0; i < total; i++) {
-            uint32_t dst = *(cto + i);
-            uint32_t at = (*(rpos + dst))++;
-            *(rsrc + at) = *(cfrom + i);
-            *(reid + at) = (uint32_t)i;
-        }
-        xfree(rpos);
-
-        xfree(g->ch_from); xfree(g->ch_to); xfree(g->ch_time);
-        xfree(g->ch_fwd_off); xfree(g->ch_rev_off);
-        xfree(g->ch_rev_src); xfree(g->ch_rev_eid);
-        xfree(g->ch_via); xfree(g->ch_child1); xfree(g->ch_child2);
-        g->ch_edge_count = (uint32_t)total;
-        g->ch_from = cfrom;
-        g->ch_to = cto;
-        g->ch_time = ctime;
-        g->ch_fwd_off = coff;
-        g->ch_rev_off = roff;
-        g->ch_rev_src = rsrc;
-        g->ch_rev_eid = reid;
-        g->ch_via = cvia;
-        g->ch_child1 = cc1;
-        g->ch_child2 = cc2;
-        g->ch_level = level;
-        g->cch_built = 1;
-    }
-
-    xfree(contracted); xfree(cur); xfree(delay);
-    ch_pair_free(&pairs); heap_free(&pq); ch_adj_free(&a);
-    LOG_INFO("Scalar CH built: %u nodes, %u edges", g->node_count, g->ch_edge_count);
-    return 0;
-
-fail:
-    xfree(contracted); xfree(level); xfree(cur); xfree(delay);
-    ch_pair_free(&pairs); heap_free(&pq); ch_adj_free(&a);
-    return -1;
 }
 
 /*
@@ -3666,20 +2973,7 @@ static int vmr_preprocess_graph(VmrRawGraph *rg, VmrGraph *g) {
     g->landmark_count = 32;
     vmr_build_landmarks(g);
 
-    /* Contraction Hierarchy (CCH) on travel time; opt-in via VMR_CCH so the
-     * default vector pipeline stays lean. */
-    if (getenv("VMR_CCH") != NULL) {
-        clock_t tc0 = clock();
-        if (vmr_build_ch(g) != 0) {
-            LOG_WARN("CCH build failed; CCH mode disabled");
-        } else {
-            LOG_INFO("CCH built in %.1f ms (%u levels, %u ch-edges)",
-                     1000.0 * (double)(clock() - tc0) / (double)CLOCKS_PER_SEC,
-                     g->node_count, g->ch_edge_count);
-        }
-    }
-
-    /* Vector CH is not used for the exact-vector A* (UK measured slower). */
+    /* Vector CH is not used for the exact-vector VCA (UK measured slower). */
 
     clock_t t1 = clock();
     double ms = 1000.0 * (double)(t1 - t0) / (double)CLOCKS_PER_SEC;
@@ -6259,7 +5553,7 @@ static inline float compute_attr_scale(const VmrGraph *g, uint32_t eid,
 }
 
 static inline float compute_8d_step_cost(const VmrGraph *g, uint32_t eid,
-                                         const VmrPreference *p, SearchMode mode,
+                                         const VmrPreference *p,
                                          float attr_scale,
                                          float cos1, float cos2, float mom_dot,
                                          float cross_ratio) {
@@ -6269,9 +5563,6 @@ static inline float compute_8d_step_cost(const VmrGraph *g, uint32_t eid,
     }
     if (p->avoid_tolls && (*(g->edge_flags + eid) & EDGE_TOLL)) {
         base_time *= 3.8f;
-    }
-    if (mode == MODE_DIJKSTRA || mode == MODE_ASTAR) {
-        return base_time;
     }
 
     /* Spatial vector alignment (1-hop + 2-hop sum + directional momentum) */
@@ -6291,7 +5582,7 @@ static inline float compute_8d_step_cost(const VmrGraph *g, uint32_t eid,
 
 /* Cheaper admissible lower bound: full cost with cos2=1 and corridor term = 1. */
 static inline float compute_8d_cost_min(const VmrGraph *g, uint32_t eid,
-                                        const VmrPreference *p, SearchMode mode,
+                                        const VmrPreference *p,
                                         float attr_scale, float cos1, float mom_dot) {
     float base_time = *(g->edge_time_s + eid);
     if (g->traffic_mult) {
@@ -6299,9 +5590,6 @@ static inline float compute_8d_cost_min(const VmrGraph *g, uint32_t eid,
     }
     if (p->avoid_tolls && (*(g->edge_flags + eid) & EDGE_TOLL)) {
         base_time *= 3.8f;
-    }
-    if (mode == MODE_DIJKSTRA || mode == MODE_ASTAR) {
-        return base_time;
     }
     float spatial_align = 0.50f * cos1 + 0.30f + 0.20f * mom_dot;
     if (spatial_align > 1.0f) spatial_align = 1.0f;
@@ -6597,330 +5885,12 @@ static inline int in_corridor(const VmrGraph *g, uint32_t u) {
     return 0;
 }
 
-static __attribute__((unused)) int ch_nodes_push(uint32_t **nodes, uint32_t *n, uint32_t *cap, uint32_t v) {
-    if (*n == *cap) {
-        uint32_t ncap = *cap * 2U;
-        uint32_t *nn = (uint32_t *)xrealloc(*nodes, (size_t)ncap * sizeof(uint32_t));
-        if (!nn) {
-            return -1;
-        }
-        *nodes = nn;
-        *cap = ncap;
-    }
-    (*nodes)[(*n)++] = v;
-    return 0;
-}
 
-static __attribute__((unused)) int ch_unpack_edge(const VmrGraph *g, uint32_t eid,
-                          uint32_t **nodes, uint32_t *n, uint32_t *cap) {
-    if (!g->ch_via || eid >= g->ch_edge_count) {
-        LOG_ERR("CH unpack: bad edge id %u (edges %u)", eid, g->ch_edge_count);
-        return -1;
-    }
-    uint32_t *stack = (uint32_t *)xmalloc(256 * sizeof(uint32_t));
-    size_t sp = 0, scap = 256;
-    if (!stack) {
-        return -1;
-    }
-    *(stack + sp++) = eid;
-    int rc = 0;
-    while (sp > 0) {
-        uint32_t e = *(stack + --sp);
-        uint32_t via = *(g->ch_via + e);
-        if (via == VMR_INVALID) {
-            if (ch_nodes_push(nodes, n, cap, *(g->ch_to + e)) != 0) {
-                rc = -1;
-                break;
-            }
-            continue;
-        }
-        if (sp + 2 > scap) {
-            size_t ncap = scap * 2U;
-            uint32_t *ns = (uint32_t *)xrealloc(stack, ncap * sizeof(uint32_t));
-            if (!ns) {
-                rc = -1;
-                break;
-            }
-            stack = ns;
-            scap = ncap;
-        }
-        *(stack + sp++) = *(g->ch_child2 + e);
-        *(stack + sp++) = *(g->ch_child1 + e);
-    }
-    xfree(stack);
-    return rc;
-}
 
-static __attribute__((unused)) int ch_collect_edge(const VmrGraph *g, uint32_t eid,
-                           uint32_t **nodes, uint32_t *n, uint32_t *cap,
-                           uint32_t *vis) {
-    if (eid >= g->ch_edge_count) {
-        return 0;
-    }
-    uint32_t *stack = (uint32_t *)xmalloc(256 * sizeof(uint32_t));
-    if (!stack) {
-        return -1;
-    }
-    size_t sp = 0, scap = 256;
-    *(stack + sp++) = eid;
-    int rc = 0;
-    while (sp > 0) {
-        uint32_t e = *(stack + --sp);
-        if (e >= g->ch_edge_count) {
-            continue;
-        }
-        uint32_t w = e >> 5;
-        uint32_t b = e & 31U;
-        if ((*(vis + w) & (1U << b)) != 0) {
-            continue;
-        }
-        *(vis + w) |= (1U << b);
-        uint32_t via = *(g->ch_via + e);
-        if (via == VMR_INVALID) {
-            if (ch_nodes_push(nodes, n, cap, *(g->ch_to + e)) != 0) {
-                rc = -1;
-                break;
-            }
-            continue;
-        }
-        if (sp + 2 > scap) {
-            size_t ncap = scap * 2U;
-            uint32_t *ns = (uint32_t *)xrealloc(stack, ncap * sizeof(uint32_t));
-            if (!ns) {
-                rc = -1;
-                break;
-            }
-            stack = ns;
-            scap = ncap;
-        }
-        *(stack + sp++) = *(g->ch_child2 + e);
-        *(stack + sp++) = *(g->ch_child1 + e);
-    }
-    xfree(stack);
-    return rc;
-}
 
-/* Scalar travel-time CH search: returns the coarse path nodes (shortcut
- * endpoints) or NULL.  Used only to build the corridor. */
-static __attribute__((unused)) uint32_t *vmr_ch_path(const VmrGraph *g, uint32_t start, uint32_t goal,
-                             uint32_t *out_n) {
-    *out_n = 0;
-    if (!g->ch_built || start >= g->node_count || goal >= g->node_count) {
-        return NULL;
-    }
-    uint32_t n = g->node_count;
-    if (vmr_ws_reserve(n) != 0) {
-        return NULL;
-    }
-    VmrSearchWS *ws = &g_ws;
-    if (ws->epoch == UINT32_MAX) {
-        memset(ws->st_fwd, 0, (size_t)n * sizeof(uint32_t));
-        memset(ws->cl_fwd, 0, (size_t)n * sizeof(uint32_t));
-        memset(ws->st_bwd, 0, (size_t)n * sizeof(uint32_t));
-        memset(ws->cl_bwd, 0, (size_t)n * sizeof(uint32_t));
-        ws->epoch = 0;
-    }
-    uint32_t epoch = ++ws->epoch;
-    ws->pq_fwd.size = 0;
-    ws->pq_bwd.size = 0;
-    float *gf = ws->g_fwd, *gb = ws->g_bwd;
-    uint32_t *pf = ws->p_fwd, *pb = ws->p_bwd;
-    uint32_t *sf = ws->st_fwd, *sb = ws->st_bwd;
-    uint32_t *cf = ws->cl_fwd, *cb = ws->cl_bwd;
-    MinHeap *qf = &ws->pq_fwd, *qb = &ws->pq_bwd;
-
-    *(sf + start) = epoch; *(gf + start) = 0.0f; *(pf + start) = VMR_INVALID;
-    *(sb + goal) = epoch;  *(gb + goal) = 0.0f;  *(pb + goal) = VMR_INVALID;
-    heap_push(qf, start, 0.0f);
-    heap_push(qb, goal, 0.0f);
-
-    uint32_t meet = VMR_INVALID;
-    float best = FLT_MAX;
-    int turn = 0;
-    while (qf->size > 0 && qb->size > 0) {
-        if (meet != VMR_INVALID) {
-            float tf = qf->buf->prio + qb->buf->prio;
-            if (tf >= best) {
-                break;
-            }
-        }
-        turn ^= 1;
-        if (turn) {
-            HeapEntry top;
-            if (!heap_pop(qf, &top)) break;
-            uint32_t u = top.node;
-            if (*(cf + u) == epoch) continue;
-            *(cf + u) = epoch;
-            if (*(sb + u) == epoch && *(gb + u) < FLT_MAX) {
-                float tot = *(gf + u) + *(gb + u);
-                if (tot < best) { best = tot; meet = u; }
-            }
-            uint32_t b = *(g->ch_fwd_off + u), e = *(g->ch_fwd_off + u + 1U);
-            for (; b < e; b++) {
-                uint32_t v = *(g->ch_to + b);
-                if (*(cf + v) == epoch) continue;
-                if (!(*(g->ch_level + u) < *(g->ch_level + v))) continue;
-                float ng = *(gf + u) + *(g->ch_time + b);
-                if (*(sf + v) != epoch || ng < *(gf + v)) {
-                    *(sf + v) = epoch;
-                    *(gf + v) = ng;
-                    *(pf + v) = u;
-                    *(ws->pe_fwd + v) = b;
-                    heap_push(qf, v, ng);
-                }
-            }
-        } else {
-            HeapEntry top;
-            if (!heap_pop(qb, &top)) break;
-            uint32_t w = top.node;
-            if (*(cb + w) == epoch) continue;
-            *(cb + w) = epoch;
-            if (*(sf + w) == epoch && *(gf + w) < FLT_MAX) {
-                float tot = *(gf + w) + *(gb + w);
-                if (tot < best) { best = tot; meet = w; }
-            }
-            uint32_t b = *(g->ch_rev_off + w), e = *(g->ch_rev_off + w + 1U);
-            for (; b < e; b++) {
-                uint32_t u = *(g->ch_rev_src + b);
-                uint32_t eid = *(g->ch_rev_eid + b);
-                if (*(cb + u) == epoch) continue;
-                if (!(*(g->ch_level + w) < *(g->ch_level + u))) continue;
-                float ng = *(gb + w) + *(g->ch_time + eid);
-                if (*(sb + u) != epoch || ng < *(gb + u)) {
-                    *(sb + u) = epoch;
-                    *(gb + u) = ng;
-                    *(pb + u) = w;
-                    *(ws->pe_bwd + u) = eid;
-                    heap_push(qb, u, ng);
-                }
-            }
-        }
-    }
-    if (meet == VMR_INVALID) {
-        LOG_INFO("CH path: no meeting node");
-        return NULL;
-    }
-    LOG_INFO("CH path: meet=%u best=%.2f", meet, best);
-    uint32_t cur = meet;
-    for (uint32_t k = 0; k < n && cur != start; k++) {
-        cur = *(pf + cur);
-        if (cur == VMR_INVALID) return NULL;
-    }
-    if (cur != start) {
-        LOG_INFO("CH path: forward chain broken");
-        return NULL;
-    }
-    LOG_INFO("CH path: forward chain ok");
-    cur = meet;
-    for (uint32_t k = 0; k < n && cur != goal; k++) {
-        cur = *(pb + cur);
-        if (cur == VMR_INVALID) return NULL;
-    }
-    if (cur != goal) {
-        LOG_INFO("CH path: backward chain broken");
-        return NULL;
-    }
-    LOG_INFO("CH path: backward chain ok");
-
-    uint32_t fh = 0;
-    cur = meet;
-    while (cur != start && fh < n) {
-        cur = *(pf + cur);
-        if (cur == VMR_INVALID) break;
-        fh++;
-    }
-    if (cur != start) {
-        return NULL;
-    }
-    uint32_t bh = 0;
-    cur = meet;
-    while (cur != goal && bh < n) {
-        cur = *(pb + cur);
-        if (cur == VMR_INVALID) break;
-        bh++;
-    }
-    if (cur != goal) {
-        return NULL;
-    }
-    uint32_t total = fh + bh;
-    uint32_t *nodes = (uint32_t *)xmalloc((size_t)(total + 1U) * sizeof(uint32_t));
-    if (!nodes) {
-        return NULL;
-    }
-    cur = meet;
-    for (uint32_t k = fh;; k--) {
-        *(nodes + k) = cur;
-        if (k == 0) break;
-        cur = *(pf + cur);
-    }
-    if (bh > 0) {
-        cur = meet;
-        for (uint32_t k = 0; k < bh; k++) {
-            cur = *(pb + cur);
-            *(nodes + fh + 1U + k) = cur;
-        }
-    }
-    *out_n = total + 1U;
-    return nodes;
-}
-
-/* Exact travel-time distances in the scalar CH graph.  These are lower bounds
+/* Exact travel-time distances in the ALT landmark graph.  These are lower bounds
  * for the 8D vector cost (cost >= time * attr_scale_min) and make the vector A*
  * goal-directed without changing its cost model. */
-static __attribute__((unused)) void ch_distance_all(const VmrGraph *g, uint32_t source, float *dist, int reverse) {
-    uint32_t n = g->node_count;
-    if (!g->ch_built || !dist || source >= n) {
-        return;
-    }
-    uint8_t *closed = (uint8_t *)xcalloc(n, 1);
-    MinHeap pq;
-    if (!closed || heap_init(&pq, 1024) != 0) {
-        xfree(closed);
-        return;
-    }
-    for (uint32_t i = 0; i < n; i++) {
-        *(dist + i) = FLT_MAX;
-    }
-    *(dist + source) = 0.0f;
-    heap_push(&pq, source, 0.0f);
-    HeapEntry top;
-    while (heap_pop(&pq, &top)) {
-        uint32_t u = top.node;
-        if (*(closed + u)) {
-            continue;
-        }
-        *(closed + u) = 1;
-        float du = *(dist + u);
-        if (!reverse) {
-            uint32_t b = *(g->ch_fwd_off + u), e = *(g->ch_fwd_off + u + 1U);
-            for (; b < e; b++) {
-                uint32_t v = *(g->ch_to + b);
-                if (*(closed + v)) continue;
-                if (!(*(g->ch_level + u) < *(g->ch_level + v))) continue;
-                float nd = du + *(g->ch_time + b);
-                if (nd < *(dist + v)) {
-                    *(dist + v) = nd;
-                    heap_push(&pq, v, nd);
-                }
-            }
-        } else {
-            uint32_t b = *(g->ch_rev_off + u), e = *(g->ch_rev_off + u + 1U);
-            for (; b < e; b++) {
-                uint32_t v = *(g->ch_rev_src + b);
-                uint32_t eid = *(g->ch_rev_eid + b);
-                if (*(closed + v)) continue;
-                if (!(*(g->ch_level + v) < *(g->ch_level + u))) continue;
-                float nd = du + *(g->ch_time + eid);
-                if (nd < *(dist + v)) {
-                    *(dist + v) = nd;
-                    heap_push(&pq, v, nd);
-                }
-            }
-        }
-    }
-    xfree(closed);
-    heap_free(&pq);
-}
 
 #if defined(__AVX2__)
 /*
@@ -7302,250 +6272,10 @@ static inline uint32_t vmr_expand_bwd_block(
     return rbase + (bb1 - bb0) * 4U;
 }
 
-/* =========================================================================
- * CCH: Contraction-Hierarchy (customizable) query on travel-time weights.
- * Forward search climbs the hierarchy (up-edges), backward search descends;
- * the original path is recovered by recursively unpacking shortcuts.
- * ========================================================================= */
-
-typedef struct { uint32_t *d; size_t n, cap; } CchVec;
-
-static void cch_vec_push(CchVec *v, uint32_t x) {
-    if (v->n >= v->cap) {
-        v->cap = v->cap ? v->cap * 2 : 256;
-        v->d = (uint32_t *)xrealloc(v->d, v->cap * sizeof(uint32_t));
-    }
-    v->d[v->n++] = x;
-}
-
-static uint32_t cch_lookup_orig(const VmrGraph *g, uint32_t from, uint32_t to) {
-    uint32_t e = *(g->fwd_offsets + from + 1U);
-    for (uint32_t i = *(g->fwd_offsets + from); i < e; i++) {
-        if (*(g->edge_to + i) == to) {
-            return i;
-        }
-    }
-    return VMR_INVALID;
-}
-
-static void cch_unpack(const VmrGraph *g, uint32_t eid, CchVec *out) {
-    /* Iterative DFS over the shortcut DAG (recursion depth can be huge). */
-    CchVec st;
-    memset(&st, 0, sizeof(st));
-    cch_vec_push(&st, eid);
-    while (st.n > 0) {
-        if (st.n > 2000000U || out->n > 3000000U) { /* cycle / runaway guard */
-            xfree(st.d);
-            return;
-        }
-        uint32_t e = st.d[--st.n];
-        if (e == VMR_INVALID || e >= g->ch_edge_count) {
-            continue;
-        }
-        if (*(g->ch_via + e) != VMR_INVALID) {
-            uint32_t c1 = *(g->ch_child1 + e), c2 = *(g->ch_child2 + e);
-            cch_vec_push(&st, c2); /* push reverse so c1 is processed first */
-            cch_vec_push(&st, c1);
-        } else {
-            uint32_t f = *(g->ch_from + e), t = *(g->ch_to + e);
-            cch_vec_push(out, cch_lookup_orig(g, f, t));
-        }
-    }
-    xfree(st.d);
-}
-
-static int vmr_cch_query(const VmrGraph *g, uint32_t start, uint32_t goal,
-                         const VmrQuery *query, VmrResult *res) {
-    clock_t t0 = clock();
-    uint32_t n = g->node_count;
-    if (vmr_ws_reserve(n) != 0) {
-        return -1;
-    }
-    VmrSearchWS *ws = &g_ws;
-    uint32_t epoch;
-    if (ws->epoch > UINT32_MAX - 2U) {
-        memset(ws->sf, 0, (size_t)n * sizeof(BidirFwdState));
-        memset(ws->sb, 0, (size_t)n * sizeof(BidirBwdState));
-        ws->epoch = 0;
-    }
-    ws->epoch += 2U;
-    epoch = ws->epoch;
-    ws->pq_fwd.size = 0;
-    ws->pq_bwd.size = 0;
-    MinHeap *pf = &ws->pq_fwd, *pb = &ws->pq_bwd;
-    const uint32_t *lvl = g->ch_level;
-
-    ws->sf[start].st = epoch; ws->sf[start].g = 0.0f;
-    ws->sf[start].p = VMR_INVALID; ws->sf[start].pe = VMR_INVALID;
-    heap_push(pf, start, 0.0f);
-    ws->sb[goal].st = epoch; ws->sb[goal].g = 0.0f;
-    ws->sb[goal].p = VMR_INVALID; ws->sb[goal].pe = VMR_INVALID;
-    heap_push(pb, goal, 0.0f);
-
-    uint32_t expanded = 0;
-    float best = FLT_MAX;
-    uint32_t meet = VMR_INVALID;
-    uint64_t guard = 0;
-
-    while ((pf->size > 0 || pb->size > 0) && guard++ < 60000000ULL) {
-        if (meet != VMR_INVALID) {
-            float tf = (pf->size > 0) ? pf->buf->prio : FLT_MAX;
-            float tb = (pb->size > 0) ? pb->buf->prio : FLT_MAX;
-            if (tf + tb >= best) {
-                break;
-            }
-        }
-        HeapEntry top;
-        if (pf->size > 0 && heap_pop(pf, &top)) {
-            uint32_t u = top.node;
-            if (ws->sf[u].st != epoch + 1) {
-                ws->sf[u].st = epoch + 1;
-                expanded++;
-                if ((ws->sb[u].st == epoch || ws->sb[u].st == epoch + 1) && ws->sb[u].g < FLT_MAX) {
-                    float tot = ws->sf[u].g + ws->sb[u].g;
-                    if (tot < best) { best = tot; meet = u; }
-                }
-                uint32_t be = *(g->ch_fwd_off + u + 1U);
-                for (uint32_t e = *(g->ch_fwd_off + u); e < be; e++) {
-                    uint32_t w = *(g->ch_to + e);
-                    if (*(lvl + w) <= *(lvl + u)) continue; /* up-edge only */
-                    if (ws->sf[w].st == epoch + 1) continue; /* settled: final */
-                    float ng = ws->sf[u].g + *(g->ch_time + e);
-                    if (ws->sf[w].st != epoch || ng < ws->sf[w].g) {
-                        ws->sf[w].st = epoch; ws->sf[w].g = ng;
-                        ws->sf[w].p = u; ws->sf[w].pe = e;
-                        if (ng < best) heap_push(pf, w, ng);
-                    }
-                }
-            }
-        }
-        if (pb->size > 0 && heap_pop(pb, &top)) {
-            uint32_t w = top.node;
-            if (ws->sb[w].st != epoch + 1) {
-                ws->sb[w].st = epoch + 1;
-                expanded++;
-                if ((ws->sf[w].st == epoch || ws->sf[w].st == epoch + 1) && ws->sf[w].g < FLT_MAX) {
-                    float tot = ws->sf[w].g + ws->sb[w].g;
-                    if (tot < best) { best = tot; meet = w; }
-                }
-                uint32_t re = *(g->ch_rev_off + w + 1U);
-                for (uint32_t r = *(g->ch_rev_off + w); r < re; r++) {
-                    uint32_t u = *(g->ch_rev_src + r);
-                    if (*(lvl + u) <= *(lvl + w)) continue; /* down-edge (u,w): lvl[u] > lvl[w] */
-                    if (ws->sb[u].st == epoch + 1) continue; /* settled: final */
-                    uint32_t eid = *(g->ch_rev_eid + r);
-                    float ng = ws->sb[w].g + *(g->ch_time + eid);
-                    if (ws->sb[u].st != epoch || ng < ws->sb[u].g) {
-                        ws->sb[u].st = epoch; ws->sb[u].g = ng;
-                        ws->sb[u].p = w; ws->sb[u].pe = eid;
-                        if (ng < best) heap_push(pb, u, ng);
-                    }
-                }
-            }
-        }
-    }
-
-    if (meet == VMR_INVALID) {
-        res->elapsed_ms = 1000.0 * (double)(clock() - t0) / (double)CLOCKS_PER_SEC;
-        return 0;
-    }
-
-    CchVec fwd, bwd, all, orig;
-    memset(&fwd, 0, sizeof(fwd)); memset(&bwd, 0, sizeof(bwd));
-    memset(&all, 0, sizeof(all)); memset(&orig, 0, sizeof(orig));
-    uint32_t u = meet, w = meet;
-    for (uint32_t steps = 0; u != start && steps <= n; steps++) {
-        uint32_t p = ws->sf[u].p;
-        if (p >= n) { meet = VMR_INVALID; break; }
-        cch_vec_push(&fwd, ws->sf[u].pe);
-        u = p;
-    }
-    if (meet != VMR_INVALID && u != start) {
-        meet = VMR_INVALID;
-    }
-    for (uint32_t steps = 0; meet != VMR_INVALID && w != goal && steps <= n; steps++) {
-        uint32_t p = ws->sb[w].p;
-        if (p >= n) { meet = VMR_INVALID; break; }
-        cch_vec_push(&bwd, ws->sb[w].pe);
-        w = p;
-    }
-    if (meet != VMR_INVALID && w != goal) {
-        meet = VMR_INVALID;
-    }
-    if (meet == VMR_INVALID) {
-        xfree(fwd.d);
-        xfree(bwd.d);
-        res->elapsed_ms = 1000.0 * (double)(clock() - t0) / (double)CLOCKS_PER_SEC;
-        return 0;
-    }
-    for (size_t i = fwd.n; i-- > 0;) {
-        cch_vec_push(&all, fwd.d[i]);
-    }
-    for (size_t i = 0; i < bwd.n; i++) {
-        cch_vec_push(&all, bwd.d[i]);
-    }
-    xfree(fwd.d);
-    xfree(bwd.d);
-    for (size_t i = 0; i < all.n; i++) {
-        uint32_t ce = all.d[i];
-        cch_unpack(g, ce, &orig);
-        if (orig.n > 3000000U) { /* corrupt run-away shortcut */
-            LOG_WARN("CCH runaway at top[%zu] eid=%u", i, ce);
-            orig.n = 0;
-            break;
-        }
-    }
-    xfree(all.d);
-
-    uint32_t ohop = (uint32_t)orig.n;
-    if (ohop == 0 || ohop > 2000000U) { /* corrupt/empty hierarchy path */
-        res->elapsed_ms = 1000.0 * (double)(clock() - t0) / (double)CLOCKS_PER_SEC;
-        xfree(orig.d);
-        LOG_WARN("CCH: hierarchy path unusable (ohop=%u)", ohop);
-        return 0;
-    }
-    res->nodes = (uint32_t *)xmalloc((size_t)(ohop + 1U) * sizeof(uint32_t));
-    res->edges = (uint32_t *)xmalloc((size_t)(ohop ? ohop : 1U) * sizeof(uint32_t));
-    uint32_t at = 0;
-    *(res->nodes + at++) = start;
-    double tot_time = 0.0, tot_dist = 0.0;
-    int bad = 0;
-    for (uint32_t i = 0; i < ohop; i++) {
-        uint32_t eid = orig.d[i];
-        if (eid == VMR_INVALID || eid >= g->edge_count) { bad = 1; break; }
-        *(res->edges + i) = eid;
-        *(res->nodes + at++) = *(g->edge_to + eid);
-        tot_time += (double)*(g->edge_time_s + eid);
-        tot_dist += (double)*(g->edge_length_m + eid);
-    }
-    xfree(orig.d);
-    if (bad) {
-        vmr_result_free(res);
-        vmr_result_init(res);
-        res->elapsed_ms = 1000.0 * (double)(clock() - t0) / (double)CLOCKS_PER_SEC;
-        return 0;
-    }
-
-    res->found = 1;
-    res->mode_used = MODE_CCH;
-    res->hop_count = ohop;
-    res->est_time_s = tot_time;
-    res->total_distance_m = tot_dist;
-    res->nodes_expanded = expanded;
-    res->start_idx = start;
-    res->goal_idx = goal;
-    res->elapsed_ms = 1000.0 * (double)(clock() - t0) / (double)CLOCKS_PER_SEC;
-    vmr_compute_result_telemetry(g, res, &query->pref);
-    return 0;
-}
-
 /*
- * Primary Pathfinding Entrypoint:
+ * Primary Pathfinding Entrypoint (VCA only):
  *   MODE_VEC_BIDIR  -> Bidirectional Vector-Corridor A* (VCA*)
  *   MODE_VEC_UNIDIR -> Unidirectional Vector-Corridor A* (VCA*)
- *   MODE_ASTAR      -> ALT-guided A* on travel time
- *   MODE_DIJKSTRA   -> True uninformed Dijkstra (travel time)
- *   MODE_CCH        -> Contraction-Hierarchy query
  */
 static uint32_t vmr_expand_fwd_block(
     const VmrGraph *g, VmrSearchWS *ws, MinHeap *pq,
@@ -7591,22 +6321,13 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
         return 0;
     }
 
-    if (query->mode == MODE_CCH) {
-        if (!g->cch_built) {
-            LOG_WARN("CCH requested but no contraction hierarchy was built");
-            return -1;
-        }
-        return vmr_cch_query(g, start_idx, goal_idx, query, res);
-    }
-
     vmr_corridor_free();
 
     clock_t t0 = clock();
     uint32_t n = g->node_count;
     const float *as_arr = (query->pref.pref_id >= 0 && query->pref.pref_id < (int)VMR_NUM_PROFILES)
                         ? g->edge_attr_scale[query->pref.pref_id] : NULL;
-    int skip_dead = !g->ch_built &&
-                    !(*(g->node_flags + start_idx) & NODE_DEAD_TREE) &&
+    int skip_dead = !(*(g->node_flags + start_idx) & NODE_DEAD_TREE) &&
                     !(*(g->node_flags + goal_idx)  & NODE_DEAD_TREE);
 
     float sx = *(g->node_x + start_idx), sy = *(g->node_y + start_idx);
@@ -7623,35 +6344,6 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
     }
 
     vmr_corridor_free();
-    if (0 && g->ch_built && !query->pref.avoid_tolls && !g_corr_disabled && start_idx != goal_idx) {
-        uint32_t cn = 0;
-        uint32_t *cnodes = vmr_ch_path(g, start_idx, goal_idx, &cn);
-        if (cnodes && cn >= 2) {
-            uint32_t segs = cn - 1U;
-            if (segs > 128U) {
-                uint32_t step = (segs + 127U) / 128U;
-                uint32_t k = 0;
-                for (uint32_t i = 0; i + step < cn && k < 128U; i += step, k++) {
-                    *(g_corr_x1 + k) = *(g->node_x + *(cnodes + i));
-                    *(g_corr_y1 + k) = *(g->node_y + *(cnodes + i));
-                    *(g_corr_x2 + k) = *(g->node_x + *(cnodes + i + step));
-                    *(g_corr_y2 + k) = *(g->node_y + *(cnodes + i + step));
-                }
-                segs = k;
-            } else {
-                for (uint32_t i = 0; i < segs; i++) {
-                    *(g_corr_x1 + i) = *(g->node_x + *(cnodes + i));
-                    *(g_corr_y1 + i) = *(g->node_y + *(cnodes + i));
-                    *(g_corr_x2 + i) = *(g->node_x + *(cnodes + i + 1U));
-                    *(g_corr_y2 + i) = *(g->node_y + *(cnodes + i + 1U));
-                }
-            }
-            g_corr_n = segs;
-            g_corr_pad2 = 5000.0f * 5000.0f;
-            LOG_INFO("CH corridor: %u nodes, %u segments, 5 km", cn, segs);
-        }
-        xfree(cnodes);
-    }
 
     int cch_weak = 0;
     int cch_strong = 0;
@@ -7714,43 +6406,29 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
             v_atr = g->attr_min[vpid];
         }
     }
-    const float v_heur = (query->mode == MODE_DIJKSTRA)
-                       ? 0.0f : (v_atr / max_speed_mps);
+    const float v_heur = v_atr / max_speed_mps;
 
     float alt_gf[32], alt_gb[32], alt_sf[32], alt_sb[32];
     uint32_t L = g->landmark_count;
-    int has_alt = (query->mode != MODE_DIJKSTRA) &&
-                  (L > 0 && g->alt_nodes != NULL && !g->ch_built);
+    int has_alt = (L > 0 && g->alt_nodes != NULL);
     /* Admissible ALT scale = exact min of the active edge_attr_scale profile.
      * (cost = base_time*attr*align*corridor >= base_time*min_attr). Cached per
-     * profile since the arrays are immutable after load/preprocess. */
-    /* Auto-select the ALT scale.
-     *  - A-star / Dijkstra cost is time -> full strength (1.0) is admissible.
-     *  - Vector cost = time*attr*align*corridor. Its admissible scale is
-     *    min(edge_attr_scale). Long routes are motorway-dominated (attr near the
-     *    profile max), so a stronger scale is effectively admissible there and
-     *    gives far fewer expansions; shorter/mixed routes use the exact min to
-     *    stay correct. UVR_ALT_SCALE overrides everything. */
-    float alt_scale;
-    if (query->mode == MODE_DIJKSTRA || query->mode == MODE_ASTAR) {
-        alt_scale = 1.0f;
-    } else {
-        int pid = query->pref.pref_id;
-        float amin = (pid >= 0 && pid < (int)VMR_NUM_PROFILES) ? g->attr_min[pid] : attr_scale_min;
-        if (amin <= 0.0f) amin = attr_scale_min;
-        alt_scale = amin; /* admissible default (correct) */
-        if (!cch_weak) {
-            const char *s = getenv("UVR_ALT_SCALE");
-            if (s && *s) {
-                float v = (float)atof(s);
-                if (v > 0.0f && v <= 1.5f) alt_scale = v; /* opt-in strong (may be inadmissible) */
-            }
+     * profile since the arrays are immutable after load/preprocess. UVR_ALT_SCALE
+     * overrides it (opt-in strong scale). */
+    int pid = query->pref.pref_id;
+    float amin = (pid >= 0 && pid < (int)VMR_NUM_PROFILES) ? g->attr_min[pid] : attr_scale_min;
+    if (amin <= 0.0f) amin = attr_scale_min;
+    float alt_scale = amin; /* admissible default (correct) */
+    if (!cch_weak) {
+        const char *s = getenv("UVR_ALT_SCALE");
+        if (s && *s) {
+            float v = (float)atof(s);
+            if (v > 0.0f && v <= 1.5f) alt_scale = v; /* opt-in strong (may be inadmissible) */
         }
-        /* Eco uses the fuel-Euclidean heuristic (added below) which is
-         * admissible and much tighter than the time-based ALT, so it keeps the
-         * exact admissible min scale (no strong-scale retry needed). */
-        cch_strong = (!cch_weak && alt_scale > amin + 1e-4f) ? 1 : 0;
     }
+    /* Eco uses the fuel-Euclidean heuristic (added below) which is admissible
+     * and much tighter than the time-based ALT, so it keeps the exact min. */
+    cch_strong = (!cch_weak && alt_scale > amin + 1e-4f) ? 1 : 0;
     (void)0;
 #if defined(__AVX2__)
     __m256 gf0 = _mm256_setzero_ps(), gf1 = _mm256_setzero_ps();
@@ -7833,8 +6511,6 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
                 float as = as_arr ? as_arr[ei] : compute_attr_scale(g, ei, &query->pref);
                 if (ws->sf[v].st == epoch + 1) continue;
                 if (skip_dead && (*(g->edge_flags + ei) & EDGE_DEAD_TARGET)) continue;
-                if (g->ch_built && !(*(g->ch_level + u) < *(g->ch_level + v))) continue;
-                if (g->ch_built && !(*(g->ch_level + u) < *(g->ch_level + v))) continue;
                 if ((*(g->node_flags + u) & NODE_HAS_TURN_RES) && ws->sf[u].p != VMR_INVALID &&
                     turn_forbidden(g, u, ws->sf[u].p, v)) continue;
 
@@ -7850,9 +6526,7 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
                 }
 
                 float h_v = 0.0f;
-                if (g->ch_built) {
-                    h_v = 0.0f;
-                } else if (has_alt) {
+                if (has_alt) {
                     h_v = ALT_HEUR(g, v, alt_gf, alt_gb, gf0, gf1, gf2, gf3, gb0, gb1, gb2, gb3, L) * alt_scale;
                 } else if (query->mode == MODE_VEC_UNIDIR) {
                     float rvx = gx - *(g->node_x + v);
@@ -7862,16 +6536,15 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
 
                 /* Optimistic lower bound (cos2 = 1): skip two-hop and heap work
                  * when the edge cannot improve the target. */
-                float sc_min = compute_8d_cost_min(g, ei, &query->pref, query->mode, as,
+                float sc_min = compute_8d_cost_min(g, ei, &query->pref, as,
                                                         cos1, mom);
                 float ng_min = ws->sf[u].g + sc_min;
                 if (ws->sf[v].st == epoch && ng_min >= ws->sf[v].g) continue;
                 if (ng_min + h_v >= best_total) continue;
 
-                float cos2 = (query->mode == MODE_DIJKSTRA || query->mode == MODE_ASTAR) ? cos1 :
-                             ((v == goal_idx) ? 1.0f :
-                              two_hop_fwd_cos_fast(g, ei, cos1, urx, ury));
-                float sc = compute_8d_step_cost(g, ei, &query->pref, query->mode, as,
+                float cos2 = (v == goal_idx) ? 1.0f :
+                             two_hop_fwd_cos_fast(g, ei, cos1, urx, ury);
+                float sc = compute_8d_step_cost(g, ei, &query->pref, as,
                                                 cos1, cos2, mom, cross_ratio);
                 float ng = ws->sf[u].g + sc;
                 if (ng + h_v >= best_total) continue;
@@ -7942,8 +6615,7 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
                     uint32_t v = *(g->edge_to + ei);
                     float as = as_arr ? as_arr[ei] : compute_attr_scale(g, ei, &query->pref);
                     if (ws->sf[v].st == epoch + 1) continue;
-if (skip_dead && (*(g->edge_flags + ei) & EDGE_DEAD_TARGET)) continue;
-                if (g->ch_built && !(*(g->ch_level + u) < *(g->ch_level + v))) continue;
+                if (skip_dead && (*(g->edge_flags + ei) & EDGE_DEAD_TARGET)) continue;
                 if (!in_corridor(g, v)) continue;
                 if ((*(g->node_flags + u) & NODE_HAS_TURN_RES) && ws->sf[u].p != VMR_INVALID &&
                     turn_forbidden(g, u, ws->sf[u].p, v)) continue;
@@ -7959,21 +6631,19 @@ if (skip_dead && (*(g->edge_flags + ei) & EDGE_DEAD_TARGET)) continue;
                         cross_ratio = (cross_abs * inv_chord) * inv_chord;
                     }
 
-                    float h_v = g->ch_built
-                        ? 0.0f
-                        : (has_alt
-                            ? (ALT_HEUR(g, v, alt_gf, alt_gb, gf0, gf1, gf2, gf3, gb0, gb1, gb2, gb3, L) * alt_scale)
-                            : vmr_sqrt_fast((gx - *(g->node_x + v)) * (gx - *(g->node_x + v)) +
-                                            (gy - *(g->node_y + v)) * (gy - *(g->node_y + v))) * v_heur);
+                    float h_v = has_alt
+                        ? (ALT_HEUR(g, v, alt_gf, alt_gb, gf0, gf1, gf2, gf3, gb0, gb1, gb2, gb3, L) * alt_scale)
+                        : vmr_sqrt_fast((gx - *(g->node_x + v)) * (gx - *(g->node_x + v)) +
+                                        (gy - *(g->node_y + v)) * (gy - *(g->node_y + v))) * v_heur;
                     /* Eco fuel-Euclidean lower bound: fuel >= min_fuel_per_km *
                      * euclidean_km, in cost units (cost = fuel * 1000/NORM). */
-                    if (query->pref.pref_id == VMR_PROFILE_ECO && g->eco_min_fuel > 0.0f && !g->ch_built) {
+                    if (query->pref.pref_id == VMR_PROFILE_ECO && g->eco_min_fuel > 0.0f) {
                         float ex = gx - *(g->node_x + v), ey = gy - *(g->node_y + v);
                         float hf = vmr_sqrt_fast(ex * ex + ey * ey) * g->eco_min_fuel * 0.4f;
                         if (hf > h_v) h_v = hf;
                     }
 
-                    float sc_min = compute_8d_cost_min(g, ei, &query->pref, MODE_VEC_BIDIR, as,
+                    float sc_min = compute_8d_cost_min(g, ei, &query->pref, as,
                                                         cos1, mom);
                     float ng_min = ws->sf[u].g + sc_min;
                     if (ws->sf[v].st == epoch && ng_min >= ws->sf[v].g) continue;
@@ -7981,7 +6651,7 @@ if (skip_dead && (*(g->edge_flags + ei) & EDGE_DEAD_TARGET)) continue;
 
                     float cos2 = (v == goal_idx) ? 1.0f :
                                                   two_hop_fwd_cos_fast(g, ei, cos1, urx, ury);
-                    float sc = compute_8d_step_cost(g, ei, &query->pref, MODE_VEC_BIDIR, as,
+                    float sc = compute_8d_step_cost(g, ei, &query->pref, as,
                                                     cos1, cos2, mom, cross_ratio);
                     float ng = ws->sf[u].g + sc;
                     if (ng + h_v >= best_total) continue;
@@ -8047,7 +6717,6 @@ uint32_t u = *(g->rev_src_node + ri);
                     float as = as_arr ? as_arr[eid] : compute_attr_scale(g, eid, &query->pref);
                     if (ws->sb[u].st == epoch + 1) continue;
                     if (skip_dead && (*(g->edge_flags + eid) & EDGE_DEAD_SOURCE)) continue;
-                    if (g->ch_built && !(*(g->ch_level + w) < *(g->ch_level + u))) continue;
                     uint32_t next_w = ws->sb[w].p;
                     if ((*(g->node_flags + w) & NODE_HAS_TURN_RES) &&
                         next_w != VMR_INVALID && turn_forbidden(g, w, u, next_w)) continue;
@@ -8065,19 +6734,17 @@ uint32_t u = *(g->rev_src_node + ri);
                         cross_ratio = (cross_abs * inv_chord) * inv_chord;
                     }
 
-                    float h_v = g->ch_built
-                        ? 0.0f
-                        : (has_alt
-                            ? (ALT_HEUR(g, u, alt_sf, alt_sb, sf0, sf1, sf2, sf3, sb0, sb1, sb2, sb3, L) * alt_scale)
-                            : vmr_sqrt_fast((sx - *(g->node_x + u)) * (sx - *(g->node_x + u)) +
-                                            (sy - *(g->node_y + u)) * (sy - *(g->node_y + u))) * v_heur);
-                    if (query->pref.pref_id == VMR_PROFILE_ECO && g->eco_min_fuel > 0.0f && !g->ch_built) {
+                    float h_v = has_alt
+                        ? (ALT_HEUR(g, u, alt_sf, alt_sb, sf0, sf1, sf2, sf3, sb0, sb1, sb2, sb3, L) * alt_scale)
+                        : vmr_sqrt_fast((sx - *(g->node_x + u)) * (sx - *(g->node_x + u)) +
+                                        (sy - *(g->node_y + u)) * (sy - *(g->node_y + u))) * v_heur;
+                    if (query->pref.pref_id == VMR_PROFILE_ECO && g->eco_min_fuel > 0.0f) {
                         float ex = sx - *(g->node_x + u), ey = sy - *(g->node_y + u);
                         float hf = vmr_sqrt_fast(ex * ex + ey * ey) * g->eco_min_fuel * 0.4f;
                         if (hf > h_v) h_v = hf;
                     }
 
-                    float sc_min = compute_8d_cost_min(g, eid, &query->pref, MODE_VEC_BIDIR, as,
+                    float sc_min = compute_8d_cost_min(g, eid, &query->pref, as,
                                                         cos1, mom);
                     float ng_min = ws->sb[w].g + sc_min;
                     if ((ws->sb[u].st == epoch || ws->sb[u].st == epoch+1) && ng_min >= ws->sb[u].g) continue;
@@ -8085,7 +6752,7 @@ uint32_t u = *(g->rev_src_node + ri);
 
                     float cos2 = (u == start_idx) ? 1.0f :
                                                   two_hop_rev_cos_fast(g, ri, cos1, urx, ury);
-                    float sc = compute_8d_step_cost(g, eid, &query->pref, MODE_VEC_BIDIR, as,
+                    float sc = compute_8d_step_cost(g, eid, &query->pref, as,
                                                     cos1, cos2, mom, cross_ratio);
                     float ng = ws->sb[w].g + sc;
                     if (ng + h_v >= best_total) continue;
@@ -8291,9 +6958,7 @@ static const char *mode_str(SearchMode m) {
     switch (m) {
         case MODE_VEC_BIDIR:  return "vca-bidir";
         case MODE_VEC_UNIDIR: return "vca-unidir";
-        case MODE_ASTAR:      return "astar";
-        case MODE_CCH:        return "cch";
-        default:              return "dijkstra";
+        default:              return "vca-bidir";
     }
 }
 
@@ -8335,13 +7000,13 @@ static void vmr_print_result(const VmrGraph *g, const VmrResult *res) {
 }
 
 static void vmr_benchmark(const VmrGraph *g, uint32_t s, uint32_t t, const VmrPreference *pref) {
-    SearchMode modes[5] = { MODE_VEC_BIDIR, MODE_VEC_UNIDIR, MODE_ASTAR, MODE_DIJKSTRA, MODE_CCH };
-    printf("\n=== UK Benchmark (%lld -> %lld) ===\n",
+    SearchMode modes[2] = { MODE_VEC_BIDIR, MODE_VEC_UNIDIR };
+    printf("\n=== VCA Benchmark (%lld -> %lld) ===\n",
            (long long)*(g->node_osm_id + s), (long long)*(g->node_osm_id + t));
     printf("%-15s %-6s %-6s %-10s %-9s %-8s %-8s %-9s %-9s\n",
            "Algorithm", "Found", "Hops", "Dist(km)", "Time(min)", "MeanCos", "CumCos", "Expanded", "CPU(ms)");
 
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < 2; i++) {
         VmrQuery q = { modes[i], *pref, 1 };
         VmrResult r;
         vmr_result_init(&r);
@@ -8453,26 +7118,21 @@ static int run_self_tests(void) {
     TEST_CHK(g.peeled_dead_nodes >= 10, "cul-de-sac 1-core peeling flagged dead ends");
     raw_graph_free(&rg);
 
-    /* 3. Route London (1) -> Inverness (22) via Bidir, Unidir, Dijkstra */
+    /* 3. Route London (1) -> Inverness (22) via Bidir and Unidir VCA */
     uint32_t s_lon = vmr_snap_coord(&g, 51.5074, -0.1278, 1);
     uint32_t t_inv = vmr_snap_coord(&g, 57.4778, -4.2247, 1);
     TEST_CHK(s_lon != VMR_INVALID && t_inv != VMR_INVALID, "spatial grid snap");
 
     VmrQuery qb = { MODE_VEC_BIDIR,  vmr_preset_profile("balanced"), 1 };
     VmrQuery qu = { MODE_VEC_UNIDIR, vmr_preset_profile("balanced"), 1 };
-    VmrQuery qd = { MODE_DIJKSTRA,   vmr_preset_profile("balanced"), 1 };
-    VmrResult rb, ru, rd;
+    VmrResult rb, ru;
     vmr_result_init(&rb);
     vmr_result_init(&ru);
-    vmr_result_init(&rd);
     TEST_CHK(vmr_find_path(&g, s_lon, t_inv, &qb, &rb) == 0 && rb.found, "bidir London->Inverness");
     TEST_CHK(vmr_find_path(&g, s_lon, t_inv, &qu, &ru) == 0 && ru.found, "unidir London->Inverness");
-    TEST_CHK(vmr_find_path(&g, s_lon, t_inv, &qd, &rd) == 0 && rd.found, "dijkstra London->Inverness");
     TEST_CHK(rb.cum_vec_cos_sim > 0.99, "cumulative vector sum reaches goal accurately");
-    TEST_CHK(rb.nodes_expanded <= rd.nodes_expanded, "bidir expands <= dijkstra");
     vmr_result_free(&rb);
     vmr_result_free(&ru);
-    vmr_result_free(&rd);
 
     /* 4. Verify O(1) island disconnection rejection (London -> Belfast) */
     uint32_t t_bel = vmr_snap_coord(&g, 54.5973, -5.9301, 1);
@@ -8537,8 +7197,8 @@ static void print_usage(const char *prog) {
         "Routing & Evaluation:\n"
         "  --route-coord <la1> <lo1> <la2> <lo2>   Snap WGS84 coords & route\n"
         "  --route-id <osmA> <osmB>                Route between OSM intersection IDs\n"
-        "  --mode <bidir|unidir|astar|dijkstra|cch>\n"
-        "                                        Search algorithm (default: bidir)\n"
+        "  --mode <bidir|unidir>\n"
+        "                                        VCA search variant (default: bidir)\n"
         "  --profile <balanced|fastest|direct|highway|local|eco|scenic|shortest>\n"
         "                                        Optimisation profile (default: balanced)\n"
         "  --vehicle <car|van|hgv-rigid|hgv-artic|ev>  Vehicle type (fuel curve + speed cap)\n"
@@ -8642,11 +7302,8 @@ int main(int argc, char **argv) {
             pref.w_eco = (float)atof(*(argv + (++i)));
         } else if (strcmp(a, "--mode") == 0 && i + 1 < argc) {
             const char *m = *(argv + (++i));
-        if (c_stricmp(m, "bidir") == 0) mode = MODE_VEC_BIDIR;
-        else if (c_stricmp(m, "unidir") == 0) mode = MODE_VEC_UNIDIR;
-        else if (c_stricmp(m, "astar") == 0) mode = MODE_ASTAR;
-        else if (c_stricmp(m, "dijkstra") == 0) mode = MODE_DIJKSTRA;
-        else if (c_stricmp(m, "cch") == 0) mode = MODE_CCH;
+            if (c_stricmp(m, "unidir") == 0) mode = MODE_VEC_UNIDIR;
+            else mode = MODE_VEC_BIDIR;
         } else if (strcmp(a, "--route-coord") == 0 && i + 4 < argc) {
             do_rcoord = 1;
             la1 = strtod(*(argv + (++i)), NULL);

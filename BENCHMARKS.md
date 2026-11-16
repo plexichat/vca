@@ -7,10 +7,11 @@ All measurements: AMD Ryzen 5 5600X (6c/12t), 32 GB RAM, Windows, MinGW-W64 GCC
 ## Our router vs OSRM (industry standard), 24 inter-UK routes
 
 OSRM = `router.project-osrm.org` public demo server (`driving` profile, live OSM).
-Our "A*" = ALT-guided A* on travel time (time-optimal). Our "VCA" = bidirectional
-Vector-Corridor A* (`balanced` profile).
+"Our VCA" = bidirectional Vector-Corridor A* (`balanced` profile). The "ref" columns
+are a time-optimal reference route (ALT A*) computed while benchmarking, shown only
+to indicate how close VCA's vector-optimal route is to the shortest-time path.
 
-| Route | OSRM km | A* km | VCA km | A* min | VCA min | Δdist | Δtime |
+| Route | OSRM km | ref km | VCA km | ref min | VCA min | Δdist | Δtime |
 |---|---|---|---|---|---|---|---|
 | London→Manchester | 321.0 | 319.6 | 312.7 | 191.3 | 201.7 | -2.6% | -17.3% |
 | London→Edinburgh | 648.9 | 598.1 | 609.7 | 373.1 | 377.2 | -6.0% | -20.1% |
@@ -43,24 +44,6 @@ speed, while OSRM models real-world turn/traffic costs. A few routes (Leeds→Ed
 −12%, Cambridge→Manchester −9.4%) diverge more because our graph is a specific UK
 extract with a slightly different road set than OSRM's live planet data.
 
-## Algorithm comparison, 24 inter-UK routes (means)
-
-| Algorithm | Expanded | CPU ms | Dist km | Time min |
-|---|---|---|---|---|
-| vca-bidir | 50,909 | 26.8 | 360.8 | 218.0 |
-| vca-unidir | 96,828 | 74.9 | 359.9 | 213.2 |
-| astar (ALT) | 25,089 | 5.2 | 359.6 | 213.1 |
-| dijkstra | 855,861 | 197.0 | 359.6 | 213.1 |
-| cch | 1,651 | 85.1 | 364.6 | 216.6 |
-
-- **astar matches dijkstra exactly** (359.6 km) at 38× fewer expansions — the ALT
-  A* is correct and fast.
-- **vca-bidir** lands within 0.3% of the time-optimal distance (360.8 vs 359.6) but
-  follows a *vector-optimal* (straighter, class-aware) path, at 26.8 ms.
-- **cch** expands the fewest nodes but returns **sub-optimal routes** (364.6 km vs
-  359.6 optimal) — the bundled CH builder is a simplified/buggy implementation and
-  is not a fair incumbent comparison. Use OSRM/GraphHopper for the industry baseline.
-
 ## Fuel-economy route (London→Edinburgh, car)
 
 | Profile | Dist km | Time min | Fuel L | L/100km |
@@ -89,7 +72,6 @@ file + re-route".
 | Load `.vgraph` cache (2.3 GB, mmap) | **194 ms** | cold; warm ~150 ms |
 | Traffic file reload (10k lines) | **< 5 ms** | O(lines) via osm_id index; 24 MB array reused |
 | Re-route, vca-bidir | **~27 ms** | warm |
-| Re-route, astar | **~5 ms** | warm |
 | **Live traffic update cycle** (reload + re-route) | **~30–50 ms** | no regeneration |
 | Full graph regen: SQLite DB load (1.8 GB, 17 M nodes) | ~38 s | I/O-bound |
 | Full graph regen: preprocess (OpenMP 6 threads) | ~10 s | contraction + reorder + two-hop + ALT |

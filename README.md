@@ -2,16 +2,16 @@
 
 A single-file, dependency-free **VCA\*** router for large road networks.
 
-VCA\* optimises a **direction-aware, preference-weighted vector cost** instead of
-a single scalar such as travel time. Each edge carries a *direction* and a set of
+VCA\* optimises a **direction-aware, preference-weighted vector cost** instead of a
+single scalar such as travel time. Each edge carries a *direction* and a set of
 *feature attributes* (road class, speed, straightness, surface). The cost of a path
 combines how well each edge aligns with the remaining route direction (via two-hop
 look-ahead continuation vectors) with a per-profile weighting of those attributes.
 The result is a route that is straighter, keeps to preferred road classes, and
 follows the overall bearing of the trip.
 
-`algo.c` is one translation unit (C99, with optional OpenMP and AVX2 paths) that
-does the whole pipeline — OSM XML / PBF / CSV / SQLite import, graph contraction and
+`algo.c` is one translation unit (C99, with optional OpenMP and AVX2 paths) that does
+the whole pipeline — OSM XML / PBF / CSV / SQLite import, graph contraction and
 preprocessing, and point-to-point search — with no dependencies beyond `sqlite3.c`
 and `zlib`.
 
@@ -50,22 +50,39 @@ gcc -O2 -mavx2 -o uk_vector_router_sc.exe algo.c sqlite3.o libz.a -I . -lm
     --traffic traffic.csv --watch 60
 ```
 
-**Modes** (`--mode`): `bidir` (default), `unidir`, `astar`, `dijkstra`, `cch`.
+## VCA's cases
 
-**Profiles** (`--profile`): `balanced` (default), `fastest`, `direct`, `highway`,
-`local` (no-toll), `eco` (fuel-economy), `scenic` (winding, higher-class roads),
-`shortest` (minimise distance). Each sets the feature-weight vector used in the cost.
+**Search variant** (`--mode`):
+- `bidir` (default) — bidirectional VCA: forward and backward searches grow from
+  origin and destination and meet in the middle. Fewest expansions on long routes.
+- `unidir` — unidirectional VCA: a single forward search. Simpler, expands more
+  nodes, useful for debugging or when a backward graph is unavailable.
 
-**Vehicles** (`--vehicle`): `car`, `van`, `hgv-rigid`, `hgv-artic`, `ev`. A vehicle
-sets a fuel-consumption curve (base L/100km + speed sensitivity + stop-and-go
-penalty) and a speed cap. The cap slows edges above it (so an HGV is measurably
-slower on motorways), which changes both the fastest route and the fuel figure.
+**Optimisation profile** (`--profile`) — sets the feature-weight vector used in the
+edge cost:
+- `balanced` (default) — equal blend of speed, class, straightness, smoothness.
+- `fastest` — weights speed and road class most; closest to a pure time route.
+- `direct` — weights straightness/alignment most; fewest bends.
+- `highway` — weights road class most; prefers motorways/trunk roads.
+- `local` / `no-toll` — down-weights major roads and applies a toll penalty; avoids
+  motorways and toll roads.
+- `eco` — **fuel-economy**: the edge cost is proportional to fuel burned
+  (`cost = time × fuel_l_per_km(speed) × speed`), so the route minimises total fuel.
+- `scenic` — prefers higher-class, winding (low-straightness) roads over speed.
+- `shortest` — minimises distance, de-emphasises smoothness.
 
-**Fuel economy** (`--profile eco`): the eco profile's edge cost is *proportional to
-fuel burned* — `cost = time × attr` with `attr = fuel_l_per_km(speed) × speed`, so
-minimising the route cost minimises total fuel. The fuel model is U-shaped vs speed
-(minimal at the vehicle's optimum cruising speed, rising at low speed from
-stop-and-go and at high speed from drag). `--fuel <l/100km>` overrides the base rate.
+**Vehicle** (`--vehicle`) — sets a fuel curve + speed cap that change both the route
+and the reported fuel figure:
+- `car`, `van`, `hgv-rigid`, `hgv-artic`, `ev`.
+- Each has a base L/100km, a speed-sensitivity coefficient, a stop-and-go penalty,
+  and a speed cap. The cap slows edges above it, so an HGV (cap 85 km/h) takes a
+  measurably different, slower path than a car (cap 130 km/h).
+- `--fuel <l/100km>` overrides the base consumption rate.
+
+**Fuel economy** (`--profile eco`): the fuel model is U-shaped vs speed — minimal at
+the vehicle's optimum cruising speed, rising at low speed (stop-and-go, wrong gear)
+and high speed (aero drag). The eco search uses a fuel-Euclidean heuristic
+(`h = euclidean_km × min_fuel_per_km`) so it stays admissible and fast.
 
 **Live traffic** (`--traffic <file>` + `--watch <seconds>`): `--traffic` loads
 per-edge travel-time multipliers from a CSV (`osm_id,multiplier` per line, `#` for
@@ -79,9 +96,8 @@ live network feed: a production system would have a feed reader (e.g. National
 Highways WebTRIS for England, or a commercial TomTom/HERE/Google feed) rewrite the
 file every 1–5 minutes.
 
-**Environment overrides:** `UVR_ALT_SCALE` forces the ALT landmark heuristic scale
-(default is the graph's admissible per-profile minimum); `VMR_CCH=1` builds the CCH
-hierarchy at preprocess time.
+**Environment override:** `UVR_ALT_SCALE` forces the ALT landmark heuristic scale
+(default is the graph's admissible per-profile minimum).
 
 ## How the search works
 
@@ -118,18 +134,15 @@ hierarchy at preprocess time.
 
 ### Query latency (warm, single core, means over 24 UK routes)
 
-| Algorithm | Expanded | CPU |
+| Variant | Expanded | CPU |
 |---|---|---|
 | **vca-bidir** | 50,909 | **26.8 ms** |
 | vca-unidir | 96,828 | 74.9 ms |
-| astar (ALT-A*) | 25,089 | 5.2 ms |
-| dijkstra (true) | 855,861 | 197 ms |
-| cch (legacy, sub-optimal) | 1,651 | 85.1 ms |
 
 vca-bidir lands within ~0.3% of the time-optimal distance while following a
 vector-optimal (straighter, class-aware) path. The eco profile is slower to compute
 (~0.32 s on London→Edinburgh) because its fuel-optimal path uses unavoidable slow
-city edges; a fuel-Euclidean heuristic keeps the search admissible and cuts its
+city edges; the fuel-Euclidean heuristic keeps the search admissible and cuts its
 expansions ~3.4× versus a time-only heuristic.
 
 ### Peak memory (single core)
@@ -139,30 +152,17 @@ expansions ~3.4× versus a time-only heuristic.
 | Peak **private** (heap) | **382 MB** |
 | Peak working set (incl. mmap pages) | 583 MB |
 
-## Comparison to incumbents
+## Comparison to OSRM (industry standard)
 
 We compare against **OSRM** (the open-source routing engine behind the OSRM demo
-server, an industry-standard baseline) on 24 inter-UK routes. VCA routes are within
-**1.5% of OSRM on distance** on average; the time-optimal A* is closer still. See
-[`BENCHMARKS.md`](BENCHMARKS.md) for the full per-route table, the internal
-vca/astar/dijkstra/cch comparison, and the fuel-economy numbers.
-
-| | Dijkstra | A* (ALT) | CCH (legacy) | OSRM | **VCA\*** |
-|---|---|---|---|---|---|
-| Expanded (24-route mean) | 855,861 | 25,089 | 1,651 | — | 50,909 |
-| CPU (warm) | 197 ms | 5.2 ms | 85 ms | — | 26.8 ms |
-| Distance vs OSRM | — | ~1% | — | baseline | ~1.5% |
-| Objective | time | time | time | time | **direction-aware vector** |
-
-The bundled CCH is a simplified builder and returns sub-optimal routes, so it is not
-a fair incumbent comparison — use OSRM (or GraphHopper) for the industry baseline.
+server) on 24 inter-UK routes. VCA routes are within **1.5% of OSRM on distance** on
+average. See [`BENCHMARKS.md`](BENCHMARKS.md) for the full per-route table and the
+fuel-economy numbers.
 
 ## Status / caveats
 
 - `.vgraph` format is v8/v9; the loader accepts both and backfills the newer eco/
   scenic/shortest profile scales on legacy v8 caches.
-- CCH is opt-in (`VMR_CCH=1`) and experimental — the legacy CH builder does not
-  scale cleanly and produces sub-optimal routes; it is not used for production.
 - The ALT scale is the exact admissible per-profile minimum; a few routes with
   unavoidable slow edges (notably eco) expand more nodes than strictly necessary.
 - The fuel model is a static per-edge approximation (speed + smoothness); it does not
