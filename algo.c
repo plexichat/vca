@@ -2490,6 +2490,7 @@ static int vmr_preprocess_graph(VmrRawGraph *rg, VmrGraph *g) {
         *(in_head + w->to) = e;
         (*(in_deg + w->to))++;
     }
+    VMR_TICK("adj build");
 
     /* Step 2: Degree-2 Chain Contraction (iterative pass until fixed point) */
     uint32_t contracted_cnt = 0;
@@ -2521,6 +2522,7 @@ static int vmr_preprocess_graph(VmrRawGraph *rg, VmrGraph *g) {
             *(in_cq + i) = 1;
         }
     }
+    VMR_TICK("queue init");
 
     while (cq_head < cq_tail) {
         uint32_t m = *(cq + cq_head++);
@@ -2655,6 +2657,7 @@ static int vmr_preprocess_graph(VmrRawGraph *rg, VmrGraph *g) {
     xfree(out_deg);
     xfree(in_deg);
     xfree(no_contract);
+    VMR_TICK("contract loop");
 
     /* Step 3: Compact surviving nodes & live edges in place */
     uint32_t *remap = (uint32_t *)xmalloc((size_t)rn * sizeof(uint32_t));
@@ -2760,16 +2763,22 @@ static int vmr_preprocess_graph(VmrRawGraph *rg, VmrGraph *g) {
         xfree(remap);
         return -1;
     }
+#pragma omp parallel for schedule(static)
     for (uint32_t i = 0; i < rn; i++) {
         uint32_t ni = *(remap + i);
         if (ni != VMR_INVALID) {
-            int64_t oid = *(rg->node_osm_id + i);
-            *(g->node_osm_id + ni) = oid;
+            *(g->node_osm_id + ni) = *(rg->node_osm_id + i);
             *(g->node_lat + ni)    = *(rg->node_lat + i);
             *(g->node_lon + ni)    = *(rg->node_lon + i);
             *(g->node_x + ni)      = *(rg->node_x + i);
             *(g->node_y + ni)      = *(rg->node_y + i);
-            idmap_put(&g->osm_map, oid, ni);
+        }
+    }
+    /* idmap_put mutates a shared hash table, so it stays single-threaded. */
+    for (uint32_t i = 0; i < rn; i++) {
+        uint32_t ni = *(remap + i);
+        if (ni != VMR_INVALID) {
+            idmap_put(&g->osm_map, *(rg->node_osm_id + i), ni);
         }
     }
     VMR_TICK("node copy");
@@ -2857,7 +2866,12 @@ static int vmr_preprocess_graph(VmrRawGraph *rg, VmrGraph *g) {
     rg->node_count = 0;
     rg->node_cap = 0;
 
-    /* Populate 8D SoA edge arrays & Forward CSR */
+    /* Forward CSR degree counts first (cheap, serial), then the heavy per-edge
+     * vector math in parallel (independent per edge). */
+    for (uint32_t e = 0; e < sm; e++) {
+        (*(g->fwd_offsets + we[e].from + 1U))++;
+    }
+#pragma omp parallel for schedule(static)
     for (uint32_t e = 0; e < sm; e++) {
         const RawEdge *w = we + e;
         uint32_t u = w->from;
@@ -2887,8 +2901,6 @@ static int vmr_preprocess_graph(VmrRawGraph *rg, VmrGraph *g) {
         *(g->edge_length_m + e)   = w->length_m;
         *(g->edge_time_s + e)     = w->travel_time_s;
         *(g->edge_flags + e)      = w->flags;
-
-        (*(g->fwd_offsets + u + 1U))++;
     }
     VMR_TICK("edge soa");
 
