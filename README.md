@@ -72,6 +72,8 @@ edge cost:
   (`cost = time × fuel_l_per_km(speed) × speed`), so the route minimises total fuel.
 - `scenic` — prefers higher-class, winding (low-straightness) roads over speed.
 - `shortest` — minimises distance, de-emphasises smoothness.
+- `avoid-motorway` / `no-motorway` — down-weights road class and speed, prefers
+  smooth A-roads; useful for fuel, safety, or drivers who dislike motorways.
 
 **Vehicle** (`--vehicle`) — sets a fuel curve + speed cap that change both the route
 and the reported fuel figure:
@@ -129,10 +131,14 @@ file every 1–5 minutes.
 
 | Phase | Single core | OpenMP (6 threads) |
 |---|---|---|
-| SQLite DB load (17 M nodes / 33 M edges) | ~45 s (I/O) | ~45 s (I/O) |
-| Contraction + components + reorder + two-hop + grid | ~7.7 s | ~7.4 s |
-| ALT landmarks (32) | **19.8 s** | **2.8 s** |
-| **Total algorithm** | **27.5 s** | **~10 s** |
+| SQLite DB load (17 M nodes / 33 M edges) | ~38–45 s (I/O) | ~38–45 s (I/O) |
+| Contraction + components + peel + reorder + two-hop + grid + attr | ~12 s | ~9 s |
+| ALT landmarks (31) | **19.8 s** | **2.6–3.9 s** |
+| **Total algorithm** | **~32 s** | **~12–13 s** |
+
+The attr_scale table (9 profiles × 6 M edges) is built in parallel; the grid and
+two-hop passes are O(n)/O(e). The one-time cost is dominated by the SQLite DB read
+(17 M nodes / 33 M edges) and the degree-2 contraction pass.
 
 ### Query latency (warm, single core, means over 24 UK routes)
 

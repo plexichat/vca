@@ -66,7 +66,7 @@ static inline float vmr_sqrt_fast(float x) {
 
 /* Number of built-in optimisation profiles. Precomputed edge_attr_scale
  * arrays and per-profile admissible ALT scales are sized to this. */
-#define VMR_NUM_PROFILES 8U
+#define VMR_NUM_PROFILES 9U
 #define VMR_PROFILE_BALANCED 0
 #define VMR_PROFILE_FASTEST  1
 #define VMR_PROFILE_DIRECT   2
@@ -75,6 +75,7 @@ static inline float vmr_sqrt_fast(float x) {
 #define VMR_PROFILE_ECO      5
 #define VMR_PROFILE_SCENIC   6
 #define VMR_PROFILE_SHORTEST 7
+#define VMR_PROFILE_AVOID_MW 8
 
 #define VMR_INVALID      UINT32_MAX
 #define EARTH_RADIUS_M   6371008.8
@@ -106,7 +107,8 @@ static const float vmr_profile_w[VMR_NUM_PROFILES][4] = {
     /* local    */  {0.70f, 0.20f, 0.80f, 1.40f},
     /* eco      */  {0.50f, 0.70f, 0.40f, 2.60f},
     /* scenic   */  {0.30f, 0.40f, 1.80f, 1.00f},
-    /* shortest */  {0.80f, 0.80f, 1.40f, 0.20f}
+    /* shortest */  {0.80f, 0.80f, 1.40f, 0.20f},
+    /* avoid_mw */  {1.00f, 0.30f, 0.00f, 1.20f}
 };
 
 /* Weighted feature dot product for a built-in profile. */
@@ -1039,6 +1041,8 @@ typedef struct {
     float     grid_max_x;
     float     grid_min_y;
     float     grid_max_y;
+    float     grid_inv_span_x; /* (SPATIAL_GRID_DIM-1)/span_x, precomputed for grid_cell_for_xy */
+    float     grid_inv_span_y;
     uint32_t *grid_offsets;    /* len = SPATIAL_GRID_DIM * SPATIAL_GRID_DIM + 1 */
     uint32_t *grid_nodes;      /* len = node_count */
 
@@ -1386,13 +1390,8 @@ static int cmp_raw_edge(const void *a, const void *b) {
 }
 
 static uint32_t grid_cell_for_xy(const VmrGraph *g, float x, float y) {
-    float span_x = g->grid_max_x - g->grid_min_x;
-    float span_y = g->grid_max_y - g->grid_min_y;
-    if (span_x < 1.0f) span_x = 1.0f;
-    if (span_y < 1.0f) span_y = 1.0f;
-
-    int gx = (int)(((x - g->grid_min_x) / span_x) * (float)(SPATIAL_GRID_DIM - 1));
-    int gy = (int)(((y - g->grid_min_y) / span_y) * (float)(SPATIAL_GRID_DIM - 1));
+    int gx = (int)((x - g->grid_min_x) * g->grid_inv_span_x);
+    int gy = (int)((y - g->grid_min_y) * g->grid_inv_span_y);
     if (gx < 0) gx = 0; else if (gx >= SPATIAL_GRID_DIM) gx = SPATIAL_GRID_DIM - 1;
     if (gy < 0) gy = 0; else if (gy >= SPATIAL_GRID_DIM) gy = SPATIAL_GRID_DIM - 1;
     return (uint32_t)(gy * SPATIAL_GRID_DIM + gx);
@@ -1419,30 +1418,40 @@ static int vmr_build_spatial_grid(VmrGraph *g) {
     g->grid_max_x = max_x;
     g->grid_min_y = min_y;
     g->grid_max_y = max_y;
+    {
+        float span_x = max_x - min_x;
+        float span_y = max_y - min_y;
+        if (span_x < 1.0f) span_x = 1.0f;
+        if (span_y < 1.0f) span_y = 1.0f;
+        g->grid_inv_span_x = (float)(SPATIAL_GRID_DIM - 1) / span_x;
+        g->grid_inv_span_y = (float)(SPATIAL_GRID_DIM - 1) / span_y;
+    }
 
     uint32_t cells = (uint32_t)(SPATIAL_GRID_DIM * SPATIAL_GRID_DIM);
     g->grid_offsets = (uint32_t *)xcalloc((size_t)cells + 1U, sizeof(uint32_t));
     g->grid_nodes   = (uint32_t *)xmalloc((size_t)n * sizeof(uint32_t));
     uint32_t *write_pos = (uint32_t *)xmalloc((size_t)cells * sizeof(uint32_t));
-    if (!g->grid_offsets || !g->grid_nodes || !write_pos) {
-        xfree(write_pos);
+    uint32_t *cell = (uint32_t *)xmalloc((size_t)n * sizeof(uint32_t));
+    if (!g->grid_offsets || !g->grid_nodes || !write_pos || !cell) {
+        xfree(write_pos); xfree(cell);
         return -1;
     }
 
+    /* Compute each node's cell once (avoids recomputing in the scatter pass). */
     for (uint32_t i = 0; i < n; i++) {
-        uint32_t c = grid_cell_for_xy(g, *(xp + i), *(yp + i));
-        (*(g->grid_offsets + c + 1U))++;
+        *(cell + i) = grid_cell_for_xy(g, *(xp + i), *(yp + i));
+        (*(g->grid_offsets + *(cell + i) + 1U))++;
     }
     for (uint32_t c = 1; c <= cells; c++) {
         *(g->grid_offsets + c) += *(g->grid_offsets + c - 1U);
     }
     memcpy(write_pos, g->grid_offsets, (size_t)cells * sizeof(uint32_t));
     for (uint32_t i = 0; i < n; i++) {
-        uint32_t c = grid_cell_for_xy(g, *(xp + i), *(yp + i));
-        uint32_t pos = (*(write_pos + c))++;
+        uint32_t pos = (*(write_pos + *(cell + i)))++;
         *(g->grid_nodes + pos) = i;
     }
     xfree(write_pos);
+    xfree(cell);
     return 0;
 }
 
@@ -2858,6 +2867,9 @@ static int vmr_preprocess_graph(VmrRawGraph *rg, VmrGraph *g) {
             if (!arr) {
                 continue;
             }
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
             for (uint32_t e = 0; e < sm; e++) {
                 *(arr + e) = vmr_edge_attr(p,
                                            *(g->edge_length_m + e),
@@ -3204,6 +3216,14 @@ static int vmr_load_binary(VmrGraph *g, const char *path) {
     g->grid_max_x = hdr.grid_max_x;
     g->grid_min_y = hdr.grid_min_y;
     g->grid_max_y = hdr.grid_max_y;
+    {
+        float span_x = g->grid_max_x - g->grid_min_x;
+        float span_y = g->grid_max_y - g->grid_min_y;
+        if (span_x < 1.0f) span_x = 1.0f;
+        if (span_y < 1.0f) span_y = 1.0f;
+        g->grid_inv_span_x = (float)(SPATIAL_GRID_DIM - 1) / span_x;
+        g->grid_inv_span_y = (float)(SPATIAL_GRID_DIM - 1) / span_y;
+    }
 
     {
         HANDLE fh = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL,
@@ -5413,6 +5433,12 @@ static VmrPreference vmr_preset_profile(const char *name) {
         /* Shortest: prefer straightness, de-emphasise smoothness. */
         p = (VmrPreference){ 0.80f, 0.80f, 0.80f, 1.60f, 0.20f, 0.0f, 0, VMR_PROFILE_SHORTEST, 5.5f };
         id = VMR_PROFILE_SHORTEST;
+    } else if (c_stricmp(name, "avoid-motorway") == 0 || c_stricmp(name, "avoid-motorways") == 0 ||
+               c_stricmp(name, "no-motorway") == 0) {
+        /* Avoid motorways: down-weight road class and speed, prefer smooth
+         * A-roads (useful for fuel, safety, or drivers who dislike motorways). */
+        p = (VmrPreference){ 1.00f, 0.30f, 0.00f, 1.20f, 1.20f, 0.0f, 0, VMR_PROFILE_AVOID_MW, 5.5f };
+        id = VMR_PROFILE_AVOID_MW;
     } else {
         p = (VmrPreference){ 1.40f, 1.20f, 1.00f, 0.60f, 0.50f, 0.0f, 0, 0, 5.0f };
         id = 0;
@@ -7229,7 +7255,7 @@ static void print_usage(const char *prog) {
         "  --route-id <osmA> <osmB>                Route between OSM intersection IDs\n"
         "  --mode <bidir|unidir>\n"
         "                                        VCA search variant (default: bidir)\n"
-        "  --profile <balanced|fastest|direct|highway|local|eco|scenic|shortest>\n"
+        "  --profile <balanced|fastest|direct|highway|local|eco|scenic|shortest|avoid-motorway>\n"
         "                                        Optimisation profile (default: balanced)\n"
         "  --vehicle <car|van|hgv-rigid|hgv-artic|ev>  Vehicle type (fuel curve + speed cap)\n"
         "  --fuel <l/100km>                        Vehicle fuel consumption (default: 5.0)\n"
