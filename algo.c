@@ -270,6 +270,7 @@ typedef struct {
     int   avoid_tolls;
     int   pref_id;    /* 0..VMR_NUM_PROFILES-1 built-in, -1 custom weights */
     float fuel_l_per_100km; /* vehicle consumption used for the fuel estimate */
+    int   pure_time;   /* 1 = minimise pure travel time (no vector/attr cost) */
 } VmrPreference;
 
 typedef struct __attribute__((aligned(32))) {
@@ -727,6 +728,11 @@ static int heap_pop(MinHeap *h, HeapEntry *out) {
         }
     }
     return 1;
+}
+
+/* Min-heap priority of the top entry (FLT_MAX when empty). */
+static inline float heap_top_prio(const MinHeap *h) {
+    return (h->size > 0) ? h->buf[0].prio : FLT_MAX;
 }
 
 /* Monotone bucket queue (Dial): A* keys are non-decreasing with the consistent
@@ -5413,6 +5419,11 @@ static VmrPreference vmr_preset_profile(const char *name) {
     }
     p.pref_id = id;
     p.fuel_l_per_100km = 5.0f;
+    /* The "fastest" profile is a pure time-optimal search (ALT-A* on travel
+     * time): no vector alignment or attribute scaling, so its routes match a
+     * time-optimal engine like RoutingKit's CH while expanding far fewer
+     * nodes than a vector-cost search. */
+    p.pure_time = (id == VMR_PROFILE_FASTEST) ? 1 : 0;
     return p;
 }
 
@@ -5564,6 +5575,10 @@ static inline float compute_8d_step_cost(const VmrGraph *g, uint32_t eid,
     if (p->avoid_tolls && (*(g->edge_flags + eid) & EDGE_TOLL)) {
         base_time *= 3.8f;
     }
+    if (p->pure_time) {
+        /* Pure time-optimal: no vector alignment or attribute scaling. */
+        return (base_time > 0.01f) ? base_time : 0.01f;
+    }
 
     /* Spatial vector alignment (1-hop + 2-hop sum + directional momentum) */
     float spatial_align = (0.50f * cos1) + (0.30f * cos2) + (0.20f * mom_dot);
@@ -5590,6 +5605,9 @@ static inline float compute_8d_cost_min(const VmrGraph *g, uint32_t eid,
     }
     if (p->avoid_tolls && (*(g->edge_flags + eid) & EDGE_TOLL)) {
         base_time *= 3.8f;
+    }
+    if (p->pure_time) {
+        return (base_time > 0.01f) ? base_time : 0.01f;
     }
     float spatial_align = 0.50f * cos1 + 0.30f + 0.20f * mom_dot;
     if (spatial_align > 1.0f) spatial_align = 1.0f;
@@ -6406,6 +6424,11 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
             v_atr = g->attr_min[vpid];
         }
     }
+    /* Pure time-optimal: the cost is raw travel time, so the Euclidean bound
+     * is 1/max_speed and the ALT scale is 1.0. */
+    if (query->pref.pure_time) {
+        v_atr = 1.0f;
+    }
     const float v_heur = v_atr / max_speed_mps;
 
     float alt_gf[32], alt_gb[32], alt_sf[32], alt_sb[32];
@@ -6419,7 +6442,10 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
     float amin = (pid >= 0 && pid < (int)VMR_NUM_PROFILES) ? g->attr_min[pid] : attr_scale_min;
     if (amin <= 0.0f) amin = attr_scale_min;
     float alt_scale = amin; /* admissible default (correct) */
-    if (!cch_weak) {
+    if (query->pref.pure_time) {
+        alt_scale = 1.0f; /* pure time: full-strength ALT (unidirectional) */
+    }
+    if (!cch_weak && !query->pref.pure_time) {
         const char *s = getenv("UVR_ALT_SCALE");
         if (s && *s) {
             float v = (float)atof(s);
@@ -6428,7 +6454,9 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
     }
     /* Eco uses the fuel-Euclidean heuristic (added below) which is admissible
      * and much tighter than the time-based ALT, so it keeps the exact min. */
-    cch_strong = (!cch_weak && alt_scale > amin + 1e-4f) ? 1 : 0;
+    /* pure_time uses alt_scale=1.0 which is always admissible for the raw
+     * time cost, so no strong-scale admissibility retry is needed. */
+    cch_strong = (!cch_weak && !query->pref.pure_time && alt_scale > amin + 1e-4f) ? 1 : 0;
     (void)0;
 #if defined(__AVX2__)
     __m256 gf0 = _mm256_setzero_ps(), gf1 = _mm256_setzero_ps();
@@ -6476,8 +6504,10 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
 #endif
     }
 
-    if (query->mode != MODE_VEC_BIDIR) {
-        /* Unidirectional Vector-Corridor or Dijkstra */
+    if (query->mode != MODE_VEC_BIDIR || query->pref.pure_time) {
+        /* Unidirectional Vector-Corridor A* (also used by the pure-time
+         * "fastest" profile: unidirectional A* is optimal with a strong ALT
+         * heuristic, avoiding the bidirectional meeting suboptimality). */
         HeapEntry top;
         while (heap_pop(pq_fwd, &top)) {
             uint32_t u = top.node;
@@ -7214,6 +7244,70 @@ static void print_usage(const char *prog) {
         UVR_VERSION, prog);
 }
 
+/* ---- Benchmark helpers: DIMACS export + same-pair VCA runs (vs RoutingKit) ---- */
+
+/* Write the contracted graph as DIMACS road format. weight_kind: 0=distance
+ * (metres), 1=time (seconds). Used to compare against RoutingKit's CH. */
+static int vmr_export_dimacs(const VmrGraph *g, const char *path, int weight_kind) {
+    FILE *fp = fopen(path, "w");
+    if (!fp) { LOG_ERR("Cannot write DIMACS '%s'", path); return -1; }
+    fprintf(fp, "p sp %u %u\n", g->node_count, g->edge_count);
+    for (uint32_t e = 0; e < g->edge_count; e++) {
+        uint32_t f = *(g->edge_from + e) + 1U;
+        uint32_t t = *(g->edge_to + e) + 1U;
+        double w = weight_kind == 0 ? *(g->edge_length_m + e) : *(g->edge_time_s + e);
+        uint64_t wi = (uint64_t)(w + 0.5);
+        if (wi == 0) wi = 1;
+        fprintf(fp, "a %u %u %llu\n", f, t, (unsigned long long)wi);
+    }
+    fclose(fp);
+    LOG_INFO("Exported DIMACS (%s weights) to '%s': %u nodes, %u arcs",
+             weight_kind == 0 ? "distance" : "time", path, g->node_count, g->edge_count);
+    return 0;
+}
+
+/* Generate `count` random node-index pairs within the main component. */
+static int vmr_gen_pairs(const VmrGraph *g, uint32_t count, uint32_t seed, const char *path) {
+    FILE *fp = fopen(path, "w");
+    if (!fp) return -1;
+    srand(seed);
+    uint32_t n = g->node_count, made = 0, guard = 0;
+    while (made < count && guard < count * 50U) {
+        guard++;
+        uint32_t a = (uint32_t)rand() % n;
+        uint32_t b = (uint32_t)rand() % n;
+        if (a == b) continue;
+        if (*(g->node_comp_id + a) != 0 || *(g->node_comp_id + b) != 0) continue;
+        if (*(g->node_flags + a) & NODE_DEAD_TREE) continue;
+        if (*(g->node_flags + b) & NODE_DEAD_TREE) continue;
+        fprintf(fp, "%u %u\n", a, b);
+        made++;
+    }
+    fclose(fp);
+    LOG_INFO("Wrote %u random pairs to '%s'", made, path);
+    return 0;
+}
+
+/* Route each pair (node indices) with VCA and print a CSV line per pair. */
+static int vmr_route_pairs(const VmrGraph *g, const char *path, const VmrPreference *pref) {
+    FILE *fp = fopen(path, "r");
+    if (!fp) { LOG_ERR("Cannot open pairs '%s'", path); return -1; }
+    printf("a,b,dist_m,time_s,expanded,ms\n");
+    unsigned a, b;
+    while (fscanf(fp, "%u %u", &a, &b) == 2) {
+        if (a >= g->node_count || b >= g->node_count) continue;
+        VmrQuery q = { MODE_VEC_BIDIR, *pref, 1 };
+        VmrResult r;
+        vmr_result_init(&r);
+        vmr_find_path(g, a, b, &q, &r);
+        printf("%u,%u,%.1f,%.1f,%u,%.3f\n", a, b, r.total_distance_m, r.est_time_s,
+               r.nodes_expanded, r.elapsed_ms);
+        vmr_result_free(&r);
+    }
+    fclose(fp);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc == 1) {
         print_usage(*argv);
@@ -7231,6 +7325,10 @@ int main(int argc, char **argv) {
     const char *traffic_file = NULL;
     const char *vehicle_name = NULL;
     const char *geojson_out= NULL;
+    const char *export_dimacs = NULL;
+    const char *gen_pairs = NULL;
+    const char *route_pairs = NULL;
+    uint32_t gen_pairs_count = 0, gen_pairs_seed = 0;
     int watch_seconds = 0;
 
     int do_demo = 0, do_preproc = 0, do_bench = 0, do_inter = 0, do_test = 0;
@@ -7278,6 +7376,14 @@ int main(int argc, char **argv) {
             load_bin = *(argv + (++i));
         } else if (strcmp(a, "--geojson") == 0 && i + 1 < argc) {
             geojson_out = *(argv + (++i));
+        } else if (strcmp(a, "--export-dimacs") == 0 && i + 1 < argc) {
+            export_dimacs = *(argv + (++i));
+        } else if (strcmp(a, "--gen-pairs") == 0 && i + 3 < argc) {
+            gen_pairs_count = (uint32_t)strtoul(*(argv + (++i)), NULL, 10);
+            gen_pairs_seed = (uint32_t)strtoul(*(argv + (++i)), NULL, 10);
+            gen_pairs = *(argv + (++i));
+        } else if (strcmp(a, "--route-pairs") == 0 && i + 1 < argc) {
+            route_pairs = *(argv + (++i));
         } else if (strcmp(a, "--profile") == 0 && i + 1 < argc) {
             pref = vmr_preset_profile(*(argv + (++i)));
         } else if (strcmp(a, "--vehicle") == 0 && i + 1 < argc) {
@@ -7394,6 +7500,20 @@ int main(int argc, char **argv) {
             return 1;
         }
         pref.fuel_l_per_100km = v->base_l_per_100km;
+    }
+
+    if (export_dimacs && graph.node_count > 0) {
+        char dist_path[512], time_path[512];
+        snprintf(dist_path, sizeof(dist_path), "%s.dist.dimacs", export_dimacs);
+        snprintf(time_path, sizeof(time_path), "%s.time.dimacs", export_dimacs);
+        vmr_export_dimacs(&graph, dist_path, 0);
+        vmr_export_dimacs(&graph, time_path, 1);
+    }
+    if (gen_pairs && graph.node_count > 0) {
+        vmr_gen_pairs(&graph, gen_pairs_count, gen_pairs_seed, gen_pairs);
+    }
+    if (route_pairs && graph.node_count > 0) {
+        vmr_route_pairs(&graph, route_pairs, &pref);
     }
 
     if (do_rcoord || do_rid) {

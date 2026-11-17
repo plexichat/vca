@@ -61,7 +61,9 @@ gcc -O2 -mavx2 -o uk_vector_router_sc.exe algo.c sqlite3.o libz.a -I . -lm
 **Optimisation profile** (`--profile`) — sets the feature-weight vector used in the
 edge cost:
 - `balanced` (default) — equal blend of speed, class, straightness, smoothness.
-- `fastest` — weights speed and road class most; closest to a pure time route.
+- `fastest` — **pure time-optimal** search (unidirectional ALT-A* on travel time).
+  Matches RoutingKit's CH time-optimal routes (99.7% within 1% on 1000 UK pairs)
+  while expanding ~44× fewer nodes than a vector-cost search.
 - `direct` — weights straightness/alignment most; fewest bends.
 - `highway` — weights road class most; prefers motorways/trunk roads.
 - `local` / `no-toll` — down-weights major roads and applies a toll penalty; avoids
@@ -136,14 +138,19 @@ file every 1–5 minutes.
 
 | Variant | Expanded | CPU |
 |---|---|---|
+| **fastest (pure time, unidir)** | **926** | **~1 ms** (10 ms on London→Edinburgh) |
 | **vca-bidir** | 50,909 | **26.8 ms** |
 | vca-unidir | 96,828 | 74.9 ms |
 
-vca-bidir lands within ~0.3% of the time-optimal distance while following a
-vector-optimal (straighter, class-aware) path. The eco profile is slower to compute
-(~0.32 s on London→Edinburgh) because its fuel-optimal path uses unavoidable slow
-city edges; the fuel-Euclidean heuristic keeps the search admissible and cuts its
-expansions ~3.4× versus a time-only heuristic.
+The `fastest` profile is a pure time-optimal search (unidirectional ALT-A* on travel
+time, no vector/attr cost). On 1000 UK pairs it matches RoutingKit's CH time-optimal
+route on **99.7% of pairs within 1%** (mean 0.3% faster), at ~926 expansions on long
+routes instead of the ~44k a vector-cost search would use. `vca-bidir` lands within
+~0.3% of the time-optimal distance while following a vector-optimal (straighter,
+class-aware) path. The eco profile is slower to compute (~0.32 s on London→Edinburgh)
+because its fuel-optimal path uses unavoidable slow city edges; the fuel-Euclidean
+heuristic keeps the search admissible and cuts its expansions ~3.4× versus a time-only
+heuristic.
 
 ### Peak memory (single core)
 
