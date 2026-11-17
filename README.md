@@ -132,13 +132,16 @@ file every 1–5 minutes.
 | Phase | Single core | OpenMP (6 threads) |
 |---|---|---|
 | SQLite DB load (17 M nodes / 33 M edges) | ~38–45 s (I/O) | ~38–45 s (I/O) |
-| Contraction + components + peel + reorder + two-hop + grid + attr | ~12 s | ~9 s |
-| ALT landmarks (31) | **19.8 s** | **2.6–3.9 s** |
-| **Total algorithm** | **~32 s** | **~12–13 s** |
+| Contract + components + peel + reorder + two-hop + grid + attr | ~12 s | ~5 s |
+| ALT landmarks (16) | **~8 s** | **~1.7 s** |
+| **Total algorithm** | **~20 s** | **~6.7 s** |
 
-The attr_scale table (9 profiles × 6 M edges) is built in parallel; the grid and
-two-hop passes are O(n)/O(e). The one-time cost is dominated by the SQLite DB read
-(17 M nodes / 33 M edges) and the degree-2 contraction pass.
+The heavy passes are parallelised: the edge group-by-source is an O(n+m) counting
+sort (not a qsort), the Hilbert reorder gathers node/edge arrays concurrently, and
+the landmark Dijkstras run across threads. The 32-entry landmark table is ~16 unique
+points (the rest are near-duplicates), so 16 landmarks give identical query results
+at half the preprocessing cost. The one-time cost is now dominated by the degree-2
+contraction pass (~3 s) and the SQLite DB read.
 
 ### Query latency (warm, single core, means over 24 UK routes)
 

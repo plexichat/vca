@@ -1379,16 +1379,6 @@ static void vmr_result_free(VmrResult *r) {
 /* SECTION 5: O(V + E) PREPROCESSING (CONTRACTION, PEELING, SoA, GRID)       */
 /* ========================================================================= */
 
-static int cmp_raw_edge(const void *a, const void *b) {
-    const RawEdge *ea = (const RawEdge *)a;
-    const RawEdge *eb = (const RawEdge *)b;
-    if (ea->from < eb->from) return -1;
-    if (ea->from > eb->from) return 1;
-    if (ea->to < eb->to) return -1;
-    if (ea->to > eb->to) return 1;
-    return 0;
-}
-
 static uint32_t grid_cell_for_xy(const VmrGraph *g, float x, float y) {
     int gx = (int)((x - g->grid_min_x) * g->grid_inv_span_x);
     int gy = (int)((y - g->grid_min_y) * g->grid_inv_span_y);
@@ -1635,6 +1625,9 @@ static void alt_dijkstra(const VmrGraph *g, uint32_t src, float *dist, int rever
     heap_free(&pq);
 }
 
+#ifndef VMR_LM_TARGET
+#define VMR_LM_TARGET 16
+#endif
 static void vmr_build_landmarks(VmrGraph *g) {
     static const double lat[32] = {
         58.6440, 50.0700, 51.1300, 53.4800,
@@ -1657,9 +1650,15 @@ static void vmr_build_landmarks(VmrGraph *g) {
         -0.1372, -2.0943, -4.2247, -3.9436
     };
     uint32_t nodes[32];
+    uint32_t nn[32];
+    /* Nearest-node lookups are independent O(n) scans; run them concurrently. */
+#pragma omp parallel for schedule(static)
+    for (int i = 0; i < VMR_LM_TARGET; i++) {
+        nn[i] = vmr_nearest_node_linear(g, lat[i], lon[i]);
+    }
     uint32_t L = 0;
-    for (uint32_t i = 0; i < 32; i++) {
-        uint32_t u = vmr_nearest_node_linear(g, lat[i], lon[i]);
+    for (uint32_t i = 0; i < (uint32_t)VMR_LM_TARGET; i++) {
+        uint32_t u = nn[i];
         if (u == VMR_INVALID) {
             continue;
         }
@@ -1690,10 +1689,12 @@ static void vmr_build_landmarks(VmrGraph *g) {
         return;
     }
     memcpy(g->landmark_node, nodes, (size_t)L * sizeof(uint32_t));
+#pragma omp parallel for schedule(static)
     for (size_t v = 0; v < n; v++) {
+        AltNode32 *a = g->alt_nodes + v;
         for (int k = 0; k < 32; k++) {
-            (*(g->alt_nodes + v)).fwd[k] = 1.0e30f;
-            (*(g->alt_nodes + v)).bwd[k] = -1.0e30f;
+            a->fwd[k] = 1.0e30f;
+            a->bwd[k] = -1.0e30f;
         }
     }
     g->landmark_count = L;
@@ -2015,6 +2016,7 @@ static void vmr_reorder_graph(VmrGraph *g) {
         xfree(hn); xfree(perm); xfree(iperm); xfree(nfill); xfree(rfill);
         return;
     }
+#pragma omp parallel for schedule(static)
     for (uint32_t i = 0; i < n; i++) {
         hn[i].id = i;
         uint32_t hx = (uint32_t)((*(g->node_x + i) - minx) * scx);
@@ -2068,6 +2070,7 @@ static void vmr_reorder_graph(VmrGraph *g) {
         xfree(perm); xfree(iperm); xfree(nfill); xfree(rfill);
         return;
     }
+#pragma omp parallel for schedule(static)
     for (uint32_t old = 0; old < n; old++) {
         uint32_t i = perm[old];
         *(n_oid + i) = *(g->node_osm_id + old);
@@ -2134,13 +2137,13 @@ static void vmr_reorder_graph(VmrGraph *g) {
         xfree(perm); xfree(iperm); xfree(nfill); xfree(rfill);
         return;
     }
+#pragma omp parallel for schedule(static)
     for (uint32_t old = 0; old < n; old++) {
         uint32_t u2 = perm[old];
         uint32_t beg = *(g->fwd_offsets + old);
         uint32_t end = *(g->fwd_offsets + old + 1U);
+        uint32_t pos = *(noff + u2);
         for (uint32_t e = beg; e < end; e++) {
-            uint32_t pos = *(nfill + u2);
-            *(nfill + u2) = pos + 1U;
             *(n_from + pos) = u2;
             *(n_to + pos) = perm[*(g->edge_to + e)];
             *(n_dx + pos) = *(g->edge_dx + e);
@@ -2158,6 +2161,7 @@ static void vmr_reorder_graph(VmrGraph *g) {
                 *(n_attr[p] + pos) = g->edge_attr_scale[p]
                                          ? *(g->edge_attr_scale[p] + e) : 1.0f;
             }
+            pos++;
         }
     }
 
@@ -2442,6 +2446,13 @@ static int vmr_preprocess_graph(VmrRawGraph *rg, VmrGraph *g) {
     }
 
     clock_t t0 = clock();
+    clock_t _tk = t0;
+    const int _vmr_tic = (getenv("VMR_TIMING") != NULL);
+#define VMR_TICK(msg) do { clock_t _n = clock(); \
+    if (_vmr_tic) { \
+        fprintf(stderr, "[T] %-22s %7.0f ms\n", msg, 1000.0 * (double)(_n - _tk) / (double)CLOCKS_PER_SEC); \
+    } \
+    _tk = _n; } while (0)
     g->raw_node_count = rn;
     g->raw_edge_count = rm;
 
@@ -2680,9 +2691,33 @@ static int vmr_preprocess_graph(VmrRawGraph *rg, VmrGraph *g) {
         sm++;
     }
 
+    VMR_TICK("contract+remap");
     if (sm > 1) {
-        qsort(we, sm, sizeof(RawEdge), cmp_raw_edge);
+        /* Stable counting sort by source: O(n+m), replaces the O(m log m) qsort
+         * that grouped edges for the CSR. Intra-group order is insertion order
+         * (optimality of the A* is independent of adjacency order). */
+        uint32_t *cnt = (uint32_t *)xcalloc((size_t)sn + 1U, sizeof(uint32_t));
+        RawEdge *tmp = (RawEdge *)xmalloc((size_t)sm * sizeof(RawEdge));
+        if (cnt && tmp) {
+            for (uint32_t e = 0; e < sm; e++) {
+                cnt[we[e].from]++;
+            }
+            uint32_t sum = 0;
+            for (uint32_t i = 0; i < sn; i++) {
+                uint32_t c = cnt[i];
+                cnt[i] = sum;
+                sum += c;
+            }
+            for (uint32_t e = 0; e < sm; e++) {
+                RawEdge w = we[e];
+                tmp[cnt[w.from]++] = w;
+            }
+            memcpy(we, tmp, (size_t)sm * sizeof(RawEdge));
+        }
+        xfree(cnt);
+        xfree(tmp);
     }
+    VMR_TICK("count sort edges");
 
     g->node_count = sn;
     g->edge_count = sm;
@@ -2737,6 +2772,7 @@ static int vmr_preprocess_graph(VmrRawGraph *rg, VmrGraph *g) {
             idmap_put(&g->osm_map, oid, ni);
         }
     }
+    VMR_TICK("node copy");
     if (rg->turn_count > 0 && sn > 0) {
         uint32_t *cnt = (uint32_t *)xcalloc(sn, sizeof(uint32_t));
         uint32_t valid = 0;
@@ -2854,6 +2890,7 @@ static int vmr_preprocess_graph(VmrRawGraph *rg, VmrGraph *g) {
 
         (*(g->fwd_offsets + u + 1U))++;
     }
+    VMR_TICK("edge soa");
 
     /* Precompute attr_scale for the built-in profiles: removes the 4D dot
      * product and division from the query hot loop. The weight table is the
@@ -2884,6 +2921,7 @@ static int vmr_preprocess_graph(VmrRawGraph *rg, VmrGraph *g) {
     }
 
     /* Raw edge pool is now mirrored in the SoA arrays. */
+    VMR_TICK("attr");
     xfree(rg->edges);
     rg->edges = NULL;
     rg->edge_count = 0;
@@ -2966,6 +3004,7 @@ static int vmr_preprocess_graph(VmrRawGraph *rg, VmrGraph *g) {
     xfree(undir_deg);
     xfree(nbr_stamp);
     xfree(peel_q);
+    VMR_TICK("peel+revcsr");
 
     for (uint32_t e = 0; e < g->edge_count; e++) {
         if (*(g->node_flags + *(g->edge_from + e)) & NODE_DEAD_TREE) {
@@ -2977,19 +3016,25 @@ static int vmr_preprocess_graph(VmrRawGraph *rg, VmrGraph *g) {
     }
 
     vmr_reorder_graph(g);
+    VMR_TICK("reorder");
 
     vmr_build_two_hop(g);
+    VMR_TICK("twohop");
     vmr_build_two_hop_rev(g);
+    VMR_TICK("twohop_rev");
     if (vmr_rev_enabled()) {
         vmr_build_edge_blocks(g);
     }
+    VMR_TICK("edge_blocks");
 
     if (vmr_build_spatial_grid(g) != 0) {
         return -1;
     }
+    VMR_TICK("grid");
 
-    g->landmark_count = 32;
+    g->landmark_count = VMR_LM_TARGET;
     vmr_build_landmarks(g);
+    VMR_TICK("landmarks");
 
     /* Vector CH is not used for the exact-vector VCA (UK measured slower). */
 
