@@ -42,7 +42,7 @@ gcc -O2 -mavx2 -o uk_vector_router_sc.exe algo.c sqlite3.o libz.a -I . -lm
 # logistics vehicle (speed cap + fuel curve change the route and the fuel figure)
 ./uk_vector_router.exe --load-bin uk.vgraph \
     --route-coord 51.5074 -0.1278 55.9533 -3.1883 \
-    --profile fastest --vehicle hgv-artic
+    --profile balanced --vehicle hgv-artic
 
 # live-traffic watch: reload a traffic file and re-route every N seconds
 ./uk_vector_router.exe --load-bin uk.vgraph \
@@ -61,9 +61,6 @@ gcc -O2 -mavx2 -o uk_vector_router_sc.exe algo.c sqlite3.o libz.a -I . -lm
 **Optimisation profile** (`--profile`) — sets the feature-weight vector used in the
 edge cost:
 - `balanced` (default) — equal blend of speed, class, straightness, smoothness.
-- `fastest` — **pure time-optimal** search (unidirectional ALT-A* on travel time).
-  Matches RoutingKit's CH time-optimal routes (99.7% within 1% on 1000 UK pairs)
-  while expanding ~44× fewer nodes than a vector-cost search.
 - `direct` — weights straightness/alignment most; fewest bends.
 - `highway` — weights road class most; prefers motorways/trunk roads.
 - `local` / `no-toll` — down-weights major roads and applies a toll penalty; avoids
@@ -133,40 +130,40 @@ file every 1–5 minutes.
 |---|---|---|
 | SQLite DB load (17 M nodes / 33 M edges) | ~38–45 s (I/O) | ~38–45 s (I/O) |
 | Contract + components + peel + reorder + two-hop + grid + attr | ~12 s | ~5 s |
-| ALT landmarks (16) | **~8 s** | **~1.7 s** |
-| **Total algorithm** | **~20 s** | **~6.7 s** |
+| ALT landmarks (16, 16-bit) | **~8 s** | **~1.5 s** |
+| **Total algorithm** | **~20 s** | **~6.6 s** |
 
 The heavy passes are parallelised: the edge group-by-source is an O(n+m) counting
 sort (not a qsort), the Hilbert reorder gathers node/edge arrays concurrently, and
-the landmark Dijkstras run across threads. The 32-entry landmark table is ~16 unique
-points (the rest are near-duplicates), so 16 landmarks give identical query results
-at half the preprocessing cost. The one-time cost is now dominated by the degree-2
-contraction pass (~3 s) and the SQLite DB read.
+the landmark Dijkstras run across threads. The landmark table has 16 well-spread
+slots (14 unique after dedup), stored as 16-bit quantized travel times at 2 s
+resolution so the ALT table stays at 64 B/node while giving admissible time lower
+bounds for the vector cost. The one-time cost is dominated by the SQLite DB read.
 
 ### Query latency (warm, single core, means over 24 UK routes)
 
 | Variant | Expanded | CPU |
 |---|---|---|
-| **fastest (pure time, unidir)** | **926** | **~1 ms** (10 ms on London→Edinburgh) |
-| **vca-bidir** | 50,909 | **26.8 ms** |
-| vca-unidir | 96,828 | 74.9 ms |
+| **vca-bidir** | 40,636 | **~14–16 ms** |
+| vca-unidir | 84,647 | ~31 ms |
 
-The `fastest` profile is a pure time-optimal search (unidirectional ALT-A* on travel
-time, no vector/attr cost). On 1000 UK pairs it matches RoutingKit's CH time-optimal
-route on **99.7% of pairs within 1%** (mean 0.3% faster), at ~926 expansions on long
-routes instead of the ~44k a vector-cost search would use. `vca-bidir` lands within
-~0.3% of the time-optimal distance while following a vector-optimal (straighter,
-class-aware) path. The eco profile is slower to compute (~0.32 s on London→Edinburgh)
-because its fuel-optimal path uses unavoidable slow city edges; the fuel-Euclidean
-heuristic keeps the search admissible and cuts its expansions ~3.4× versus a time-only
-heuristic.
+`vca-bidir` grows forward and backward searches from origin and destination and
+alternates sides; the ALT landmark table gives an admissible time lower bound for
+the vector cost. The balanced profile follows a vector-optimal (straighter,
+class-aware) path rather than a pure time-optimal one. The eco profile is slower
+to compute because its fuel-optimal path uses unavoidable slow city edges; the
+fuel-Euclidean heuristic keeps the search admissible and cuts its expansions ~3.4×
+versus a time-only heuristic.
 
-### Peak memory (single core)
+### Peak memory (single core, after load)
 
 | Metric | Value |
 |---|---|
-| Peak **private** (heap) | **382 MB** |
-| Peak working set (incl. mmap pages) | 583 MB |
+| Peak working set | **~950 MB** |
+
+The precompute passes trade memory for query speed: per-profile `time×attr`
+base costs (8 × 6.0 M edges) and per-edge target/source coordinates (~96 MB)
+remove random `edge_attr_scale`/`node_x` lookups from the query hot loop.
 
 ## Comparison to OSRM (industry standard)
 

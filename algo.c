@@ -62,20 +62,21 @@ static inline float vmr_sqrt_fast(float x) {
 
 #define UVR_VERSION      "2.1.0"
 #define VGRAPH_MAGIC     0x564D5235U /* "VMR5" */
-#define VGRAPH_FORMAT_V  9U
+#define VGRAPH_FORMAT_V  12U
+#define VMR_LM_MAX       16
+#define VMR_LM_SCALE     2.0f
 
 /* Number of built-in optimisation profiles. Precomputed edge_attr_scale
  * arrays and per-profile admissible ALT scales are sized to this. */
-#define VMR_NUM_PROFILES 9U
+#define VMR_NUM_PROFILES 8U
 #define VMR_PROFILE_BALANCED 0
-#define VMR_PROFILE_FASTEST  1
-#define VMR_PROFILE_DIRECT   2
-#define VMR_PROFILE_HIGHWAY  3
-#define VMR_PROFILE_LOCAL    4
-#define VMR_PROFILE_ECO      5
-#define VMR_PROFILE_SCENIC   6
-#define VMR_PROFILE_SHORTEST 7
-#define VMR_PROFILE_AVOID_MW 8
+#define VMR_PROFILE_DIRECT   1
+#define VMR_PROFILE_HIGHWAY  2
+#define VMR_PROFILE_LOCAL    3
+#define VMR_PROFILE_ECO      4
+#define VMR_PROFILE_SCENIC   5
+#define VMR_PROFILE_SHORTEST 6
+#define VMR_PROFILE_AVOID_MW 7
 
 #define VMR_INVALID      UINT32_MAX
 #define EARTH_RADIUS_M   6371008.8
@@ -101,7 +102,6 @@ static inline float vmr_sqrt_fast(float x) {
  */
 static const float vmr_profile_w[VMR_NUM_PROFILES][4] = {
     /* balanced */  {1.20f, 1.00f, 0.60f, 0.50f},
-    /* fastest  */  {2.20f, 1.50f, 0.30f, 0.40f},
     /* direct   */  {0.50f, 0.30f, 1.20f, 0.30f},
     /* highway  */  {1.80f, 2.20f, 0.50f, 0.60f},
     /* local    */  {0.70f, 0.20f, 0.80f, 1.40f},
@@ -272,7 +272,6 @@ typedef struct {
     int   avoid_tolls;
     int   pref_id;    /* 0..VMR_NUM_PROFILES-1 built-in, -1 custom weights */
     float fuel_l_per_100km; /* vehicle consumption used for the fuel estimate */
-    int   pure_time;   /* 1 = minimise pure travel time (no vector/attr cost) */
 } VmrPreference;
 
 typedef struct __attribute__((aligned(32))) {
@@ -986,8 +985,8 @@ typedef struct {
 } VmrRawGraph;
 
 typedef struct __attribute__((aligned(64))) {
-    float fwd[32];
-    float bwd[32];
+    uint16_t fwd[VMR_LM_MAX];
+    uint16_t bwd[VMR_LM_MAX];
 } AltNode32;
 
 /*
@@ -1023,6 +1022,10 @@ typedef struct {
     float    *edge_dy;
     float    *edge_ux;         /* Precomputed unit dx */
     float    *edge_uy;         /* Precomputed unit dy */
+    float    *edge_vx;         /* Target node x (avoids node_x[edge_to] lookup) */
+    float    *edge_vy;         /* Target node y */
+    float    *edge_sx;         /* Source node x (backward target) */
+    float    *edge_sy;         /* Source node y */
     float    *edge_f_speed;    /* [0..1] normalized speed capability */
     float    *edge_f_class;    /* [0..1] highway hierarchy           */
     float    *edge_f_straight; /* (0..1] macro-vector straightness   */
@@ -1076,6 +1079,7 @@ typedef struct {
     uint32_t *ch_child2;
 
     float *edge_attr_scale[VMR_NUM_PROFILES];
+    float *edge_base_cost[VMR_NUM_PROFILES]; /* time_s * attr_scale, per profile */
     float  attr_min[VMR_NUM_PROFILES]; /* per-profile min(edge_attr_scale) (admissible ALT scale) */
     float  eco_min_fuel;               /* min L/km over edges (active vehicle) for eco heuristic */
 
@@ -1270,6 +1274,48 @@ static void vmr_ensure_all_attr_scales(VmrGraph *g) {
     }
 }
 
+/* Precompute time_s * attr_scale per profile so the query hot loop needs one
+ * load instead of two plus a multiply. */
+static void vmr_ensure_base_costs(VmrGraph *g) {
+    if (g->edge_count == 0 || !g->edge_time_s) return;
+    for (uint32_t p = 0; p < VMR_NUM_PROFILES; p++) {
+        const float *as = g->edge_attr_scale[p];
+        if (!as) continue;
+        if (!g->edge_base_cost[p]) {
+            g->edge_base_cost[p] = (float *)xmalloc((size_t)g->edge_count * sizeof(float));
+            if (!g->edge_base_cost[p]) continue;
+        }
+        float *bc = g->edge_base_cost[p];
+        const float *et = g->edge_time_s;
+        for (uint32_t e = 0; e < g->edge_count; e++) {
+            *(bc + e) = *(et + e) * *(as + e);
+        }
+    }
+}
+
+/* Per-edge target coordinates so the query hot loop avoids node_x[edge_to]
+ * random lookups in the cross-track and Euclidean terms. */
+static void vmr_build_edge_coords(VmrGraph *g) {
+    if (!g->edge_to || !g->node_x || !g->node_y || g->edge_count == 0) return;
+    size_t m = g->edge_count;
+    if (!g->edge_vx || !g->edge_vy || !g->edge_sx || !g->edge_sy) {
+        g->edge_vx = (float *)xmalloc(m * sizeof(float));
+        g->edge_vy = (float *)xmalloc(m * sizeof(float));
+        g->edge_sx = (float *)xmalloc(m * sizeof(float));
+        g->edge_sy = (float *)xmalloc(m * sizeof(float));
+    }
+    if (!g->edge_vx || !g->edge_vy || !g->edge_sx || !g->edge_sy) return;
+#pragma omp parallel for schedule(static)
+    for (uint32_t e = 0; e < (uint32_t)m; e++) {
+        uint32_t v = *(g->edge_to + e);
+        uint32_t u = *(g->edge_from + e);
+        *(g->edge_vx + e) = *(g->node_x + v);
+        *(g->edge_vy + e) = *(g->node_y + v);
+        *(g->edge_sx + e) = *(g->node_x + u);
+        *(g->edge_sy + e) = *(g->node_y + u);
+    }
+}
+
 /* Compute per-profile min(edge_attr_scale) (admissible ALT scale). */
 static void vmr_compute_attr_min(VmrGraph *g) {
     for (uint32_t p = 0; p < VMR_NUM_PROFILES; p++) {
@@ -1313,6 +1359,10 @@ static void vmr_graph_free(VmrGraph *g) {
     if (!g->map) xfree(g->edge_dy);
     if (!g->map) xfree(g->edge_ux);
     if (!g->map) xfree(g->edge_uy);
+    xfree(g->edge_vx);
+    xfree(g->edge_vy);
+    xfree(g->edge_sx);
+    xfree(g->edge_sy);
     if (!g->map) xfree(g->edge_f_speed);
     if (!g->map) xfree(g->edge_f_class);
     if (!g->map) xfree(g->edge_f_straight);
@@ -1346,6 +1396,7 @@ static void vmr_graph_free(VmrGraph *g) {
     }
     for (int i = 0; i < (int)VMR_NUM_PROFILES; i++) {
         xfree(g->edge_attr_scale[i]);
+        xfree(g->edge_base_cost[i]);
     }
     xfree(g->traffic_mult);
     xfree_aligned(g->rev_blocks);
@@ -1628,10 +1679,13 @@ static void alt_dijkstra(const VmrGraph *g, uint32_t src, float *dist, int rever
 #ifndef VMR_LM_TARGET
 #define VMR_LM_TARGET 16
 #endif
+#ifndef VMR_QUERY_LM
+#define VMR_QUERY_LM 16
+#endif
 static void vmr_build_landmarks(VmrGraph *g) {
     static const double lat[32] = {
-        58.6440, 50.0700, 51.1300, 53.4800,
-        55.9530, 51.5070, 52.4800, 57.4780,
+        58.6440, 50.0700, 51.1300, 54.9700,
+        55.9530, 51.5070, 52.4800, 53.4000,
         50.7200, 53.4000, 53.8000, 54.9700,
         55.8600, 57.1500, 51.4500, 52.6300,
         51.4816, 54.6032, 55.8617, 53.4808,
@@ -1640,8 +1694,8 @@ static void vmr_build_landmarks(VmrGraph *g) {
         50.8225, 57.1497, 57.4778, 51.6214
     };
     static const double lon[32] = {
-        -3.0700, -5.7200, 1.3100, -2.2400,
-        -3.1880, -0.1280, -1.9000, -4.2250,
+        -3.0700, -5.7200, 1.3100, -1.6100,
+        -3.1880, -0.1280, -1.9000, -2.9800,
         -3.5300, -2.9800, -1.5500, -1.6100,
         -4.2500, -2.0900, -2.5900, 1.3000,
         -3.1791, -5.9301, -4.2518, -2.2426,
@@ -1692,9 +1746,9 @@ static void vmr_build_landmarks(VmrGraph *g) {
 #pragma omp parallel for schedule(static)
     for (size_t v = 0; v < n; v++) {
         AltNode32 *a = g->alt_nodes + v;
-        for (int k = 0; k < 32; k++) {
-            a->fwd[k] = 1.0e30f;
-            a->bwd[k] = -1.0e30f;
+        for (int k = 0; k < VMR_LM_MAX; k++) {
+            a->fwd[k] = 65535u;
+            a->bwd[k] = 65535u;
         }
     }
     g->landmark_count = L;
@@ -1711,12 +1765,16 @@ static void vmr_build_landmarks(VmrGraph *g) {
         alt_dijkstra(g, u, tmp, 0);
         for (size_t v = 0; v < n; v++) {
             float d = *(tmp + v);
-            (*(g->alt_nodes + v)).fwd[li] = (d >= 1.0e29f) ? 1.0e30f : d;
+            uint16_t q = (d >= 1.0e29f) ? 65535u
+                                        : (uint16_t)ceilf(d * (1.0f / VMR_LM_SCALE));
+            (*(g->alt_nodes + v)).fwd[li] = (q > 65535u) ? 65535u : q;
         }
         alt_dijkstra(g, u, tmp, 1);
         for (size_t v = 0; v < n; v++) {
             float d = *(tmp + v);
-            (*(g->alt_nodes + v)).bwd[li] = (d >= 1.0e29f) ? -1.0e30f : d;
+            uint16_t q = (d >= 1.0e29f) ? 65535u
+                                        : (uint16_t)ceilf(d * (1.0f / VMR_LM_SCALE));
+            (*(g->alt_nodes + v)).bwd[li] = (q > 65535u) ? 65535u : q;
         }
         xfree(tmp);
     }
@@ -2240,6 +2298,10 @@ static void vmr_reorder_graph(VmrGraph *g) {
     if (!g->map) xfree(g->edge_dy);
     if (!g->map) xfree(g->edge_ux);
     if (!g->map) xfree(g->edge_uy);
+    xfree(g->edge_vx);
+    xfree(g->edge_vy);
+    xfree(g->edge_sx);
+    xfree(g->edge_sy);
     if (!g->map) xfree(g->edge_f_speed);
     if (!g->map) xfree(g->edge_f_class);
     if (!g->map) xfree(g->edge_f_straight);
@@ -2247,8 +2309,9 @@ static void vmr_reorder_graph(VmrGraph *g) {
     if (!g->map) xfree(g->edge_length_m);
     if (!g->map) xfree(g->edge_time_s);
     if (!g->map) xfree(g->edge_flags);
-    for (uint32_t p = 0; p < 5; p++) {
+    for (uint32_t p = 0; p < VMR_NUM_PROFILES; p++) {
         if (!g->map) xfree(g->edge_attr_scale[p]);
+        xfree(g->edge_base_cost[p]);
     }
     if (!g->map) xfree(g->rev_offsets);
     if (!g->map) xfree(g->rev_src_node);
@@ -2382,8 +2445,7 @@ static const VehicleType *vmr_find_vehicle(const char *name) {
  *  - recomputes the eco attr array with the vehicle's speed cap (so the eco
  *    profile minimises fuel at the vehicle's actual cruising speed),
  *  - applies the vehicle's speed cap to edge travel times via traffic_mult
- *    (so the fastest profile also respects the cap, e.g. an HGV is slower on
- *    motorways).
+ *    (so every profile respects the cap, e.g. an HGV is slower on motorways).
  * Recomputing the eco array is O(edge_count) and done once per vehicle.
  */
 static int vmr_apply_vehicle(VmrGraph *g, const VehicleType *v) {
@@ -2403,6 +2465,16 @@ static int vmr_apply_vehicle(VmrGraph *g, const VehicleType *v) {
         *(eco + e) = vmr_eco_attr(*(g->edge_length_m + e),
                                   *(g->edge_time_s + e),
                                   *(g->edge_f_smooth + e));
+    }
+    /* Keep the precomputed eco base cost in sync with the vehicle-adjusted attr. */
+    float *bc = g->edge_base_cost[VMR_PROFILE_ECO];
+    if (!bc) {
+        bc = (float *)xmalloc((size_t)g->edge_count * sizeof(float));
+        if (!bc) return -1;
+        g->edge_base_cost[VMR_PROFILE_ECO] = bc;
+    }
+    for (uint32_t e = 0; e < g->edge_count; e++) {
+        *(bc + e) = *(g->edge_time_s + e) * *(eco + e);
     }
 
     /* Apply speed cap to edge times (multiplies any existing traffic). */
@@ -3029,6 +3101,7 @@ static int vmr_preprocess_graph(VmrRawGraph *rg, VmrGraph *g) {
 
     vmr_reorder_graph(g);
     VMR_TICK("reorder");
+    vmr_build_edge_coords(g);
 
     vmr_build_two_hop(g);
     VMR_TICK("twohop");
@@ -3053,6 +3126,7 @@ static int vmr_preprocess_graph(VmrRawGraph *rg, VmrGraph *g) {
     clock_t t1 = clock();
     double ms = 1000.0 * (double)(t1 - t0) / (double)CLOCKS_PER_SEC;
     vmr_ensure_all_attr_scales(g);
+    vmr_ensure_base_costs(g);
     vmr_compute_attr_min(g);
     LOG_INFO("Preprocessed UK SoA Graph in %.1f ms: %u -> %u nodes (-%.1f%% contracted), "
              "%u -> %u edges, %u cul-de-sac nodes peeled",
@@ -3250,9 +3324,10 @@ static int vmr_load_binary(VmrGraph *g, const char *path) {
     VgraphHeader hdr;
     if (fread(&hdr, sizeof(hdr), 1, fp) != 1 ||
         hdr.magic != VGRAPH_MAGIC ||
-        (hdr.version != 8U && hdr.version != VGRAPH_FORMAT_V) ||
+        hdr.version != VGRAPH_FORMAT_V ||
         hdr.grid_dim != SPATIAL_GRID_DIM) {
-        LOG_ERR("Invalid or incompatible .vgraph header in '%s'", path);
+        LOG_ERR("Invalid or incompatible .vgraph header in '%s' (version %u, expected %u; re-run --preprocess)",
+                path, hdr.version, VGRAPH_FORMAT_V);
         fclose(fp);
         return -1;
     }
@@ -3453,6 +3528,7 @@ static int vmr_load_binary(VmrGraph *g, const char *path) {
         idmap_put(&g->osm_map, *(oids + i), i);
     }
 
+    vmr_build_edge_coords(g);
     if (!g->th_off)  vmr_build_two_hop(g);
     if (!g->rth_off) vmr_build_two_hop_rev(g);
     if (vmr_rev_enabled()) {
@@ -3461,6 +3537,7 @@ static int vmr_load_binary(VmrGraph *g, const char *path) {
 
     clock_t t1 = clock();
     vmr_ensure_all_attr_scales(g);
+    vmr_ensure_base_costs(g);
     vmr_compute_attr_min(g);
     LOG_INFO("Loaded binary SoA graph '%s' in %.1f ms (%zu nodes, %zu edges)",
              path, 1000.0 * (double)(t1 - t0) / (double)CLOCKS_PER_SEC, n, m);
@@ -5463,18 +5540,15 @@ static VmrPreference vmr_preset_profile(const char *name) {
     if (name == NULL || c_stricmp(name, "balanced") == 0) {
         p = (VmrPreference){ 1.40f, 1.20f, 1.00f, 0.60f, 0.50f, 0.0f, 0, 0, 5.0f };
         id = 0;
-    } else if (c_stricmp(name, "fastest") == 0) {
-        p = (VmrPreference){ 0.80f, 2.20f, 1.50f, 0.30f, 0.40f, 0.0f, 0, 1, 5.0f };
-        id = 1;
     } else if (c_stricmp(name, "direct") == 0) {
-        p = (VmrPreference){ 2.60f, 0.50f, 0.30f, 1.20f, 0.30f, 0.0f, 0, 2, 5.0f };
-        id = 2;
+        p = (VmrPreference){ 2.60f, 0.50f, 0.30f, 1.20f, 0.30f, 0.0f, 0, 1, 5.0f };
+        id = 1;
     } else if (c_stricmp(name, "highway") == 0) {
-        p = (VmrPreference){ 1.10f, 1.80f, 2.20f, 0.50f, 0.60f, 0.0f, 0, 3, 5.0f };
-        id = 3;
+        p = (VmrPreference){ 1.10f, 1.80f, 2.20f, 0.50f, 0.60f, 0.0f, 0, 2, 5.0f };
+        id = 2;
     } else if (c_stricmp(name, "local") == 0 || c_stricmp(name, "no-toll") == 0) {
-        p = (VmrPreference){ 1.30f, 0.70f, 0.20f, 0.80f, 1.40f, 0.0f, 1, 4, 5.0f };
-        id = 4;
+        p = (VmrPreference){ 1.30f, 0.70f, 0.20f, 0.80f, 1.40f, 0.0f, 1, 3, 5.0f };
+        id = 3;
     } else if (c_stricmp(name, "eco") == 0 || c_stricmp(name, "fuel") == 0 ||
                c_stricmp(name, "economy") == 0) {
         /* Fuel-economy: cost is exactly the fuel model (edge_attr_scale[eco]),
@@ -5497,16 +5571,12 @@ static VmrPreference vmr_preset_profile(const char *name) {
         p = (VmrPreference){ 1.00f, 0.30f, 0.00f, 1.20f, 1.20f, 0.0f, 0, VMR_PROFILE_AVOID_MW, 5.5f };
         id = VMR_PROFILE_AVOID_MW;
     } else {
+        LOG_WARN("Unknown optimisation profile '%s'; using balanced", name);
         p = (VmrPreference){ 1.40f, 1.20f, 1.00f, 0.60f, 0.50f, 0.0f, 0, 0, 5.0f };
         id = 0;
     }
     p.pref_id = id;
     p.fuel_l_per_100km = 5.0f;
-    /* The "fastest" profile is a pure time-optimal search (ALT-A* on travel
-     * time): no vector alignment or attribute scaling, so its routes match a
-     * time-optimal engine like RoutingKit's CH while expanding far fewer
-     * nodes than a vector-cost search. */
-    p.pure_time = (id == VMR_PROFILE_FASTEST) ? 1 : 0;
     return p;
 }
 
@@ -5648,19 +5718,15 @@ static inline float compute_attr_scale(const VmrGraph *g, uint32_t eid,
 
 static inline float compute_8d_step_cost(const VmrGraph *g, uint32_t eid,
                                          const VmrPreference *p,
-                                         float attr_scale,
+                                         float base_cost,
                                          float cos1, float cos2, float mom_dot,
                                          float cross_ratio) {
-    float base_time = *(g->edge_time_s + eid);
+    float base = base_cost;
     if (g->traffic_mult) {
-        base_time *= *(g->traffic_mult + eid);
+        base *= *(g->traffic_mult + eid);
     }
     if (p->avoid_tolls && (*(g->edge_flags + eid) & EDGE_TOLL)) {
-        base_time *= 3.8f;
-    }
-    if (p->pure_time) {
-        /* Pure time-optimal: no vector alignment or attribute scaling. */
-        return (base_time > 0.01f) ? base_time : 0.01f;
+        base *= 3.8f;
     }
 
     /* Spatial vector alignment (1-hop + 2-hop sum + directional momentum) */
@@ -5674,86 +5740,64 @@ static inline float compute_8d_step_cost(const VmrGraph *g, uint32_t eid,
     if (cross_ratio > 1.5f) cross_ratio = 1.5f;
     float corridor_pen = 1.0f + (0.14f * p->w_align * cross_ratio);
 
-    float cost = base_time * attr_scale * align_pen * corridor_pen;
+    float cost = base * align_pen * corridor_pen;
     return (cost > 0.01f) ? cost : 0.01f;
 }
 
 /* Cheaper admissible lower bound: full cost with cos2=1 and corridor term = 1. */
 static inline float compute_8d_cost_min(const VmrGraph *g, uint32_t eid,
                                         const VmrPreference *p,
-                                        float attr_scale, float cos1, float mom_dot) {
-    float base_time = *(g->edge_time_s + eid);
+                                        float base_cost, float cos1, float mom_dot) {
+    float base = base_cost;
     if (g->traffic_mult) {
-        base_time *= *(g->traffic_mult + eid);
+        base *= *(g->traffic_mult + eid);
     }
     if (p->avoid_tolls && (*(g->edge_flags + eid) & EDGE_TOLL)) {
-        base_time *= 3.8f;
-    }
-    if (p->pure_time) {
-        return (base_time > 0.01f) ? base_time : 0.01f;
+        base *= 3.8f;
     }
     float spatial_align = 0.50f * cos1 + 0.30f + 0.20f * mom_dot;
     if (spatial_align > 1.0f) spatial_align = 1.0f;
     if (spatial_align < -1.0f) spatial_align = -1.0f;
     float align_pen = 1.0f + (0.38f * p->w_align * (1.0f - spatial_align));
-    float cost = base_time * attr_scale * align_pen;
+    float cost = base * align_pen;
     return (cost > 0.01f) ? cost : 0.01f;
 }
 
-static inline float alt_heuristic_scalar(const AltNode32 *av, const float *gf,
-                                         const float *gb, uint32_t L) {
+static inline float alt_heuristic_scalar(const AltNode32 *av, const uint16_t *gf,
+                                         const uint16_t *gb, uint32_t L) {
     float best = 0.0f;
-    for (uint32_t i = 0; i < L && i < 32; i++) {
-        float d1 = *(gf + i) - av->fwd[i];
-        float d2 = av->bwd[i] - *(gb + i);
+    for (uint32_t i = 0; i < L && i < VMR_LM_MAX; i++) {
+        float d1 = (float)*(gf + i) - (float)av->fwd[i];
+        float d2 = (float)av->bwd[i] - (float)*(gb + i);
         if (d1 > best) best = d1;
         if (d2 > best) best = d2;
     }
-    return best;
+    return best * VMR_LM_SCALE;
 }
 
 #if defined(__AVX2__)
 #include <immintrin.h>
-static inline float alt_heuristic_avx2_8(const AltNode32 *av, __m256 gf0, __m256 gb0) {
-    __m256 f0 = _mm256_loadu_ps(av->fwd);
-    __m256 b0 = _mm256_loadu_ps(av->bwd);
-    __m256 d1 = _mm256_sub_ps(gf0, f0);
-    __m256 d2 = _mm256_sub_ps(b0, gb0);
-    __m256 mx = _mm256_max_ps(_mm256_max_ps(d1, d2), _mm256_setzero_ps());
-    __m128 hi = _mm256_extractf128_ps(mx, 1);
-    __m128 lo = _mm256_castps256_ps128(mx);
-    __m128 m = _mm_max_ps(lo, hi);
-    m = _mm_max_ps(m, _mm_movehl_ps(m, m));
-    m = _mm_max_ss(m, _mm_shuffle_ps(m, m, 1));
-    return _mm_cvtss_f32(m);
-}
-static inline float alt_heuristic_avx2(const AltNode32 *av, __m256 gf0, __m256 gf1,
-                                       __m256 gf2, __m256 gf3,
-                                       __m256 gb0, __m256 gb1, __m256 gb2, __m256 gb3) {
-    __m256 f0 = _mm256_loadu_ps(av->fwd);
-    __m256 f1 = _mm256_loadu_ps(av->fwd + 8);
-    __m256 f2 = _mm256_loadu_ps(av->fwd + 16);
-    __m256 f3 = _mm256_loadu_ps(av->fwd + 24);
-    __m256 b0 = _mm256_loadu_ps(av->bwd);
-    __m256 b1 = _mm256_loadu_ps(av->bwd + 8);
-    __m256 b2 = _mm256_loadu_ps(av->bwd + 16);
-    __m256 b3 = _mm256_loadu_ps(av->bwd + 24);
-    __m256 d1 = _mm256_max_ps(_mm256_max_ps(_mm256_sub_ps(gf0, f0), _mm256_sub_ps(gf1, f1)),
-                              _mm256_max_ps(_mm256_sub_ps(gf2, f2), _mm256_sub_ps(gf3, f3)));
-    __m256 d2 = _mm256_max_ps(_mm256_max_ps(_mm256_sub_ps(b0, gb0), _mm256_sub_ps(b1, gb1)),
-                              _mm256_max_ps(_mm256_sub_ps(b2, gb2), _mm256_sub_ps(b3, gb3)));
-    __m256 mx = _mm256_max_ps(_mm256_max_ps(d1, d2), _mm256_setzero_ps());
-    __m128 hi = _mm256_extractf128_ps(mx, 1);
-    __m128 lo = _mm256_castps256_ps128(mx);
-    __m128 m = _mm_max_ps(lo, hi);
-    m = _mm_max_ps(m, _mm_movehl_ps(m, m));
-    m = _mm_max_ss(m, _mm_shuffle_ps(m, m, 1));
-    return _mm_cvtss_f32(m);
+static inline float alt_heuristic_avx2_16q(const AltNode32 *av, __m128i gf0, __m128i gb0,
+                                          __m128i gf1, __m128i gb1) {
+    __m128i f0 = _mm_loadu_si128((const __m128i *)(av->fwd));
+    __m128i f1 = _mm_loadu_si128((const __m128i *)(av->fwd + 8));
+    __m128i b0 = _mm_loadu_si128((const __m128i *)(av->bwd));
+    __m128i b1 = _mm_loadu_si128((const __m128i *)(av->bwd + 8));
+    __m128i d0 = _mm_subs_epu16(gf0, f0);
+    __m128i d1 = _mm_subs_epu16(gf1, f1);
+    __m128i e0 = _mm_subs_epu16(b0, gb0);
+    __m128i e1 = _mm_subs_epu16(b1, gb1);
+    __m128i m = _mm_max_epu16(_mm_max_epu16(d0, d1), _mm_max_epu16(e0, e1));
+    m = _mm_max_epu16(m, _mm_srli_si128(m, 8));
+    m = _mm_max_epu16(m, _mm_srli_si128(m, 4));
+    m = _mm_max_epu16(m, _mm_srli_si128(m, 2));
+    unsigned int mx = (unsigned int)_mm_extract_epi16(m, 0);
+    return (float)mx * VMR_LM_SCALE;
 }
 #endif
 
 #if defined(__AVX2__)
-#define ALT_HEUR(g, u, gf, gb, gf0, gf1, gf2, gf3, gb0, gb1, gb2, gb3, L) alt_heuristic_avx2_8(&(g)->alt_nodes[u], (gf0), (gb0))
+#define ALT_HEUR(g, u, gf, gb, gf0, gf1, gf2, gf3, gb0, gb1, gb2, gb3, L) alt_heuristic_avx2_16q(&(g)->alt_nodes[u], (gf0), (gb0), (gf1), (gb1))
 #else
 #define ALT_HEUR(g, u, gf, gb, gf0, gf1, gf2, gf3, gb0, gb1, gb2, gb3, L) alt_heuristic_scalar(&(g)->alt_nodes[u], (gf), (gb), (L))
 #endif
@@ -5948,6 +5992,10 @@ static int vmr_ws_reserve(size_t n) {
     if (!g_ws.sf || !g_ws.sb || heap_init(&g_ws.pq_fwd, 256) != 0 || heap_init(&g_ws.pq_bwd, 256) != 0) {
         return -1;
     }
+    /* Generation stamps start at 0; clear the freshly allocated state so
+     * uninitialised memory can never alias a live epoch. */
+    memset(g_ws.sf, 0, n * sizeof(BidirFwdState));
+    memset(g_ws.sb, 0, n * sizeof(BidirBwdState));
     g_ws.ready = 1;
     return 0;
 }
@@ -6005,7 +6053,7 @@ static inline uint32_t vmr_expand_fwd_block(
     float urx, float ury, float gx, float gy, float sx, float sy,
     float chord_dx, float chord_dy, float inv_chord,
     const VmrPreference *pref, uint32_t pref_id, int use_cross,
-    int use_alt, const float *alt_gf, const float *alt_gb, float alt_scale,
+    int use_alt, const uint16_t *alt_gf, const uint16_t *alt_gb, float alt_scale,
     uint32_t L, float v_heur, float *best_total, uint32_t *meet_node,
     int track_meet, int skip_dead) {
     uint32_t ebase = *(g->fwd_offsets + u);
@@ -6136,6 +6184,15 @@ static inline uint32_t vmr_expand_fwd_block(
             if (turn_res && turn_forbidden(g, u, p_u, v)) {
                 continue;
             }
+            float ng_min = gu_ + cminv[l];
+            if (ws->sf[v].st == epoch && ng_min >= ws->sf[v].g) {
+                continue;
+            }
+            /* Cheap admissible bound first: skip the expensive ALT/Euclidean
+             * lookup (and its random alt_nodes access) for hopeless edges. */
+            if (ng_min >= *best_total) {
+                continue;
+            }
             float h_v;
             if (use_alt) {
                 h_v = alt_heuristic_scalar(&g->alt_nodes[v], alt_gf, alt_gb, L) * alt_scale;
@@ -6143,10 +6200,6 @@ static inline uint32_t vmr_expand_fwd_block(
                 float rvx = gx - *(g->node_x + v);
                 float rvy = gy - *(g->node_y + v);
                 h_v = vmr_sqrt_fast(rvx * rvx + rvy * rvy) * v_heur;
-            }
-            float ng_min = gu_ + cminv[l];
-            if (ws->sf[v].st == epoch && ng_min >= ws->sf[v].g) {
-                continue;
             }
             if (ng_min + h_v >= *best_total) {
                 continue;
@@ -6192,7 +6245,7 @@ static inline uint32_t vmr_expand_bwd_block(
     float urx, float ury, float sx, float sy,
     float chord_dx, float chord_dy, float inv_chord,
     const VmrPreference *pref, uint32_t pref_id, int use_cross,
-    int use_alt, const float *alt_sf, const float *alt_sb, float alt_scale,
+    int use_alt, const uint16_t *alt_sf, const uint16_t *alt_sb, float alt_scale,
     uint32_t L, float v_heur, float *best_total, uint32_t *meet_node,
     int track_meet, int skip_dead) {
     uint32_t bb0 = *(g->rev_block_off + w);
@@ -6323,6 +6376,15 @@ static inline uint32_t vmr_expand_bwd_block(
             if (turn_res && turn_forbidden(g, w, u, next_w)) {
                 continue;
             }
+            float ng_min = gb + cminv[l];
+            if ((ws->sb[u].st == epoch || ws->sb[u].st == epoch + 1U) &&
+                ng_min >= ws->sb[u].g) {
+                continue;
+            }
+            /* Cheap admissible bound before the expensive ALT/Euclidean lookup. */
+            if (ng_min >= *best_total) {
+                continue;
+            }
             float h_v;
             if (use_alt) {
                 h_v = alt_heuristic_scalar(&g->alt_nodes[u], alt_sf, alt_sb, L) * alt_scale;
@@ -6330,11 +6392,6 @@ static inline uint32_t vmr_expand_bwd_block(
                 float rvx = sx - *(g->node_x + u);
                 float rvy = sy - *(g->node_y + u);
                 h_v = vmr_sqrt_fast(rvx * rvx + rvy * rvy) * v_heur;
-            }
-            float ng_min = gb + cminv[l];
-            if ((ws->sb[u].st == epoch || ws->sb[u].st == epoch + 1U) &&
-                ng_min >= ws->sb[u].g) {
-                continue;
             }
             if (ng_min + h_v >= *best_total) {
                 continue;
@@ -6385,7 +6442,7 @@ static uint32_t vmr_expand_fwd_block(
     float gx, float gy, float sx, float sy,
     float chord_dx, float chord_dy, float inv_chord,
     const VmrPreference *pref, uint32_t pref_id,
-    int use_cross, int use_alt, const float *alt_gf, const float *alt_gb,
+    int use_cross, int use_alt, const uint16_t *alt_gf, const uint16_t *alt_gb,
     float alt_scale, uint32_t L, float v_heur,
     float *best_total, uint32_t *meet_node,
     int track_meet, int skip_dead);
@@ -6428,6 +6485,8 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
     uint32_t n = g->node_count;
     const float *as_arr = (query->pref.pref_id >= 0 && query->pref.pref_id < (int)VMR_NUM_PROFILES)
                         ? g->edge_attr_scale[query->pref.pref_id] : NULL;
+    const float *bc_arr = (query->pref.pref_id >= 0 && query->pref.pref_id < (int)VMR_NUM_PROFILES)
+                        ? g->edge_base_cost[query->pref.pref_id] : NULL;
     int skip_dead = !(*(g->node_flags + start_idx) & NODE_DEAD_TREE) &&
                     !(*(g->node_flags + goal_idx)  & NODE_DEAD_TREE);
 
@@ -6507,14 +6566,9 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
             v_atr = g->attr_min[vpid];
         }
     }
-    /* Pure time-optimal: the cost is raw travel time, so the Euclidean bound
-     * is 1/max_speed and the ALT scale is 1.0. */
-    if (query->pref.pure_time) {
-        v_atr = 1.0f;
-    }
     const float v_heur = v_atr / max_speed_mps;
 
-    float alt_gf[32], alt_gb[32], alt_sf[32], alt_sb[32];
+    uint16_t alt_gf[32], alt_gb[32], alt_sf[32], alt_sb[32];
     uint32_t L = g->landmark_count;
     int has_alt = (L > 0 && g->alt_nodes != NULL);
     /* Admissible ALT scale = exact min of the active edge_attr_scale profile.
@@ -6525,10 +6579,11 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
     float amin = (pid >= 0 && pid < (int)VMR_NUM_PROFILES) ? g->attr_min[pid] : attr_scale_min;
     if (amin <= 0.0f) amin = attr_scale_min;
     float alt_scale = amin; /* admissible default (correct) */
-    if (query->pref.pure_time) {
-        alt_scale = 1.0f; /* pure time: full-strength ALT (unidirectional) */
+    if (getenv("VMR_DEBUG_H")) {
+        fprintf(stderr, "[H] pid=%d amin=%.4f alt_scale=%.4f v_atr=%.4f L=%u maxspeed=%.1f\n",
+                pid, amin, alt_scale, v_atr, L, max_speed_mps);
     }
-    if (!cch_weak && !query->pref.pure_time) {
+    if (!cch_weak) {
         const char *s = getenv("UVR_ALT_SCALE");
         if (s && *s) {
             float v = (float)atof(s);
@@ -6537,60 +6592,52 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
     }
     /* Eco uses the fuel-Euclidean heuristic (added below) which is admissible
      * and much tighter than the time-based ALT, so it keeps the exact min. */
-    /* pure_time uses alt_scale=1.0 which is always admissible for the raw
-     * time cost, so no strong-scale admissibility retry is needed. */
-    cch_strong = (!cch_weak && !query->pref.pure_time && alt_scale > amin + 1e-4f) ? 1 : 0;
+    cch_strong = (!cch_weak && alt_scale > amin + 1e-4f) ? 1 : 0;
     (void)0;
 #if defined(__AVX2__)
-    __m256 gf0 = _mm256_setzero_ps(), gf1 = _mm256_setzero_ps();
-    __m256 gf2 = _mm256_setzero_ps(), gf3 = _mm256_setzero_ps();
-    __m256 gb0 = _mm256_setzero_ps(), gb1 = _mm256_setzero_ps();
-    __m256 gb2 = _mm256_setzero_ps(), gb3 = _mm256_setzero_ps();
-    __m256 sf0 = _mm256_setzero_ps(), sf1 = _mm256_setzero_ps();
-    __m256 sf2 = _mm256_setzero_ps(), sf3 = _mm256_setzero_ps();
-    __m256 sb0 = _mm256_setzero_ps(), sb1 = _mm256_setzero_ps();
-    __m256 sb2 = _mm256_setzero_ps(), sb3 = _mm256_setzero_ps();
+    __m128i gf0 = _mm_setzero_si128(), gf1 = _mm_setzero_si128();
+    __m128i gf2 = _mm_setzero_si128(), gf3 = _mm_setzero_si128();
+    __m128i gb0 = _mm_setzero_si128(), gb1 = _mm_setzero_si128();
+    __m128i gb2 = _mm_setzero_si128(), gb3 = _mm_setzero_si128();
+    __m128i sf0 = _mm_setzero_si128(), sf1 = _mm_setzero_si128();
+    __m128i sf2 = _mm_setzero_si128(), sf3 = _mm_setzero_si128();
+    __m128i sb0 = _mm_setzero_si128(), sb1 = _mm_setzero_si128();
+    __m128i sb2 = _mm_setzero_si128(), sb3 = _mm_setzero_si128();
 #endif
     if (has_alt) {
-        if (L > 8) {
-            L = 8;
+        if (L > VMR_QUERY_LM) {
+            L = VMR_QUERY_LM;
         }
         const AltNode32 *gn = g->alt_nodes + goal_idx;
         const AltNode32 *sn = g->alt_nodes + start_idx;
         for (uint32_t i = 0; i < 32; i++) {
-            float gf = (i < L) ? gn->fwd[i] : 1.0e30f;
-            float gb = (i < L) ? gn->bwd[i] : -1.0e30f;
-            float sf = (i < L) ? sn->fwd[i] : 1.0e30f;
-            float sb = (i < L) ? sn->bwd[i] : -1.0e30f;
-            *(alt_gf + i) = (gf >= 1.0e29f) ? -1.0e30f : gf;
-            *(alt_gb + i) = (gb <= -1.0e29f) ? 1.0e30f : gb;
-            *(alt_sf + i) = (sf >= 1.0e29f) ? -1.0e30f : sf;
-            *(alt_sb + i) = (sb <= -1.0e29f) ? 1.0e30f : sb;
+            uint16_t gf = (i < L && gn->fwd[i] < 65535u && gn->fwd[i] > 0)
+                              ? (uint16_t)(gn->fwd[i] - 1) : 0u;
+            uint16_t gb = (i < L && gn->bwd[i] < 65535u)
+                              ? (uint16_t)(gn->bwd[i] + 1) : 65535u;
+            uint16_t sf = (i < L && sn->fwd[i] < 65535u && sn->fwd[i] > 0)
+                              ? (uint16_t)(sn->fwd[i] - 1) : 0u;
+            uint16_t sb = (i < L && sn->bwd[i] < 65535u)
+                              ? (uint16_t)(sn->bwd[i] + 1) : 65535u;
+            *(alt_gf + i) = gf;
+            *(alt_gb + i) = gb;
+            *(alt_sf + i) = sf;
+            *(alt_sb + i) = sb;
         }
 #if defined(__AVX2__)
-        gf0 = _mm256_loadu_ps(alt_gf);
-        gf1 = _mm256_loadu_ps(alt_gf + 8);
-        gf2 = _mm256_loadu_ps(alt_gf + 16);
-        gf3 = _mm256_loadu_ps(alt_gf + 24);
-        gb0 = _mm256_loadu_ps(alt_gb);
-        gb1 = _mm256_loadu_ps(alt_gb + 8);
-        gb2 = _mm256_loadu_ps(alt_gb + 16);
-        gb3 = _mm256_loadu_ps(alt_gb + 24);
-        sf0 = _mm256_loadu_ps(alt_sf);
-        sf1 = _mm256_loadu_ps(alt_sf + 8);
-        sf2 = _mm256_loadu_ps(alt_sf + 16);
-        sf3 = _mm256_loadu_ps(alt_sf + 24);
-        sb0 = _mm256_loadu_ps(alt_sb);
-        sb1 = _mm256_loadu_ps(alt_sb + 8);
-        sb2 = _mm256_loadu_ps(alt_sb + 16);
-        sb3 = _mm256_loadu_ps(alt_sb + 24);
+        gf0 = _mm_loadu_si128((const __m128i *)(alt_gf));
+        gf1 = _mm_loadu_si128((const __m128i *)(alt_gf + 8));
+        gb0 = _mm_loadu_si128((const __m128i *)(alt_gb));
+        gb1 = _mm_loadu_si128((const __m128i *)(alt_gb + 8));
+        sf0 = _mm_loadu_si128((const __m128i *)(alt_sf));
+        sf1 = _mm_loadu_si128((const __m128i *)(alt_sf + 8));
+        sb0 = _mm_loadu_si128((const __m128i *)(alt_sb));
+        sb1 = _mm_loadu_si128((const __m128i *)(alt_sb + 8));
 #endif
     }
 
-    if (query->mode != MODE_VEC_BIDIR || query->pref.pure_time) {
-        /* Unidirectional Vector-Corridor A* (also used by the pure-time
-         * "fastest" profile: unidirectional A* is optimal with a strong ALT
-         * heuristic, avoiding the bidirectional meeting suboptimality). */
+    if (query->mode != MODE_VEC_BIDIR) {
+        /* Unidirectional Vector-Corridor A*. */
         HeapEntry top;
         while (heap_pop(pq_fwd, &top)) {
             uint32_t u = top.node;
@@ -6621,7 +6668,13 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
             uint32_t end = *(g->fwd_offsets + u + 1U);
             for (; ei < end; ei++) {
                 uint32_t v = *(g->edge_to + ei);
-                float as = as_arr ? as_arr[ei] : compute_attr_scale(g, ei, &query->pref);
+                if (ei + 1 < end) {
+                    uint32_t nv = *(g->edge_to + ei + 1);
+                    __builtin_prefetch(&ws->sf[nv], 1, 3);
+                    __builtin_prefetch(&g->alt_nodes[nv], 0, 3);
+                }
+                float base = bc_arr ? bc_arr[ei] :
+                 (*(g->edge_time_s + ei) * (as_arr ? as_arr[ei] : compute_attr_scale(g, ei, &query->pref)));
                 if (ws->sf[v].st == epoch + 1) continue;
                 if (skip_dead && (*(g->edge_flags + ei) & EDGE_DEAD_TARGET)) continue;
                 if ((*(g->node_flags + u) & NODE_HAS_TURN_RES) && ws->sf[u].p != VMR_INVALID &&
@@ -6632,32 +6685,33 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
                 float mom = umx * eux + umy * euy;
                 float cross_ratio = 0.0f;
                 if (query->allow_cross_track_prune && chord_len > 100.0f) {
-                    float vx_rel = *(g->node_x + v) - sx;
-                    float vy_rel = *(g->node_y + v) - sy;
+                    float vx_rel = *(g->edge_vx + ei) - sx;
+                    float vy_rel = *(g->edge_vy + ei) - sy;
                     float cross_abs = fabsf(chord_dx * vy_rel - chord_dy * vx_rel);
                     cross_ratio = (cross_abs * inv_chord) * inv_chord;
                 }
 
+                /* Optimistic lower bound (cos2 = 1): skip two-hop and heap work
+                 * when the edge cannot improve the target. */
+                float sc_min = compute_8d_cost_min(g, ei, &query->pref, base,
+                                                        cos1, mom);
+                float ng_min = ws->sf[u].g + sc_min;
+                if (ws->sf[v].st == epoch && ng_min >= ws->sf[v].g) continue;
+                /* Cheap admissible bound before the expensive ALT/Euclidean lookup. */
+                if (ng_min >= best_total) continue;
                 float h_v = 0.0f;
                 if (has_alt) {
                     h_v = ALT_HEUR(g, v, alt_gf, alt_gb, gf0, gf1, gf2, gf3, gb0, gb1, gb2, gb3, L) * alt_scale;
                 } else if (query->mode == MODE_VEC_UNIDIR) {
-                    float rvx = gx - *(g->node_x + v);
-                    float rvy = gy - *(g->node_y + v);
+                    float rvx = gx - *(g->edge_vx + ei);
+                    float rvy = gy - *(g->edge_vy + ei);
                     h_v = vmr_sqrt_fast(rvx * rvx + rvy * rvy) * v_heur;
                 }
-
-                /* Optimistic lower bound (cos2 = 1): skip two-hop and heap work
-                 * when the edge cannot improve the target. */
-                float sc_min = compute_8d_cost_min(g, ei, &query->pref, as,
-                                                        cos1, mom);
-                float ng_min = ws->sf[u].g + sc_min;
-                if (ws->sf[v].st == epoch && ng_min >= ws->sf[v].g) continue;
                 if (ng_min + h_v >= best_total) continue;
 
                 float cos2 = (v == goal_idx) ? 1.0f :
                              two_hop_fwd_cos_fast(g, ei, cos1, urx, ury);
-                float sc = compute_8d_step_cost(g, ei, &query->pref, as,
+                float sc = compute_8d_step_cost(g, ei, &query->pref, base,
                                                 cos1, cos2, mom, cross_ratio);
                 float ng = ws->sf[u].g + sc;
                 if (ng + h_v >= best_total) continue;
@@ -6696,10 +6750,10 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
                 if (!heap_pop(pq_fwd, &top)) break;
                 uint32_t u = top.node;
                 if (ws->sf[u].st == epoch + 1) continue;
-                ws->sf[u].st = epoch + 1;
-                expanded++;
+            ws->sf[u].st = epoch + 1;
+            expanded++;
 
-                if ((ws->sb[u].st == epoch || ws->sb[u].st == epoch+1) && ws->sb[u].g < FLT_MAX) {
+            if ((ws->sb[u].st == epoch || ws->sb[u].st == epoch+1) && ws->sb[u].g < FLT_MAX) {
                     float tot = ws->sf[u].g + ws->sb[u].g;
                     if (tot < best_total) {
                         best_total = tot;
@@ -6726,10 +6780,15 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
                 uint32_t end = *(g->fwd_offsets + u + 1U);
                 for (; ei < end; ei++) {
                     uint32_t v = *(g->edge_to + ei);
-                    float as = as_arr ? as_arr[ei] : compute_attr_scale(g, ei, &query->pref);
+                if (ei + 1 < end) {
+                    uint32_t nv = *(g->edge_to + ei + 1);
+                    __builtin_prefetch(&ws->sf[nv], 1, 3);
+                    __builtin_prefetch(&g->alt_nodes[nv], 0, 3);
+                }
+                    float base = bc_arr ? bc_arr[ei] :
+                 (*(g->edge_time_s + ei) * (as_arr ? as_arr[ei] : compute_attr_scale(g, ei, &query->pref)));
                     if (ws->sf[v].st == epoch + 1) continue;
                 if (skip_dead && (*(g->edge_flags + ei) & EDGE_DEAD_TARGET)) continue;
-                if (!in_corridor(g, v)) continue;
                 if ((*(g->node_flags + u) & NODE_HAS_TURN_RES) && ws->sf[u].p != VMR_INVALID &&
                     turn_forbidden(g, u, ws->sf[u].p, v)) continue;
 
@@ -6738,33 +6797,34 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
                     float mom = umx * eux + umy * euy;
                     float cross_ratio = 0.0f;
                     if (query->allow_cross_track_prune && chord_len > 100.0f) {
-                        float vx_rel = *(g->node_x + v) - sx;
-                        float vy_rel = *(g->node_y + v) - sy;
+                        float vx_rel = *(g->edge_vx + ei) - sx;
+                        float vy_rel = *(g->edge_vy + ei) - sy;
                         float cross_abs = fabsf(chord_dx * vy_rel - chord_dy * vx_rel);
                         cross_ratio = (cross_abs * inv_chord) * inv_chord;
                     }
 
-                    float h_v = has_alt
-                        ? (ALT_HEUR(g, v, alt_gf, alt_gb, gf0, gf1, gf2, gf3, gb0, gb1, gb2, gb3, L) * alt_scale)
-                        : vmr_sqrt_fast((gx - *(g->node_x + v)) * (gx - *(g->node_x + v)) +
-                                        (gy - *(g->node_y + v)) * (gy - *(g->node_y + v))) * v_heur;
-                    /* Eco fuel-Euclidean lower bound: fuel >= min_fuel_per_km *
-                     * euclidean_km, in cost units (cost = fuel * 1000/NORM). */
-                    if (query->pref.pref_id == VMR_PROFILE_ECO && g->eco_min_fuel > 0.0f) {
-                        float ex = gx - *(g->node_x + v), ey = gy - *(g->node_y + v);
-                        float hf = vmr_sqrt_fast(ex * ex + ey * ey) * g->eco_min_fuel * 0.4f;
-                        if (hf > h_v) h_v = hf;
-                    }
-
-                    float sc_min = compute_8d_cost_min(g, ei, &query->pref, as,
+                    float sc_min = compute_8d_cost_min(g, ei, &query->pref, base,
                                                         cos1, mom);
                     float ng_min = ws->sf[u].g + sc_min;
                     if (ws->sf[v].st == epoch && ng_min >= ws->sf[v].g) continue;
+                    /* Cheap admissible bound before the expensive ALT/Euclidean lookup. */
+                    if (ng_min >= best_total) continue;
+                    float h_v = has_alt
+                        ? (ALT_HEUR(g, v, alt_gf, alt_gb, gf0, gf1, gf2, gf3, gb0, gb1, gb2, gb3, L) * alt_scale)
+                        : vmr_sqrt_fast((gx - *(g->edge_vx + ei)) * (gx - *(g->edge_vx + ei)) +
+                                        (gy - *(g->edge_vy + ei)) * (gy - *(g->edge_vy + ei))) * v_heur;
+                    /* Eco fuel-Euclidean lower bound: fuel >= min_fuel_per_km *
+                     * euclidean_km, in cost units (cost = fuel * 1000/NORM). */
+                    if (query->pref.pref_id == VMR_PROFILE_ECO && g->eco_min_fuel > 0.0f) {
+                        float ex = gx - *(g->edge_vx + ei), ey = gy - *(g->edge_vy + ei);
+                        float hf = vmr_sqrt_fast(ex * ex + ey * ey) * g->eco_min_fuel * 0.4f;
+                        if (hf > h_v) h_v = hf;
+                    }
                     if (ng_min + h_v >= best_total) continue;
 
                     float cos2 = (v == goal_idx) ? 1.0f :
                                                   two_hop_fwd_cos_fast(g, ei, cos1, urx, ury);
-                    float sc = compute_8d_step_cost(g, ei, &query->pref, as,
+                    float sc = compute_8d_step_cost(g, ei, &query->pref, base,
                                                     cos1, cos2, mom, cross_ratio);
                     float ng = ws->sf[u].g + sc;
                     if (ng + h_v >= best_total) continue;
@@ -6826,8 +6886,14 @@ static int vmr_find_path(const VmrGraph *g, uint32_t start_idx, uint32_t goal_id
                 uint32_t rend = *(g->rev_offsets + w + 1U);
                 for (; ri < rend; ri++) {
 uint32_t u = *(g->rev_src_node + ri);
+                    if (ri + 1 < rend) {
+                        uint32_t nu = *(g->rev_src_node + ri + 1);
+                        __builtin_prefetch(&ws->sb[nu], 1, 3);
+                        __builtin_prefetch(&g->alt_nodes[nu], 0, 3);
+                    }
                     uint32_t eid = *(g->rev_fwd_eid + ri);
-                    float as = as_arr ? as_arr[eid] : compute_attr_scale(g, eid, &query->pref);
+                    float base = bc_arr ? bc_arr[eid] :
+                 (*(g->edge_time_s + eid) * (as_arr ? as_arr[eid] : compute_attr_scale(g, eid, &query->pref)));
                     if (ws->sb[u].st == epoch + 1) continue;
                     if (skip_dead && (*(g->edge_flags + eid) & EDGE_DEAD_SOURCE)) continue;
                     uint32_t next_w = ws->sb[w].p;
@@ -6841,31 +6907,33 @@ uint32_t u = *(g->rev_src_node + ri);
                     float mom = wmx * eux + wmy * euy;
                     float cross_ratio = 0.0f;
                     if (query->allow_cross_track_prune && chord_len > 100.0f) {
-                        float ux_rel = *(g->node_x + u) - sx;
-                        float uy_rel = *(g->node_y + u) - sy;
+                        float ux_rel = *(g->edge_sx + eid) - sx;
+                        float uy_rel = *(g->edge_sy + eid) - sy;
                         float cross_abs = fabsf(chord_dx * uy_rel - chord_dy * ux_rel);
                         cross_ratio = (cross_abs * inv_chord) * inv_chord;
                     }
 
-                    float h_v = has_alt
-                        ? (ALT_HEUR(g, u, alt_sf, alt_sb, sf0, sf1, sf2, sf3, sb0, sb1, sb2, sb3, L) * alt_scale)
-                        : vmr_sqrt_fast((sx - *(g->node_x + u)) * (sx - *(g->node_x + u)) +
-                                        (sy - *(g->node_y + u)) * (sy - *(g->node_y + u))) * v_heur;
-                    if (query->pref.pref_id == VMR_PROFILE_ECO && g->eco_min_fuel > 0.0f) {
-                        float ex = sx - *(g->node_x + u), ey = sy - *(g->node_y + u);
-                        float hf = vmr_sqrt_fast(ex * ex + ey * ey) * g->eco_min_fuel * 0.4f;
-                        if (hf > h_v) h_v = hf;
-                    }
-
-                    float sc_min = compute_8d_cost_min(g, eid, &query->pref, as,
+                    /* Cheap admissible bound before the expensive ALT lookup. */
+                    float sc_min = compute_8d_cost_min(g, eid, &query->pref, base,
                                                         cos1, mom);
                     float ng_min = ws->sb[w].g + sc_min;
                     if ((ws->sb[u].st == epoch || ws->sb[u].st == epoch+1) && ng_min >= ws->sb[u].g) continue;
+                    if (ng_min >= best_total) continue;
+
+                    float h_v = has_alt
+                        ? (ALT_HEUR(g, u, alt_sf, alt_sb, sf0, sf1, sf2, sf3, sb0, sb1, sb2, sb3, L) * alt_scale)
+                        : vmr_sqrt_fast((sx - *(g->edge_sx + eid)) * (sx - *(g->edge_sx + eid)) +
+                                        (sy - *(g->edge_sy + eid)) * (sy - *(g->edge_sy + eid))) * v_heur;
+                    if (query->pref.pref_id == VMR_PROFILE_ECO && g->eco_min_fuel > 0.0f) {
+                        float ex = sx - *(g->edge_sx + eid), ey = sy - *(g->edge_sy + eid);
+                        float hf = vmr_sqrt_fast(ex * ex + ey * ey) * g->eco_min_fuel * 0.4f;
+                        if (hf > h_v) h_v = hf;
+                    }
                     if (ng_min + h_v >= best_total) continue;
 
                     float cos2 = (u == start_idx) ? 1.0f :
                                                   two_hop_rev_cos_fast(g, ri, cos1, urx, ury);
-                    float sc = compute_8d_step_cost(g, eid, &query->pref, as,
+                    float sc = compute_8d_step_cost(g, eid, &query->pref, base,
                                                     cos1, cos2, mom, cross_ratio);
                     float ng = ws->sb[w].g + sc;
                     if (ng + h_v >= best_total) continue;
@@ -7312,7 +7380,7 @@ static void print_usage(const char *prog) {
         "  --route-id <osmA> <osmB>                Route between OSM intersection IDs\n"
         "  --mode <bidir|unidir>\n"
         "                                        VCA search variant (default: bidir)\n"
-        "  --profile <balanced|fastest|direct|highway|local|eco|scenic|shortest|avoid-motorway>\n"
+        "  --profile <balanced|direct|highway|local|eco|scenic|shortest|avoid-motorway>\n"
         "                                        Optimisation profile (default: balanced)\n"
         "  --vehicle <car|van|hgv-rigid|hgv-artic|ev>  Vehicle type (fuel curve + speed cap)\n"
         "  --fuel <l/100km>                        Vehicle fuel consumption (default: 5.0)\n"

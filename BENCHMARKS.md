@@ -48,12 +48,11 @@ extract with a slightly different road set than OSRM's live planet data.
 
 | Profile | Dist km | Time min | Fuel L | L/100km |
 |---|---|---|---|---|
-| fastest | 607.9 | 373.5 | 31.93 | 5.25 |
 | balanced | 609.7 | 377.2 | 32.05 | 5.26 |
 | **eco** | 594.3 | 406.2 | **31.44** | 5.29 |
 
 The eco profile minimises a per-edge fuel model (U-shaped vs speed, smoothness
-penalty) and genuinely finds a lower-fuel route (−1.5% vs fastest). It is slower to
+penalty) and genuinely finds a lower-fuel route (−1.9% vs balanced). It is slower to
 compute (~0.32 s vs ~0.03 s) because the fuel-optimal path uses unavoidable slow
 city edges; a fuel-Euclidean heuristic (`h = euclidean_km × min_fuel_per_km`) keeps
 it admissible and cuts the expansions ~3.4× versus a time-only heuristic. Vehicle
