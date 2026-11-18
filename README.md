@@ -18,10 +18,13 @@ and `zlib`.
 ## Build
 
 ```sh
-gcc -O2 -mavx2 -fopenmp -o uk_vector_router.exe algo.c sqlite3.o libz.a -I . -lm
+gcc -O2 -mavx2 -fopenmp -funroll-loops -o uk_vector_router.exe algo.c sqlite3.o libz.a -I . -lm
 # single-core (no OpenMP):
-gcc -O2 -mavx2 -o uk_vector_router_sc.exe algo.c sqlite3.o libz.a -I . -lm
+gcc -O2 -mavx2 -funroll-loops -o uk_vector_router_sc.exe algo.c sqlite3.o libz.a -I . -lm
 ```
+
+`-funroll-loops` unrolls the scalar query inner loop and is worth ~5% on query
+latency versus a plain `-O2` build (measured interleaved on the 24-route benchmark).
 
 ## Usage
 
@@ -144,8 +147,8 @@ bounds for the vector cost. The one-time cost is dominated by the SQLite DB read
 
 | Variant | Expanded | CPU |
 |---|---|---|
-| **vca-bidir** | 40,636 | **~14–16 ms** |
-| vca-unidir | 84,647 | ~31 ms |
+| **vca-bidir** | 40,636 | **~13–15 ms** |
+| vca-unidir | 84,647 | ~30 ms |
 
 `vca-bidir` grows forward and backward searches from origin and destination and
 alternates sides; the ALT landmark table gives an admissible time lower bound for

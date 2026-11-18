@@ -70,7 +70,7 @@ file + re-route".
 |---|---|---|
 | Load `.vgraph` cache (2.3 GB, mmap) | **194 ms** | cold; warm ~150 ms |
 | Traffic file reload (10k lines) | **< 5 ms** | O(lines) via osm_id index; 24 MB array reused |
-| Re-route, vca-bidir | **~14–16 ms** | warm |
+| Re-route, vca-bidir | **~13–15 ms** | warm; `-funroll-loops` build |
 | **Live traffic update cycle** (reload + re-route) | **~30–50 ms** | no regeneration |
 | Full graph regen: SQLite DB load (1.8 GB, 17 M nodes) | ~38 s | I/O-bound |
 | Full graph regen: preprocess (OpenMP 6 threads) | ~10 s | contraction + reorder + two-hop + ALT |
