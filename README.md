@@ -107,7 +107,7 @@ file every 1–5 minutes.
   hot loop is a multiply). The path cost weights travel time by this attribute score
   and rewards alignment between an edge and the two-hop continuation vector from the
   node it leads to.
-- **Heuristic (ALT).** A set of landmarks (31 on the UK graph) is chosen and their
+- **Heuristic (ALT).** A set of landmarks (16 on the UK graph) is chosen and their
   distances precomputed. The heuristic is `max over landmarks |d(L,t) − d(L,v)|`
   scaled by the profile's admissible `min(edge_attr_scale)`. A* with an admissible ALT
   heuristic is optimal; the scale is exact per profile so longer routes are not
@@ -174,8 +174,8 @@ fuel-economy numbers.
 
 ## Status / caveats
 
-- `.vgraph` format is v8/v9; the loader accepts both and backfills the newer eco/
-  scenic/shortest profile scales on legacy v8 caches.
+- `.vgraph` format is v12; the loader accepts older caches and backfills the newer
+  eco/scenic/shortest profile scales on legacy v8 caches.
 - The ALT scale is the exact admissible per-profile minimum; a few routes with
   unavoidable slow edges (notably eco) expand more nodes than strictly necessary.
 - The fuel model is a static per-edge approximation (speed + smoothness); it does not
